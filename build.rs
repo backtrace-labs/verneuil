@@ -43,6 +43,8 @@ fn main() {
         // We're linking this extension statically, without going
         // through sqlite's dynamic loading mechanism.
         .define("SQLITE_CORE", None)
+        // We know the linuxvfs doesn't implement dirsync.
+        .define("SQLITE_DISABLE_DIRSYNC", None)
         .file("c/linuxvfs.c")
         .opt_level(2)
         .compile("linuxvfs")

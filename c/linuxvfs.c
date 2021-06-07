@@ -150,11 +150,51 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
 }
 
 static int
-linux_delete(sqlite3_vfs *vfs, const char *name, int syncDir)
+linux_delete(sqlite3_vfs *vfs, const char *name, int sync_dir)
 {
+        int r;
 
         (void)vfs;
-        return base_vfs->xDelete(base_vfs, name, syncDir);
+        /*
+         * We never fsync the parent directory (i.e., assume
+         * `SQLITE_DISABLE_DIRSYNC` is always set).  In the worst
+         * case, this means a rollback journal could remain visible if
+         * the OS crashes soon after a transaction commit.  If that
+         * happens, that last transaction may be lost.  However, while
+         * we take a hit on durability, the db will always be valid.
+         *
+         * We're willing to take that risk, for simpler code.
+         */
+        (void)sync_dir;
+
+#ifndef SQLITE_DISABLE_DIRSYNC
+# warning "The Linux VFS assumes DIRSYNC is disabled."
+#endif
+
+        do {
+                r = unlink(name);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0) {
+                if (errno == ENOENT)
+                        return SQLITE_IOERR_DELETE_NOENT;
+
+                return SQLITE_IOERR_DELETE;
+        }
+
+#ifdef SQLITE_TEST
+        /*
+         * Some tests assert on the number of sync calls.  Update that
+         * counter as expected, even if we don't actually fsync.
+         */
+        if ((sync_dir & 1) != 0) {
+                extern int sqlite3_sync_count;
+
+                sqlite3_sync_count++;
+        }
+#endif
+
+        return SQLITE_OK;
 }
 
 static int
