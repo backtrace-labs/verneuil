@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 SQLITE_EXTENSION_INIT1
@@ -253,9 +254,15 @@ linux_randomness(sqlite3_vfs *vfs, int n, char *dst)
 static int
 linux_sleep(sqlite3_vfs *vfs, int microseconds)
 {
+        struct timespec to_sleep = {
+                .tv_sec = microseconds / 1000000,
+                .tv_nsec = (microseconds % 1000000) * 1000,
+        };
 
         (void)vfs;
-        return base_vfs->xSleep(base_vfs, microseconds);
+
+        nanosleep(&to_sleep, NULL);
+        return microseconds;
 }
 
 static int
