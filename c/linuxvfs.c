@@ -1,7 +1,12 @@
 #include "linuxvfs.h"
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 SQLITE_EXTENSION_INIT1
 
@@ -198,12 +203,42 @@ linux_dlclose(sqlite3_vfs *vfs, void *handle)
         return;
 }
 
+/*
+ * Linux added the getrandom syscall in 3.17, but glibc only recently
+ * added a wrapper.  Define our own getrandom.
+ */
+static ssize_t
+getrandom_compat(void *buf, size_t buflen, unsigned int flags)
+{
+
+        return syscall(SYS_getrandom, buf, buflen, flags);
+}
+
 static int
 linux_randomness(sqlite3_vfs *vfs, int n, char *dst)
 {
 
         (void)vfs;
-        return base_vfs->xRandomness(base_vfs, n, dst);
+        memset(dst, 0, n);
+
+#if !defined(SQLITE_TEST) && !defined(SQLITE_OMIT_RANDOMNESS)
+        ssize_t r;
+
+        do {
+                /*
+                 * This is only called to initialise a small
+                 * (256-byte) seed, so we don't have to worry
+                 * about short reads.
+                 */
+                r = getrandom_compat(dst, n, /*flags=*/0);
+        } while (r < 0 && errno == EINTR);
+        /*
+         * It's ok to fail silently: we zero-filled, so no UB,
+         * and the output is only used for a non-crypto PRNG.
+         */
+#endif
+
+        return n;
 }
 
 static int
