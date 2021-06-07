@@ -279,9 +279,23 @@ linux_get_last_error(sqlite3_vfs *vfs, int n, char *OUT_error)
 static int
 linux_current_time_int64(sqlite3_vfs *vfs, sqlite3_int64 *out)
 {
+        /* Offset copied from os_unix.c */
+        static const int64_t epoch = 24405875 * (int64_t)8640000;
+        struct timespec now;
 
         (void)vfs;
-        return base_vfs->xCurrentTimeInt64(base_vfs, out);
+
+        clock_gettime(CLOCK_REALTIME, &now);
+        *out = epoch + (int64_t)1000 * now.tv_sec + now.tv_nsec / 1000000;
+
+#ifdef SQLITE_TEST
+        extern int sqlite3_current_time;
+
+        if (sqlite3_current_time != 0)
+                *out = epoch + (int64_t)1000 * sqlite3_current_time;
+#endif
+
+        return SQLITE_OK;
 }
 
 static int
