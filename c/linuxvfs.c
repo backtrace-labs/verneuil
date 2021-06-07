@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <time.h>
@@ -159,9 +160,49 @@ linux_delete(sqlite3_vfs *vfs, const char *name, int syncDir)
 static int
 linux_access(sqlite3_vfs *vfs, const char *name, int flags, int *OUT_res)
 {
+        int access_mode = F_OK;
+        int r;
 
         (void)vfs;
-        return base_vfs->xAccess(base_vfs, name, flags, OUT_res);
+
+        /*
+         * The Unix VFS says a file exists if it's not a regular file,
+         * or it's non-empty... Replicate that logic here.
+         */
+        if (flags == SQLITE_ACCESS_EXISTS) {
+                struct stat sb;
+
+                do {
+                        r = stat(name, &sb);
+                } while (r != 0 && errno == EINTR);
+
+                /* If we can't stat the file, assume it doesn't exist. */
+                if (r != 0) {
+                        *OUT_res = 0;
+                        return SQLITE_OK;
+                }
+
+                if (S_ISREG(sb.st_mode) != 0) {
+                        *OUT_res = 1;
+                        return SQLITE_OK;
+                }
+
+                *OUT_res = (sb.st_size > 0) ? 1 : 0;
+                return SQLITE_OK;
+        }
+
+        if (flags == SQLITE_ACCESS_READWRITE) {
+                access_mode = W_OK | R_OK;
+        } else  if (flags == SQLITE_ACCESS_READ) {
+                access_mode = R_OK;
+        }
+
+        do {
+                r = access(name, access_mode);
+        } while (r != 0 && errno == EINTR);
+
+        *OUT_res = (r == 0) ? 1 : 0;
+        return SQLITE_OK;
 }
 
 static int
