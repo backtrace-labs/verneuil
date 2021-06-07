@@ -270,7 +270,10 @@ linux_get_last_error(sqlite3_vfs *vfs, int n, char *OUT_error)
 {
 
         (void)vfs;
-        return base_vfs->xGetLastError(base_vfs, n, OUT_error);
+        (void)n;
+        (void)OUT_error;
+        /* As of sqlite 3.35.5, only the return code is used. */
+        return errno;
 }
 
 static int
