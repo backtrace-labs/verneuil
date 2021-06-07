@@ -1,7 +1,9 @@
 #include "linuxvfs.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -174,15 +176,22 @@ linux_dlopen(sqlite3_vfs *vfs, const char *name)
 {
 
         (void)vfs;
-        return base_vfs->xDlOpen(base_vfs, name);
+        return dlopen(name, RTLD_NOW | RTLD_GLOBAL);
 }
 
 static void
 linux_dlerror(sqlite3_vfs *vfs, int n, char *OUT_error)
 {
+        const char *err;
 
         (void)vfs;
-        base_vfs->xDlError(base_vfs, n, OUT_error);
+        /*
+         * The whole dlerror interface is thread-hostile.  Let's hope
+         * this is good enough for sqlite.
+         */
+        err = dlerror();
+        if (err != NULL)
+                snprintf(OUT_error, n, "%s", err);
         return;
 }
 
@@ -191,7 +200,7 @@ linux_dlsym(sqlite3_vfs *vfs, void *handle, const char *symbol)
 {
 
         (void)vfs;
-        return base_vfs->xDlSym(base_vfs, handle, symbol);
+        return (dlfun_t *)dlsym(handle, symbol);
 }
 
 static void
@@ -199,7 +208,7 @@ linux_dlclose(sqlite3_vfs *vfs, void *handle)
 {
 
         (void)vfs;
-        base_vfs->xDlClose(base_vfs, handle);
+        dlclose(handle);
         return;
 }
 
