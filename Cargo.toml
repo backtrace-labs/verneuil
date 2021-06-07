@@ -1,0 +1,13 @@
+[package]
+name = "verneuil"
+version = "0.1.0"
+description = "A sqlite VFS for asynchronous replication to S3-compatible blob stores"
+license = "MIT"
+repository = "https://github.com/backtrace-labs/verneuil"
+authors = ["Backtrace I/O <team@backtrace.io>"]
+edition = "2018"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
