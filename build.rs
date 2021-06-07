@@ -1,4 +1,4 @@
-fn main() {
+fn build_sqlite() {
     println!("cargo:rerun-if-changed=include/sqlite3.h");
     println!("cargo:rerun-if-changed=include/sqlite3ext.h");
     println!("cargo:rerun-if-changed=c/sqlite3.c");
@@ -31,4 +31,19 @@ fn main() {
         .file("c/sqlite3.c")
         .opt_level(2)
         .compile("verneuil_sqlite")
+}
+
+fn main() {
+    build_sqlite();
+
+    println!("cargo:rerun-if-changed=c/linuxvfs.c");
+    println!("cargo:rerun-if-changed=c/linuxvfs.h");
+    cc::Build::new()
+        .include("include")
+        // We're linking this extension statically, without going
+        // through sqlite's dynamic loading mechanism.
+        .define("SQLITE_CORE", None)
+        .file("c/linuxvfs.c")
+        .opt_level(2)
+        .compile("linuxvfs")
 }
