@@ -298,6 +298,11 @@ linux_current_time_int64(sqlite3_vfs *vfs, sqlite3_int64 *out)
         return SQLITE_OK;
 }
 
+/**
+ * We don't actually implement any syscall fault injection logic.
+ * However, some test code fails if we don't implement the interface
+ * at all.  Expose no-op implementations to improve test coverage.
+ */
 static int
 linux_set_syscall(sqlite3_vfs *vfs, const char *name, sqlite3_syscall_ptr ptr)
 {
