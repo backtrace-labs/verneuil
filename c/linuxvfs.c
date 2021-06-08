@@ -28,6 +28,19 @@ SQLITE_EXTENSION_INIT1
 struct shim_file {
         sqlite3_file base;
         sqlite3_file *original;
+
+        /*
+         * NULLable.  Only NULL for temporary files, otherwise this is
+         * an absolute path to the file.
+         */
+        const char *path;
+
+        /*
+         * If `path` is non-NULL, this metadata identifies the inode
+         * for `path` around the time the file was opened.
+         */
+        dev_t device;
+        ino_t inode;
 };
 
 typedef void dlfun_t(void);
@@ -134,9 +147,21 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
         int rc;
 
         (void)vfs;
+
+        /*
+         * It is safe to borrow `name` for the lifetime of the `file`.
+         * https://www.sqlite.org/c3ref/vfs.html says
+         *
+         *   SQLite further guarantees that the string will be valid
+         *   and unchanged until xClose() is called. Because of the
+         *   previous sentence, the sqlite3_file can safely store a
+         *   pointer to the filename if it needs to remember the
+         *   filename for some reason.
+         */
         *file = (struct shim_file) {
                 .base.pMethods = &shim_io_methods,
                 .original = calloc(1, base_vfs->szOsFile),
+                .path = name,
         };
 
         if (file->original == NULL) {
@@ -145,12 +170,36 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
         }
 
         rc = base_vfs->xOpen(base_vfs, name, file->original, flags, OUT_flags);
-        if (file->original->pMethods == NULL) {
-                free(file->original);
-                *file = (struct shim_file) { 0 };
+        if (file->original->pMethods == NULL || rc != SQLITE_OK) {
+                shim_file_close(vfile);
+                return rc;
         }
 
-        return rc;
+        /*
+         * Not a temporary file, and the `base_vfs` has created the
+         * file if necessary.  Now, we can stat that path.
+         *
+         * Ideally, we'd fstat rather than stat, but that will have to
+         * wait until we actually open(2) the file ourselves.
+         */
+        if (name != NULL) {
+                struct stat sb;
+                int r;
+
+                do {
+                        r = stat(name, &sb);
+                } while (r != 0 && errno == EINTR);
+
+                if (r != 0) {
+                        shim_file_close(vfile);
+                        return SQLITE_IOERR_FSTAT;
+                }
+
+                file->device = sb.st_dev;
+                file->inode = sb.st_ino;
+        }
+
+        return SQLITE_OK;
 }
 
 static int
@@ -744,6 +793,31 @@ shim_file_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
         return original->pMethods->xCheckReservedLock(original, OUT_result);
 }
 
+static bool
+linux_file_has_moved(const struct shim_file *file)
+{
+        struct stat sb;
+        const char *path = file->path;
+        int r;
+
+        /*
+         * Assume temporary files don't move: we ideally don't even
+         * want them to have a name.
+         */
+        if (path == NULL)
+                return false;
+
+        do {
+                r = stat(path, &sb);
+        } while (r != 0 && errno == EINTR);
+
+        /* Assume this means trouble. */
+        if (r != 0)
+                return true;
+
+        return sb.st_dev != file->device || sb.st_ino != file->inode;
+}
+
 static int
 shim_file_control(sqlite3_file *vfile, int op, void *arg)
 {
@@ -759,10 +833,13 @@ shim_file_control(sqlite3_file *vfile, int op, void *arg)
                 *(char**)arg = sqlite3_mprintf("%s", base_vfs->zName);
                 return SQLITE_OK;
 
+        case SQLITE_FCNTL_HAS_MOVED:
+                *(int *)arg = linux_file_has_moved(file) ? 1 : 0;
+                return SQLITE_OK;
+
         /* These are used in tests, and should be implemented. */
         case SQLITE_FCNTL_LOCKSTATE:
         case SQLITE_FCNTL_TEMPFILENAME:
-        case SQLITE_FCNTL_HAS_MOVED:
                 return original->pMethods->xFileControl(original, op, arg);
 
         default:
