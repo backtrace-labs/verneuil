@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -66,7 +67,7 @@ static int shim_file_unlock(sqlite3_file *, int level);
 static int shim_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
 
 static int shim_file_control(sqlite3_file *, int op, void *arg);
-static int shim_file_sector_size(sqlite3_file *);
+static int linux_file_sector_size(sqlite3_file *);
 static int shim_file_device_characteristics(sqlite3_file *);
 
 static sqlite3_vfs *base_vfs;
@@ -87,7 +88,7 @@ static const struct sqlite3_io_methods shim_io_methods = {
         .xCheckReservedLock = shim_file_check_reserved_lock,
 
         .xFileControl = shim_file_control,
-        .xSectorSize = shim_file_sector_size,
+        .xSectorSize = linux_file_sector_size,
         .xDeviceCharacteristics = shim_file_device_characteristics,
 };
 
@@ -770,12 +771,54 @@ shim_file_control(sqlite3_file *vfile, int op, void *arg)
 }
 
 static int
-shim_file_sector_size(sqlite3_file *vfile)
+linux_file_sector_size(sqlite3_file *vfile)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        enum {
+                /*
+                 * sqlite assumes the sector size is a multiple of its
+                 * min value, 512 bytes.
+                 */
+                MIN_SECTOR_SIZE = 512,
+#ifdef PAGE_SIZE
+                DEFAULT_SECTOR_SIZE = PAGE_SIZE,
+#else
+                DEFAULT_SECTOR_SIZE = 4096,
+#endif
+        };
+        static atomic_int cached_sector_size = 0;
+        long sector_size;
 
-        return original->pMethods->xSectorSize(original);
+        (void)vfile;
+
+        /*
+         * Our sector size value is independent of the underlying
+         * filesystem, so we can use a process-global cache.
+         *
+         * Any non-zero value must be valid: the sector size
+         * computation should be deterministic, so redundant writes
+         * will always store the same value.
+         */
+        sector_size = atomic_load_explicit(&cached_sector_size,
+            memory_order_relaxed);
+        if (sector_size != 0)
+                return sector_size;
+
+        /*
+         * Let the sector size match the OS page size, if we can find
+         * it.  That's the granularity at which Linux's buffered IO
+         * works, so should be safe.  It also happens to match the
+         * sqlite default on x86 and x86-64.
+         */
+        sector_size = sysconf(_SC_PAGESIZE);
+        if (sector_size <= 0 || sector_size > INT_MAX)
+                sector_size = DEFAULT_SECTOR_SIZE;
+
+        if ((sector_size % MIN_SECTOR_SIZE) != 0)
+                sector_size = MIN_SECTOR_SIZE;
+
+        atomic_store_explicit(&cached_sector_size, sector_size,
+            memory_order_relaxed);
+        return sector_size;
 }
 
 static int
