@@ -829,9 +829,19 @@ shim_file_control(sqlite3_file *vfile, int op, void *arg)
         case SQLITE_FCNTL_CHUNK_SIZE:
                 return SQLITE_OK;
 
-        case SQLITE_FCNTL_VFSNAME:
-                *(char**)arg = sqlite3_mprintf("%s", base_vfs->zName);
+        case SQLITE_FCNTL_VFSNAME: {
+#ifdef TEST_VFS
+                /*
+                 * Pretend we're "unix" in tests, to avoid
+                 * accidentally losing coverage.
+                 */
+                const char *vfsname = "unix";
+#else
+                const char *vfsname = "linux";
+#endif
+                *(char**)arg = sqlite3_mprintf("%s", vfsname);
                 return SQLITE_OK;
+        }
 
         case SQLITE_FCNTL_HAS_MOVED:
                 *(int *)arg = linux_file_has_moved(file) ? 1 : 0;
