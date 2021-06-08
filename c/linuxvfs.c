@@ -1,7 +1,10 @@
 #include "linuxvfs.h"
 
+#include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,12 +248,242 @@ linux_access(sqlite3_vfs *vfs, const char *name, int flags, int *OUT_res)
         return SQLITE_OK;
 }
 
+/**
+ * Determines whether `name` is a symlink.
+ *
+ * @returns true on success, false on failure;
+ */
+static bool
+check_if_symlink(const char *name, bool *OUT_is_symlink)
+{
+        struct stat sb;
+        int r;
+
+        *OUT_is_symlink = false;
+
+        do {
+                r = lstat(name, &sb);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0) {
+                /*
+                 * If the path doesn't exist yet, it's clearly not a
+                 * symlink.
+                 */
+                return errno == ENOENT;
+        }
+
+        *OUT_is_symlink = S_ISLNK(sb.st_mode) != 0;
+        return true;
+}
+
+/**
+ * Attempts to copy the result of `realpath` to dst.
+ *
+ * @returns true on success, false on failure.
+ */
+static bool
+resolve_path(const char *name, int n, char *dst)
+{
+        char buf[PATH_MAX];
+        const char *resolved;
+        size_t resolved_size;
+
+        resolved = realpath(name, buf);
+        if (resolved == NULL)
+                return false;
+
+        resolved_size = strlen(resolved) + 1;
+        if ((int)resolved_size > n)
+                return false;
+
+        memcpy(dst, resolved, resolved_size);
+        return true;
+}
+
+/**
+ * Iteratively constructs the symlinked path for `link` in `dst`,
+ * until `dst` is not a symlink.
+ *
+ * @returns true on success, false on failure.
+ */
+static bool
+walk_symlink(const char *link, char *dst, size_t n)
+{
+#ifdef SQLITE_MAX_SYMLINKS
+        const size_t limit = SQLITE_MAX_SYMLINKS;
+#else
+        const size_t limit = 100;
+#endif
+
+        /* Copy `link` to `dst` */
+        {
+                size_t link_len;
+
+                link_len = strnlen(link, n);
+                if (link_len >= n)
+                        return false;
+
+                memcpy(dst, link, link_len + 1);
+        }
+
+        /*
+         * Expand the last component of `dst` in place.
+         */
+        for (size_t i = 0; i <= limit; i++) {
+                char target[PATH_MAX];
+                char *last_slash;
+                ssize_t r;
+                bool is_symlink;
+
+                /*
+                 * If we don't have a symlink, there's nothing else to
+                 * do.  Also ignore all errors: either `resolve_parent_path`
+                 * will handle it, or `open(2)` will fail.
+                 */
+                if (check_if_symlink(dst, &is_symlink) == false ||
+                    is_symlink == false)
+                        return true;
+
+                do {
+                        r = readlink(dst, target, sizeof(target));
+                } while (r < 0 && errno == EINTR);
+
+                if ((size_t)r >= sizeof(target))
+                        return false;
+
+                target[r] = '\0';
+
+                last_slash = strrchr(dst, '/');
+                if (last_slash == NULL) {
+                        if ((size_t)r >= n)
+                                return false;
+
+                        memcpy(dst, target, r + 1);
+                } else {
+                        size_t remaining = (dst + n) - (last_slash + 1);
+
+                        if ((size_t)r > remaining)
+                                return false;
+
+                        memcpy(last_slash + 1, target, r + 1);
+                }
+        }
+
+        /*
+         * If we hit the iteration limit, that was too many symlinks,
+         * and we should fail.
+         */
+        return false;
+}
+
+/**
+ * Find the real path for a file that might not exist yet, by
+ * resolving only the parent directory, and appending the file to it.
+ * The `name` string will be modified in place.
+ *
+ * This will fail to do something useful if the parent directory also
+ * does not exist, but that's fine: that means there can't be funny
+ * symlink shenanigans, and the open call will fail anyway.
+ *
+ * @return true on success, false on failure;
+ */
+static bool
+resolve_parent_path(char *name, int n_dst, char *dst)
+{
+        char resolved_dir[PATH_MAX];
+        const char *parent;
+        const char *filename;
+        const char *resolved;
+        int r;
+
+        /*
+         * Split `name` in a parent directory and a trailing filename.
+         */
+        {
+                char *last_slash;
+
+                last_slash = strrchr(name, '/');
+                if (last_slash == NULL) {
+                        parent = ".";
+                        filename = name;
+                } else {
+                        filename = last_slash + 1;
+
+                        /* While the last two chars are "//", go back one. */
+                        while (last_slash > name + 1 && last_slash[-1] == '/')
+                                last_slash--;
+
+                        *last_slash = '\0';
+                        parent = name;
+                }
+        }
+
+        resolved = realpath(parent, resolved_dir);
+        if (resolved == NULL) {
+                /*
+                 * If some component is missing, we want to use the
+                 * parent directory as is, and let the open(2) call deal
+                 * with any problem.  Similarly for EACCES, which
+                 * realpath can also return if we lack read
+                 * permissions (that aren't needed for open(2)).
+
+                 */
+                if (errno != ENOENT && errno != EACCES)
+                        return false;
+
+                resolved = parent;
+        }
+
+        if (strcmp(resolved, "/") == 0) {
+                r = snprintf(dst, n_dst, "/%s", filename);
+        } else {
+                r = snprintf(dst, n_dst, "%s/%s", resolved, filename);
+        }
+
+        return r >= 0 && r < n_dst;
+}
+
+/**
+ * sqlite uses xFullPathName to figure out where a database file
+ * actually lives: journal files are created in the same directory.
+ *
+ * This name-based scheme also means that opening DB files through
+ * symlinks can be a bad idea; that's why we must return
+ * SQLITE_OK_SYMLINK when we successfully construct the real path for
+ * `name`, but `name` is actually a symlink.
+ */
 static int
 linux_full_pathname(sqlite3_vfs *vfs, const char *name, int n, char *dst)
 {
+        char target[PATH_MAX];
+        int ok;
+        bool is_symlink;
 
         (void)vfs;
-        return base_vfs->xFullPathname(vfs, name, n, dst);
+
+        if (check_if_symlink(name, &is_symlink) == false)
+                return SQLITE_CANTOPEN;
+
+        ok = (is_symlink == true) ? SQLITE_OK_SYMLINK : SQLITE_OK;
+        if (resolve_path(name, n, dst) == true)
+                return ok;
+
+        /*
+         * We now have to handle paths that don't exist yet, and
+         * compute something that matches the file that would be
+         * created if we were to open(2) through that path.
+         */
+
+        /* First, iteratively resolve when the direct `name` is a symlink. */
+        if (walk_symlink(name, target, sizeof(target)) == false)
+                return SQLITE_CANTOPEN;
+
+        /* Next, try to resolve the parent directory. */
+        if (resolve_parent_path(target, n, dst) == false)
+                return SQLITE_CANTOPEN;
+
+        return ok;
 }
 
 static void *
