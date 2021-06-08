@@ -68,7 +68,7 @@ static int shim_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
 
 static int shim_file_control(sqlite3_file *, int op, void *arg);
 static int linux_file_sector_size(sqlite3_file *);
-static int shim_file_device_characteristics(sqlite3_file *);
+static int linux_file_device_characteristics(sqlite3_file *);
 
 static sqlite3_vfs *base_vfs;
 
@@ -89,7 +89,7 @@ static const struct sqlite3_io_methods shim_io_methods = {
 
         .xFileControl = shim_file_control,
         .xSectorSize = linux_file_sector_size,
-        .xDeviceCharacteristics = shim_file_device_characteristics,
+        .xDeviceCharacteristics = linux_file_device_characteristics,
 };
 
 static sqlite3_vfs linux_vfs = {
@@ -822,12 +822,39 @@ linux_file_sector_size(sqlite3_file *vfile)
 }
 
 static int
-shim_file_device_characteristics(sqlite3_file *vfile)
+linux_file_device_characteristics(sqlite3_file *vfile)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        /*
+         * We don't have any kind of failure-atomic write guarantee on
+         * Linux, so SQLITE_IOCAP_ATOMIC* must be off.
+         *
+         * We have seen what looks like files being extended with zero
+         * bytes before storing the new data, when VMs froze while
+         * writing to ext4 / Ceph, so `SQLITE_IOCAP_SAFE_APPEND` isn't.
+         *
+         * Linux will reorder buffered I/O, so
+         * `SQLITE_IOCAP_SEQUENTIAL` is not a thing.
+         *
+         * Open files can be unlinked under POSIX, so
+         * `SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN` is also not a thing.
+         *
+         * We know data is overwritten a full OS page at a time, and
+         * maybe worse with SSDs, so `SQLITE_IOCAP_POWERSAFE_OVERWRITE`
+         * doesn't seem true at all... however, stock sqlite turns it
+         * on by default because otherwise the journaling I/O is
+         * really sucky.  See https://sqlite.org/psow.html for
+         * details.
+         *
+         * Although some filesystems (e.g., xfs) support fully
+         * immutable files, we don't check for it, so let's assume
+         * `SQLITE_IOCAP_IMMUTABLE` is false.
+         *
+         * Finally, we also don't implement F2FS-style batch atomic
+         * commits, so `SQLITE_IOCAP_BATCH_ATOMIC` is false.
+         */
+        (void)vfile;
 
-        return original->pMethods->xDeviceCharacteristics(original);
+        return SQLITE_IOCAP_POWERSAFE_OVERWRITE;
 }
 
 int
