@@ -16,6 +16,7 @@ fn main() {
         .define("SQLITE_OMIT_AUTOINIT", None)
         // We want larger pages for our replication.
         .define("SQLITE_DEFAULT_PAGE_SIZE", "65536")
+        .define("SQLITE_MAX_DEFAULT_PAGE_SIZE", "65536")
         // Fast secure delete will zero-fill garbage in pages that
         // would be updated anyway.  The result compresses better.
         .define("SQLITE_FAST_SECURE_DELETE", None)
