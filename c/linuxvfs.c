@@ -3,10 +3,13 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +27,13 @@ SQLITE_EXTENSION_INIT1
  * baseline for VFSes that do not implement mmap or WAL methods, nor
  * any of the test syscall override logic.
  */
+
+/* Temporary directories must have some room left for filenames. */
+#define LINUX_VFS_TEMPPATH_MAX (PATH_MAX - 200)
+
+#ifndef SQLITE_TEMP_FILE_PREFIX
+# define SQLITE_TEMP_FILE_PREFIX "etilqs_"
+#endif
 
 struct shim_file {
         sqlite3_file base;
@@ -83,6 +93,13 @@ static int shim_file_control(sqlite3_file *, int op, void *arg);
 static int linux_file_sector_size(sqlite3_file *);
 static int linux_file_device_characteristics(sqlite3_file *);
 
+/*
+ * The directory for temporary files.  It is lazily computed once,
+ * and then cached.  The first value published to this variable
+ * is sticky: all writes must compare-and-swap with NULL.
+ */
+static const char *_Atomic linux_vfs_tempdir = NULL;
+
 static sqlite3_vfs *base_vfs;
 
 static const struct sqlite3_io_methods shim_io_methods = {
@@ -138,6 +155,143 @@ static sqlite3_vfs linux_vfs = {
         .xGetSystemCall = linux_get_syscall,
         .xNextSystemCall = linux_next_syscall,
 };
+
+/**
+ * Is `dir` currently a valid temporary directory?
+ */
+static bool
+is_valid_tempdir(const char *dir)
+{
+        struct stat sb;
+        int r;
+
+        /* Is the path too long? */
+        if (strnlen(dir, LINUX_VFS_TEMPPATH_MAX) >= LINUX_VFS_TEMPPATH_MAX)
+                return false;
+
+        /* Is it a directory? */
+        do {
+                r = stat(dir, &sb);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0 || S_ISDIR(sb.st_mode) == 0)
+                return false;
+
+        /* Do we have read and write access to it? */
+        do {
+                r = access(dir, W_OK | X_OK);
+        } while (r != 0 && errno == EINTR);
+
+        return r == 0;
+}
+
+bool
+sqlite3_linuxvfs_set_tempdir(const char *dir)
+{
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        /* Reserve room for the file name itself. */
+        static char tempdir_copy[LINUX_VFS_TEMPPATH_MAX];
+        const char *expected;
+        int r;
+        bool success = false;
+
+        if (is_valid_tempdir(dir) == false)
+                return false;
+
+        r = pthread_mutex_lock(&lock);
+        if (r != 0)
+                return false;
+
+        /* tempdir already computed. */
+        if (atomic_load(&linux_vfs_tempdir) != NULL)
+                goto out;
+
+        /*
+         * This strncpy is safe because `tempdir_copy` must be empty:
+         * no other thread may be in the current critical section, and
+         * we ensure `linux_vfs_tempdir` is non-NULL before releasing
+         * the lock.  If we get here, it's the first call to
+         * `sqlite3_linux_vfs_set_tempdir`.
+         */
+        strncpy(tempdir_copy, dir, sizeof(tempdir_copy));
+        tempdir_copy[sizeof(tempdir_copy) - 1] = '\0';
+
+        expected = NULL;
+        success = atomic_compare_exchange_strong(&linux_vfs_tempdir,
+            &expected, tempdir_copy);
+
+out:
+        r = pthread_mutex_unlock(&lock);
+        assert(r == 0 && "pthread_mutex_unlock failed");
+        return success;
+}
+
+static const char *
+compute_tempdir(void)
+{
+        const char *dirs[] = {
+                /* Use the same priority as the Unix VFS. */
+                sqlite3_temp_directory,
+                /*
+                 * We call `getenv` the first time we compute the
+                 * temporary directory, and then cache the result.
+                 * That's not safe in there are calls to `setenv`, but
+                 * there's essentially nothing we can do to fix that;
+                 * the environment should be considered static.
+                 *
+                 * POSIX also allows the implementation to reuse a
+                 * mutable buffer for the return value of `getenv`.
+                 * We assume no libc is that broken.
+                 */
+                NULL,
+                NULL,
+                "/var/tmp",
+                "/usr/tmp",
+                "/tmp",
+                ".",
+        };
+
+#ifdef _GNU_SOURCE
+        /*
+         * When GNU extensions are available, use secure_getenv to
+         * ignore the environment in suid binaries: we don't want
+         * untrusted user to control where our writes go.
+         */
+        dirs[1] = secure_getenv("SQLITE_TMPDIR");
+        dirs[2] = secure_getenv("TMPDIR");
+#else
+        dirs[1] = getenv("SQLITE_TMPDIR");
+        dirs[2] = getenv("TMPDIR");
+#endif
+
+        for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+                const char *dir = dirs[i];
+
+                if (dir != NULL && is_valid_tempdir(dir))
+                        return dir;
+        }
+
+        /* If nothing works, default to "/tmp" */
+        return "/tmp";
+}
+
+static const char *
+get_tempdir_base(void)
+{
+        const char *copy;
+        const char *computed;
+
+        copy = atomic_load_explicit(&linux_vfs_tempdir, memory_order_relaxed);
+        if (copy != NULL)
+                return copy;
+
+        computed = compute_tempdir();
+        if (atomic_compare_exchange_strong(&linux_vfs_tempdir, &copy,
+            computed) == true)
+                return computed;
+
+        return copy;
+}
 
 static int
 linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
@@ -819,6 +973,48 @@ linux_file_has_moved(const struct shim_file *file)
 }
 
 static int
+linux_tempfilename(char **dst)
+{
+        static _Atomic uint64_t counter = 0;
+        struct timespec now = { 0 };
+        uint64_t noise[2] = { 0 };
+        uint64_t unique;
+        ssize_t r;
+        int pid;
+
+        clock_gettime(CLOCK_REALTIME, &now);
+        do {
+                r = getrandom_compat(noise, sizeof(noise), 0);
+        } while (r <= 0 && errno == EINTR);
+
+        unique = atomic_fetch_add(&counter, 1);
+        pid = getpid();
+
+        static_assert(
+            LINUX_VFS_TEMPPATH_MAX + sizeof(SQLITE_TEMP_FILE_PREFIX)
+            /* the harcoded string pattern is < 100 chars. */
+            + 100
+            /* pid fits in 10 chars. */
+            + 10
+            /* time and counter fit in 20 chars each. */
+            + 2 * 20
+            /* finally, the two random u64 are 16 chars each. */
+            + 2 * 16
+            < PATH_MAX,
+            "TEMPPATH_MAX + suffix must fit in PATH_MAX");
+
+        *dst = sqlite3_mprintf(
+            "%s/"SQLITE_TEMP_FILE_PREFIX"linux_vfs.pid=%i"
+            ".time=%lld.counter=%"PRIu64".rand=%016"PRIx64"%016"PRIx64".tmp",
+            get_tempdir_base(), pid,
+            (long long)now.tv_sec, unique, noise[0], noise[1]);
+        if (*dst == NULL)
+                return SQLITE_NOMEM;
+
+        return SQLITE_OK;
+}
+
+static int
 shim_file_control(sqlite3_file *vfile, int op, void *arg)
 {
         struct shim_file *file = (void *)vfile;
@@ -847,9 +1043,11 @@ shim_file_control(sqlite3_file *vfile, int op, void *arg)
                 *(int *)arg = linux_file_has_moved(file) ? 1 : 0;
                 return SQLITE_OK;
 
+        case SQLITE_FCNTL_TEMPFILENAME:
+                return linux_tempfilename(arg);
+
         /* These are used in tests, and should be implemented. */
         case SQLITE_FCNTL_LOCKSTATE:
-        case SQLITE_FCNTL_TEMPFILENAME:
                 return original->pMethods->xFileControl(original, op, arg);
 
         default:

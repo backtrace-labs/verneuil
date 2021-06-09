@@ -40,6 +40,8 @@ fn main() {
     println!("cargo:rerun-if-changed=c/linuxvfs.h");
     cc::Build::new()
         .include("include")
+        // We want GNU extensions.
+        .define("_GNU_SOURCE", None)
         // We're linking this extension statically, without going
         // through sqlite's dynamic loading mechanism.
         .define("SQLITE_CORE", None)
