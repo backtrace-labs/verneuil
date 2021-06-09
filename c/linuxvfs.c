@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
@@ -22,22 +23,57 @@
 SQLITE_EXTENSION_INIT1
 
 /**
- * This shim VFS wraps the default VFS and exposes only a subset of IO
- * methods.  Running SQLite's tests with this dummy VFS gives us a
- * baseline for VFSes that do not implement mmap or WAL methods, nor
- * any of the test syscall override logic.
+ * The Linux VFS implements the basic file operations that sqlite uses
+ * for non-WAL databases.  It passes sqlite's test suite
+ * (Fossil id 5d4535bfb603d7c8229ef60f99666459f2997e02e186bc1e52b7ec1320251d67)
+ * at the same level as a shim VFS that hides the mmap / shmem methods
+ * left unimplemented by this VFS, except for:
+ *
+ *  - File locking
+ *  - Test-only open file counter
+ *  - Exact fsync counts
+ *  - diskfull-1.{3,5}: we don't implement failure injection, and these
+ *      tests exercise sqlite's handling of VFS errors, not the VFS.
+ *  - ioerr2-5: we don't implement failure injection.
+ *  - journal3-1.2.[2-4].4: journal files fail to inherit the main
+ *      db's uid/gid/permissions, and instead always use the current
+ *      user, and default permissions (0644) after umask.
+ *  - unixexcl-1.2.4.singleproc: we do not do anything special for
+ *      in-process locking, so the `unix-excl` VFS excludes the
+ *      Linux VFS even within the same process.
  */
 
 /* Temporary directories must have some room left for filenames. */
 #define LINUX_VFS_TEMPPATH_MAX (PATH_MAX - 200)
 
+#ifndef SQLITE_DEFAULT_FILE_PERMISSIONS
+# define SQLITE_DEFAULT_FILE_PERMISSIONS 0644
+#endif
+
 #ifndef SQLITE_TEMP_FILE_PREFIX
 # define SQLITE_TEMP_FILE_PREFIX "etilqs_"
 #endif
 
-struct shim_file {
+struct linux_file {
         sqlite3_file base;
-        sqlite3_file *original;
+        /*
+         * The descriptor for this file object.  The underlying kernel
+         * file object must be unique owned by this file struct (i.e.,
+         * can't dup this).
+         */
+        int fd;
+
+        /*
+         * Current lock level for this file object on the underlying
+         * inode.  Matches the level parameters of xLock / xUnlock:
+         *
+         * SQLITE_LOCK_NONE       0
+         * SQLITE_LOCK_SHARED     1
+         * SQLITE_LOCK_RESERVED   2
+         * SQLITE_LOCK_PENDING    3
+         * SQLITE_LOCK_EXCLUSIVE  4
+         */
+        int lock_level;
 
         /*
          * NULLable.  Only NULL for temporary files, otherwise this is
@@ -46,8 +82,7 @@ struct shim_file {
         const char *path;
 
         /*
-         * If `path` is non-NULL, this metadata identifies the inode
-         * for `path` around the time the file was opened.
+         * This metadata identifies the inode that `fd` refers to.
          */
         dev_t device;
         ino_t inode;
@@ -78,18 +113,18 @@ static int linux_set_syscall(sqlite3_vfs *, const char *, sqlite3_syscall_ptr);
 static sqlite3_syscall_ptr linux_get_syscall(sqlite3_vfs *, const char *);
 static const char *linux_next_syscall(sqlite3_vfs *, const char *);
 
-static int shim_file_close(sqlite3_file *);
-static int shim_file_read(sqlite3_file *, void *dst, int n, sqlite3_int64 off);
-static int shim_file_write(sqlite3_file *, const void *src, int n, sqlite3_int64 off);
-static int shim_file_truncate(sqlite3_file *, sqlite3_int64 size);
-static int shim_file_sync(sqlite3_file *, int flags);
-static int shim_file_size(sqlite3_file *, sqlite3_int64 *OUT_size);
+static int linux_file_close(sqlite3_file *);
+static int linux_file_read(sqlite3_file *, void *dst, int n, sqlite3_int64 off);
+static int linux_file_write(sqlite3_file *, const void *src, int n, sqlite3_int64 off);
+static int linux_file_truncate(sqlite3_file *, sqlite3_int64 size);
+static int linux_file_sync(sqlite3_file *, int flags);
+static int linux_file_size(sqlite3_file *, sqlite3_int64 *OUT_size);
 
-static int shim_file_lock(sqlite3_file *, int level);
-static int shim_file_unlock(sqlite3_file *, int level);
-static int shim_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
+static int linux_file_lock(sqlite3_file *, int level);
+static int linux_file_unlock(sqlite3_file *, int level);
+static int linux_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
 
-static int shim_file_control(sqlite3_file *, int op, void *arg);
+static int linux_file_control(sqlite3_file *, int op, void *arg);
 static int linux_file_sector_size(sqlite3_file *);
 static int linux_file_device_characteristics(sqlite3_file *);
 
@@ -102,29 +137,29 @@ static const char *_Atomic linux_vfs_tempdir = NULL;
 
 static sqlite3_vfs *base_vfs;
 
-static const struct sqlite3_io_methods shim_io_methods = {
+static const struct sqlite3_io_methods linux_io_methods = {
         .iVersion = 1,  /* No WAL or mmap method */
-        .xClose = shim_file_close,
+        .xClose = linux_file_close,
 
-        .xRead = shim_file_read,
-        .xWrite = shim_file_write,
-        .xTruncate = shim_file_truncate,
-        .xSync = shim_file_sync,
+        .xRead = linux_file_read,
+        .xWrite = linux_file_write,
+        .xTruncate = linux_file_truncate,
+        .xSync = linux_file_sync,
 
-        .xFileSize = shim_file_size,
+        .xFileSize = linux_file_size,
 
-        .xLock = shim_file_lock,
-        .xUnlock = shim_file_unlock,
-        .xCheckReservedLock = shim_file_check_reserved_lock,
+        .xLock = linux_file_lock,
+        .xUnlock = linux_file_unlock,
+        .xCheckReservedLock = linux_file_check_reserved_lock,
 
-        .xFileControl = shim_file_control,
+        .xFileControl = linux_file_control,
         .xSectorSize = linux_file_sector_size,
         .xDeviceCharacteristics = linux_file_device_characteristics,
 };
 
 static sqlite3_vfs linux_vfs = {
         .iVersion = 3,
-        .szOsFile = sizeof(struct shim_file),
+        .szOsFile = sizeof(struct linux_file),
         .mxPathname = 512,  /* default limit for the default VFS */
         .zName = "linux",
         .xOpen = linux_open,
@@ -293,11 +328,25 @@ get_tempdir_base(void)
         return copy;
 }
 
+static bool
+linux_path_exists(const char *path)
+{
+        int r;
+
+        do {
+                r = access(path, F_OK);
+        } while (r != 0 && errno == EINTR);
+
+        return r == 0;
+}
+
 static int
 linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
     int flags, int *OUT_flags)
 {
-        struct shim_file *file = (void *)vfile;
+        struct linux_file *file = (void *)vfile;
+        int open_flags = O_CLOEXEC | O_LARGEFILE | O_NOFOLLOW;
+        int fd;
         int rc;
 
         (void)vfs;
@@ -312,40 +361,113 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          *   pointer to the filename if it needs to remember the
          *   filename for some reason.
          */
-        *file = (struct shim_file) {
-                .base.pMethods = &shim_io_methods,
-                .original = calloc(1, base_vfs->szOsFile),
+        *file = (struct linux_file) {
+                .base.pMethods = &linux_io_methods,
+                .fd = -1,
                 .path = name,
         };
 
-        if (file->original == NULL) {
-                *file = (struct shim_file) { 0 };
-                return SQLITE_NOMEM;
-        }
+        if ((flags & SQLITE_OPEN_READONLY) != 0)
+                open_flags |= O_RDONLY;
 
-        rc = base_vfs->xOpen(base_vfs, name, file->original, flags, OUT_flags);
-        if (file->original->pMethods == NULL || rc != SQLITE_OK) {
-                shim_file_close(vfile);
-                return rc;
-        }
+        if ((flags & SQLITE_OPEN_READWRITE) != 0)
+                open_flags |= O_RDWR;
 
         /*
-         * Not a temporary file, and the `base_vfs` has created the
-         * file if necessary.  Now, we can stat that path.
-         *
-         * Ideally, we'd fstat rather than stat, but that will have to
-         * wait until we actually open(2) the file ourselves.
+         * name == NULL means a temporary file, and implies
+         * delete-on-close. The default unix VFS implements that flag
+         * latter as open + unlink; let's skip that intermediate step
+         * and get an `O_TMPFILE` in `get_tempdir_base()`.
+         */
+        if (name == NULL || (flags & SQLITE_OPEN_DELETEONCLOSE) != 0) {
+                file->path = NULL;
+
+                do {
+                        /*
+                         * TODO: make sure fd >=
+                         * SQLITE_MINIMUM_FILE_DESCRIPTOR.
+                         */
+                        fd = open(get_tempdir_base(),
+                             O_TMPFILE | O_EXCL | open_flags, 0600);
+                } while (fd < 0 && errno == EINTR);
+
+                if (fd < 0 && errno == EACCES) {
+                        rc = SQLITE_READONLY_DIRECTORY;
+                        goto fail;
+                }
+        } else {
+                if ((flags & SQLITE_OPEN_CREATE) != 0)
+                        open_flags |= O_CREAT;
+
+                if ((flags & SQLITE_OPEN_EXCLUSIVE) != 0)
+                        open_flags |= O_EXCL;
+
+                /*
+                 * TODO: we should ideally inherit the permission and
+                 * ownership of the main DB when opening journals.
+                 *
+                 * In most cases however, it's fine to just use the
+                 * the default (0644), and let umask do its thing.
+                 */
+                do {
+                        fd = open(name, open_flags,
+                            SQLITE_DEFAULT_FILE_PERMISSIONS);
+                } while (fd < 0 && errno == EINTR);
+
+                /* Bail early if we found a directory. */
+                if (fd < 0 && errno == EISDIR) {
+                        rc = SQLITE_CANTOPEN;
+                        goto fail;
+                }
+
+                /*
+                 * If we failed to create a new file that does not
+                 * already exist, report a read-only parent directory.
+                 */
+                if (fd < 0 &&
+                    (flags & SQLITE_OPEN_CREATE) != 0 &&
+                    errno == EACCES &&
+                    linux_path_exists(name) == false) {
+                        rc = SQLITE_READONLY_DIRECTORY;
+                        goto fail;
+                }
+
+                /*
+                 * Try again in read-only mode.
+                 */
+                if (fd < 0 && (flags & SQLITE_OPEN_READWRITE) != 0) {
+                        flags &= ~(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+                        flags |= SQLITE_OPEN_READONLY;
+
+                        open_flags &= ~(O_RDWR | O_CREAT);
+                        open_flags |= O_RDONLY;
+                        do {
+                                fd = open(name, open_flags,
+                                     SQLITE_DEFAULT_FILE_PERMISSIONS);
+                        } while (fd < 0 && errno == EINTR);
+                }
+        }
+
+        if (fd < 0) {
+                rc = SQLITE_CANTOPEN;
+                goto fail;
+        }
+
+        file->fd = fd;
+
+        /*
+         * fstat the file to remember its current identity.
          */
         if (name != NULL) {
                 struct stat sb;
                 int r;
 
                 do {
-                        r = stat(name, &sb);
+                        r = fstat(fd, &sb);
                 } while (r != 0 && errno == EINTR);
 
                 if (r != 0) {
-                        shim_file_close(vfile);
+                        linux_file_close(vfile);
                         return SQLITE_IOERR_FSTAT;
                 }
 
@@ -353,7 +475,13 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                 file->inode = sb.st_ino;
         }
 
+        if (OUT_flags != NULL)
+                *OUT_flags = flags;
         return SQLITE_OK;
+
+fail:
+        *file = (struct linux_file) { .fd = -1 };
+        return rc;
 }
 
 static int
@@ -853,102 +981,218 @@ linux_next_syscall(sqlite3_vfs *vfs, const char *name)
 }
 
 static int
-shim_file_close(sqlite3_file *vfile)
+linux_file_close(sqlite3_file *vfile)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
-        int rc;
+        struct linux_file *file = (void *)vfile;
 
-        if (original == NULL) {
-                *file = (struct shim_file) { 0 };
+        if (file->fd >= 0) {
+                /*
+                 * *never* retry close: it might fail after recycling
+                 * the file descriptor id.
+                 */
+                close(file->fd);
+        }
+
+        *file = (struct linux_file) { .fd = -1 };
+        return SQLITE_OK;
+}
+
+static int
+linux_file_read(sqlite3_file *vfile, void *dst, int n, sqlite3_int64 off)
+{
+        struct linux_file *file = (void *)vfile;
+
+        while (n > 0) {
+                ssize_t r;
+
+                r = pread(file->fd, dst, n, off);
+                if (r == 0)
+                        break;
+
+                if (r > 0) {
+                        assert(r <= n);
+                        dst = (char *)dst + r;
+                        n -= r;
+                        off += r;
+                } else if (errno != EINTR) {
+                        switch (errno) {
+                        /* Upstream converts these to CORRUPTFS. */
+                        case ERANGE:
+                        case EIO:
+                        case ENXIO:
+#ifdef EDEVERR
+                        case EDEVERR:
+#endif
+                                return SQLITE_IOERR_CORRUPTFS;
+
+                        default:
+                                return SQLITE_IOERR_READ;
+                        }
+                }
+        }
+
+        if (n == 0)
                 return SQLITE_OK;
+
+        /*
+         * We don't return the actual read length; short reads must
+         * instead zero-fill the remainder of the destination buffer.
+         */
+        memset(dst, 0, n);
+        return SQLITE_IOERR_SHORT_READ;
+}
+
+static int
+linux_file_write(sqlite3_file *vfile, const void *src, int n, sqlite3_int64 off)
+{
+        struct linux_file *file = (void *)vfile;
+
+        while (n > 0) {
+                ssize_t r;
+
+                r = pwrite(file->fd, src, n, off);
+
+                /* r == 0 shouldn't happen... */
+                if (r >= 0) {
+                        assert(r <= n);
+                        src = (const char *)src + r;
+                        n -= r;
+                        off += r;
+                } else if (errno != EINTR) {
+                        switch (errno) {
+                        case EDQUOT:
+                        case ENOSPC:
+                                return SQLITE_FULL;
+
+                        default:
+                                return SQLITE_IOERR_WRITE;
+                        }
+                }
         }
 
-        if (original->pMethods != NULL) {
-                rc = original->pMethods->xClose(original);
-        } else {
-                rc = SQLITE_OK;
+        return SQLITE_OK;
+}
+
+static int
+linux_file_truncate(sqlite3_file *vfile, sqlite3_int64 size)
+{
+        struct linux_file *file = (void *)vfile;
+        int r;
+
+#ifdef __ANDROID__
+        /*
+         * Sqlite says ftruncate() always uses 32-bit offsets on
+         * android, and it's safe to just ignore any requests
+         * for more than 2GB!?
+         */
+        if (size > INT32_MAX)
+                return SQLITE_OK;
+#endif
+
+        do {
+                r = ftruncate(file->fd, size);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0)
+                return SQLITE_IOERR_TRUNCATE;
+
+        return SQLITE_OK;
+}
+
+static int
+linux_file_sync(sqlite3_file *vfile, int flags)
+{
+        struct linux_file *file = (void *)vfile;
+        int r;
+
+        (void)flags;
+
+#ifdef SQLITE_TEST
+        extern int sqlite3_fullsync_count;
+        extern int sqlite3_sync_count;
+
+        /*
+         * TODO: another sync for the directory if `ctrlFlags &
+         * UNIXFILE_DIRSYNC`.
+         */
+        if ((flags & 0x0F) == SQLITE_SYNC_FULL)
+                sqlite3_fullsync_count++;
+        sqlite3_sync_count++;
+#endif
+
+        do {
+                r = fdatasync(file->fd);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0) {
+                switch (errno) {
+                case ENOSPC:
+                case EDQUOT:
+                        return SQLITE_FULL;
+
+                default:
+                        return SQLITE_IOERR_FSYNC;
+                }
         }
 
-        free(original);
-        *file = (struct shim_file) { 0 };
-        return rc;
+        return SQLITE_OK;
 }
 
 static int
-shim_file_read(sqlite3_file *vfile, void *dst, int n, sqlite3_int64 off)
+linux_file_size(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        struct stat sb;
+        struct linux_file *file = (void *)vfile;
+        int r;
 
-        return original->pMethods->xRead(original, dst, n, off);
+        do {
+                r = fstat(file->fd, &sb);
+        } while (r != 0 && errno == EINTR);
+
+        if (r != 0)
+                return SQLITE_IOERR_FSTAT;
+
+        *OUT_size = sb.st_size;
+        return SQLITE_OK;
 }
 
 static int
-shim_file_write(sqlite3_file *vfile, const void *src, int n, sqlite3_int64 off)
+linux_file_lock(sqlite3_file *vfile, int level)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        struct linux_file *file = (void *)vfile;
 
-        return original->pMethods->xWrite(original, src, n, off);
+        /* xLock never downgrades, and instead no-ops. */
+        if (file->lock_level >= level)
+                return SQLITE_OK;
+
+        file->lock_level = level;
+        return SQLITE_OK;
 }
 
 static int
-shim_file_truncate(sqlite3_file *vfile, sqlite3_int64 size)
+linux_file_unlock(sqlite3_file *vfile, int level)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        struct linux_file *file = (void *)vfile;
 
-        return original->pMethods->xTruncate(original, size);
+        /* xUnlock never upgrades, and instead no-ops. */
+        if (file->lock_level <= level)
+                return SQLITE_OK;
+
+        file->lock_level = level;
+        return SQLITE_OK;
 }
 
 static int
-shim_file_sync(sqlite3_file *vfile, int flags)
+linux_file_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        struct linux_file *file = (void *)vfile;
 
-        return original->pMethods->xSync(original, flags);
-}
-
-static int
-shim_file_size(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
-{
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
-
-        return original->pMethods->xFileSize(original, OUT_size);
-}
-
-static int
-shim_file_lock(sqlite3_file *vfile, int level)
-{
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
-
-        return original->pMethods->xLock(original, level);
-}
-
-static int
-shim_file_unlock(sqlite3_file *vfile, int level)
-{
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
-
-        return original->pMethods->xUnlock(original, level);
-}
-
-static int
-shim_file_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
-{
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
-
-        return original->pMethods->xCheckReservedLock(original, OUT_result);
+        *OUT_result = (file->lock_level >= SQLITE_LOCK_RESERVED) ? 1 : 0;
+        return SQLITE_OK;
 }
 
 static bool
-linux_file_has_moved(const struct shim_file *file)
+linux_file_has_moved(const struct linux_file *file)
 {
         struct stat sb;
         const char *path = file->path;
@@ -1015,10 +1259,9 @@ linux_tempfilename(char **dst)
 }
 
 static int
-shim_file_control(sqlite3_file *vfile, int op, void *arg)
+linux_file_control(sqlite3_file *vfile, int op, void *arg)
 {
-        struct shim_file *file = (void *)vfile;
-        sqlite3_file *original = file->original;
+        struct linux_file *file = (void *)vfile;
 
         switch (op) {
         /* Advisory fcntl used in tests. */
@@ -1048,7 +1291,8 @@ shim_file_control(sqlite3_file *vfile, int op, void *arg)
 
         /* These are used in tests, and should be implemented. */
         case SQLITE_FCNTL_LOCKSTATE:
-                return original->pMethods->xFileControl(original, op, arg);
+                *(int *)arg = file->lock_level;
+                return SQLITE_OK;
 
         default:
                 return SQLITE_NOTFOUND;
