@@ -50,6 +50,14 @@ SQLITE_EXTENSION_INIT1
 # define SQLITE_DEFAULT_FILE_PERMISSIONS 0644
 #endif
 
+/*
+ * Avoid using file descriptors lower than this value: we don't want
+ * writes to what should be stdout or stderr to stomp over our data.
+ */
+#ifndef SQLITE_MINIMUM_FILE_DESCRIPTOR
+# define SQLITE_MINIMUM_FILE_DESCRIPTOR 3
+#endif
+
 #ifndef SQLITE_TEMP_FILE_PREFIX
 # define SQLITE_TEMP_FILE_PREFIX "etilqs_"
 #endif
@@ -353,6 +361,61 @@ get_tempdir_base(void)
         return copy;
 }
 
+/**
+ * Wraps open(2) to retry on EINTR and avoid returning file
+ * descriptors below `SQLITE_MINIMUM_FILE_DESCRIPTOR` (usually 3,
+ * to avoid stdin/stdout/stderr).
+ */
+static int
+linux_safe_open(const char *path, int flags, mode_t mode)
+{
+        int dummy, err, fd, r;
+
+        do {
+                fd = open(path, flags, mode);
+        } while (fd < 0 && errno == EINTR);
+
+        if (fd < 0)
+                return fd;
+
+        if (fd >= SQLITE_MINIMUM_FILE_DESCRIPTOR)
+                return fd;
+
+        /*
+         * This FD is too low.  Open `/dev/null` and dup3 in place.
+         */
+        do {
+                dummy = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        } while (dummy < 0 && errno == EINTR);
+
+        if (dummy < 0)
+                return dummy;
+
+        /* Copy `dummy` to `0 <= fd < SQLITE_MINIMUM_FILE_DESCRIPTOR`. */
+        do {
+                r = dup3(dummy, fd, O_CLOEXEC);
+        } while (r < 0 && errno == EINTR);
+
+        /*
+         * Regardless of what happened to `dup3`, we want to get rid
+         * of `dummy` if it's a file descriptor number we can use.
+         */
+        if (dummy >= SQLITE_MINIMUM_FILE_DESCRIPTOR) {
+                err = errno;
+                close(dummy);
+                errno = err;
+        }
+
+        if (r < 0)
+                return r;
+
+        /*
+         * We made some progress and populated at least one fd below
+         * SQLITE_MINIMUM_FILE_DESCRIPTOR.  Try again.
+         */
+        return linux_safe_open(path, flags, mode);
+}
+
 static bool
 linux_path_exists(const char *path)
 {
@@ -417,16 +480,8 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          */
         if (name == NULL || (flags & SQLITE_OPEN_DELETEONCLOSE) != 0) {
                 file->path = NULL;
-
-                do {
-                        /*
-                         * TODO: make sure fd >=
-                         * SQLITE_MINIMUM_FILE_DESCRIPTOR.
-                         */
-                        fd = open(get_tempdir_base(),
-                             O_TMPFILE | O_EXCL | open_flags, 0600);
-                } while (fd < 0 && errno == EINTR);
-
+                fd = linux_safe_open(get_tempdir_base(),
+                     O_TMPFILE | O_EXCL | open_flags, 0600);
                 if (fd < 0 && errno == EACCES) {
                         rc = SQLITE_READONLY_DIRECTORY;
                         goto fail;
@@ -445,10 +500,8 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                  * In most cases however, it's fine to just use the
                  * the default (0644), and let umask do its thing.
                  */
-                do {
-                        fd = open(name, open_flags,
-                            SQLITE_DEFAULT_FILE_PERMISSIONS);
-                } while (fd < 0 && errno == EINTR);
+                fd = linux_safe_open(name, open_flags,
+                    SQLITE_DEFAULT_FILE_PERMISSIONS);
 
                 /* Bail early if we found a directory. */
                 if (fd < 0 && errno == EISDIR) {
@@ -477,10 +530,7 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
 
                         open_flags &= ~(O_RDWR | O_CREAT);
                         open_flags |= O_RDONLY;
-                        do {
-                                fd = open(name, open_flags,
-                                     SQLITE_DEFAULT_FILE_PERMISSIONS);
-                        } while (fd < 0 && errno == EINTR);
+                        fd = linux_safe_open(name, open_flags, 0);
                 }
         }
 
