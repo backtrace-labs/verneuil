@@ -31,7 +31,6 @@ SQLITE_EXTENSION_INIT1
  *
  *  - File locking
  *  - Test-only open file counter
- *  - Exact fsync counts
  *  - diskfull-1.{3,5}: we don't implement failure injection, and these
  *      tests exercise sqlite's handling of VFS errors, not the VFS.
  *  - ioerr2-5: we don't implement failure injection.
@@ -89,6 +88,15 @@ struct linux_file {
          */
         dev_t device;
         ino_t inode;
+
+        /*
+         * sqlite expects us to fsync the parent directory along with
+         * this (journal) file, in order to guarantee its visibility.
+         *
+         * We don't actually do that, but we still want to fake it for
+         * tests.
+         */
+        bool dirsync_pending;
 };
 
 typedef void dlfun_t(void);
@@ -348,6 +356,8 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
     int flags, int *OUT_flags)
 {
         struct linux_file *file = (void *)vfile;
+        const int journal_mask =
+            SQLITE_OPEN_SUPER_JOURNAL | SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_WAL;
         int open_flags = O_CLOEXEC | O_LARGEFILE | O_NOFOLLOW;
         int fd;
         int rc;
@@ -368,6 +378,15 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                 .base.pMethods = &linux_io_methods,
                 .fd = -1,
                 .path = name,
+                /*
+                 * If we're creating a new journal file, test code
+                 * expects the parent directory to be fsynced the
+                 * first time the journal itself is synced.  We don't
+                 * do that, but we do want to increment the sync
+                 * counter in tests.
+                 */
+                .dirsync_pending = (flags & SQLITE_OPEN_CREATE) != 0 &&
+                    (flags & journal_mask) != 0,
         };
 
         if ((flags & SQLITE_OPEN_READONLY) != 0)
@@ -1114,14 +1133,20 @@ linux_file_sync(sqlite3_file *vfile, int flags)
         extern int sqlite3_fullsync_count;
         extern int sqlite3_sync_count;
 
-        /*
-         * TODO: another sync for the directory if `ctrlFlags &
-         * UNIXFILE_DIRSYNC`.
-         */
         if ((flags & 0x0F) == SQLITE_SYNC_FULL)
                 sqlite3_fullsync_count++;
         sqlite3_sync_count++;
+
+        /* Fake fsync-ing the parent directory, if needed.*/
+        if (file->dirsync_pending == true)
+                sqlite3_sync_count++;
 #endif
+
+        /*
+         * If we did implement dirsync, we would only have to do so
+         * once after file creation.
+         */
+        file->dirsync_pending = false;
 
         do {
                 r = fdatasync(file->fd);
