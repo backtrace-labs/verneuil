@@ -112,6 +112,12 @@ struct linux_file {
         ino_t inode;
 
         /*
+         * Wait up to this many milliseconds for each lock
+         * acquisition.
+         */
+        uint32_t lock_timeout_ms;
+
+        /*
          * sqlite expects us to fsync the parent directory along with
          * this (journal) file, in order to guarantee its visibility.
          *
@@ -1308,15 +1314,115 @@ static const size_t linux_file_shared_lock_size = 510;
  */
 static const size_t linux_file_all_lock_size = 512;
 
+static uint64_t
+now_ms_boottime(void)
+{
+        struct timespec now;
+
+        clock_gettime(CLOCK_BOOTTIME, &now);
+        return 1000 * (uint64_t)now.tv_sec + (now.tv_nsec / 1000000);
+}
+
+/**
+ * Sleeps for a few milliseconds, or until `end_ms`.
+ *
+ * @param num_attempts the number of times we have already slept
+ *   while trying to acquire the same lock.
+ * Returns false if the current time is past the `end_ms` deadline.
+ */
+static bool
+sleep_until_at_most(uint64_t num_attempts, uint64_t end_ms)
+{
+        struct timespec to_sleep = { .tv_sec = 0 };
+        uint64_t now;
+        double random_value;
+        double max_sleep_ms;
+        double sleep_ms;
+
+        now = now_ms_boottime();
+        if (now >= end_ms)
+                return false;
+
+        {
+                uint64_t random_bits;
+
+                sqlite3_randomness(sizeof(random_bits), &random_bits);
+                random_value = (1.0 / UINT64_MAX) * random_bits;
+        }
+
+        /*
+         * Use exponential backoff to set the maximum sleep value,
+         * from an initial value 0.1 milliseconds up to 10
+         * milliseconds.
+         *
+         * We use `num_attempts / 4` as our backoff exponent to
+         * approximate a smoother base factor of ~1.2x instead of 2x
+         * per attempt.  This asymptotically guarantees that, if the
+         * lock is held continuously until we acquire it, we will
+         * sleep at most ~50% (modulo jitter) longer than the time
+         * the lock was actually unavailable to us.
+         */
+        if (num_attempts < 7 * 4) {
+                max_sleep_ms = 0.1 * (1UL << (num_attempts / 4));
+        } else {
+                max_sleep_ms = 10.0;
+        }
+
+        if (max_sleep_ms > end_ms - now)
+                max_sleep_ms = end_ms - now;
+
+        /* And jitter uniformly within that limit. */
+        sleep_ms = random_value * max_sleep_ms;
+        to_sleep.tv_nsec = 1e6 * sleep_ms + 0.5;
+        nanosleep(&to_sleep, NULL);
+        return true;
+}
+
 static int
 linux_flock_op(const struct linux_file *file, int op, struct flock *fl,
     int default_error)
 {
+        uint64_t begin, end;
+        uint64_t num_sleep = 0;
+        uint32_t timeout = file->lock_timeout_ms;
         int r;
 
-        /* TODO: loop and apply file timeout. */
+        begin = now_ms_boottime();
+        end = begin + timeout;
+
         do {
                 r = fcntl(file->fd, op, fl);
+
+                /*
+                 * If we failed to acquire the lock, and there's a
+                 * non-zero timeout, sleep for a bit at most 20 times
+                 * per timeout millisecond: this limit guarantees that
+                 * we won't sleep forever in case the clock isn't
+                 * monotonic.
+                 *
+                 * The initial sleeps are expected to be ~0.05 ms on
+                 * average and start ramping up after the 4th, so
+                 * allowing 20 sleeps per millisecond of timeout means
+                 * that we will definitely not stop due to this sleep
+                 * *count* limit unless time goes wonky or our calls
+                 * to nanosleep are interrupted very frequently.
+                 */
+                if (r < 0 &&
+                    num_sleep / 20 < timeout &&
+                    (errno == EACCES || errno == EAGAIN)) {
+                        if (sleep_until_at_most(num_sleep, end) == false) {
+                                errno = EACCES;
+                                break;
+                        }
+
+                        num_sleep++;
+                        /*
+                         * Pretend we were just interrupted after
+                         * sleeping for a bit, to let the do / while
+                         * loop try again.
+                         */
+                        errno = EINTR;
+                }
         } while (r < 0 && errno == EINTR);
 
         if (r != 0) {
@@ -1720,6 +1826,14 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
         case SQLITE_FCNTL_LOCKSTATE:
                 *(int *)arg = file->lock_level;
                 return SQLITE_OK;
+
+        case SQLITE_FCNTL_LOCK_TIMEOUT: {
+                uint32_t old = file->lock_timeout_ms;
+
+                file->lock_timeout_ms = *(uint32_t *)arg;
+                *(uint32_t *)arg = old;
+                return SQLITE_OK;
+        }
 
         default:
                 return SQLITE_NOTFOUND;
