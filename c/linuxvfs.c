@@ -30,7 +30,6 @@ SQLITE_EXTENSION_INIT1
  * left unimplemented by this VFS, except for:
  *
  *  - File locking
- *  - Test-only open file counter
  *  - diskfull-1.{3,5}: we don't implement failure injection, and these
  *      tests exercise sqlite's handling of VFS errors, not the VFS.
  *  - ioerr2-5: we don't implement failure injection.
@@ -474,6 +473,12 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                 rc = SQLITE_CANTOPEN;
                 goto fail;
         }
+
+#ifdef SQLITE_TEST
+        extern int sqlite3_open_file_count;
+
+        sqlite3_open_file_count++;
+#endif
 
         file->fd = fd;
 
@@ -1013,6 +1018,12 @@ linux_file_close(sqlite3_file *vfile)
                  * the file descriptor id.
                  */
                 close(file->fd);
+
+#ifdef SQLITE_TEST
+                extern int sqlite3_open_file_count;
+
+                sqlite3_open_file_count--;
+#endif
         }
 
         *file = (struct linux_file) { .fd = -1 };
