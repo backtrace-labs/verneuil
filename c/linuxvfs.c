@@ -29,7 +29,6 @@ SQLITE_EXTENSION_INIT1
  * at the same level as a shim VFS that hides the mmap / shmem methods
  * left unimplemented by this VFS, except for:
  *
- *  - File locking
  *  - diskfull-1.{3,5}: we don't implement failure injection, and these
  *      tests exercise sqlite's handling of VFS errors, not the VFS.
  *  - ioerr2-5: we don't implement failure injection.
@@ -53,6 +52,22 @@ SQLITE_EXTENSION_INIT1
 
 #ifndef SQLITE_TEMP_FILE_PREFIX
 # define SQLITE_TEMP_FILE_PREFIX "etilqs_"
+#endif
+
+/**
+ * Some older distributions fail to expose these constants.  Hardcode
+ * them if necessary: open file description locks have been around
+ * since Linux 3.15, and we don't try to support anything that old
+ * (getrandom was introduced in 3.17, and we also use that).
+ */
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK     36
+#define F_OFD_SETLK     37
+#define F_OFD_SETLKW    38
+#endif
+
+#if (F_OFD_GETLK != 36) || (F_OFD_SETLK != 37) || (F_OFD_SETLKW != 38)
+# error "Mismatch in fallback OFD fcntl constants."
 #endif
 
 struct linux_file {
@@ -1195,6 +1210,202 @@ linux_file_size(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
         return SQLITE_OK;
 }
 
+/**
+ * The Linux VFS replicates the default Unix VFS's locking scheme.
+ *
+ * The lock bytes start at `sqlite3PendingByte` or `0x40000000`.
+ *
+ * The first lock byte is the "PENDING" lock: when a writer has
+ * acquired this lock, new read locks may not be acquired.
+ *
+ * The next one is the "RESERVED" lock: writers race for this lock to
+ * determine which one can enter the write state machine.
+ *
+ * Finally, the next 510 bytes are for "SHARED" (read) locks.  Sqlite
+ * uses this range to allow concurrent readers on systems that do not
+ * support shared file locks.  We always acquire the whole range.
+ */
+
+static inline off_t
+linux_file_pending_lock_offset(void)
+{
+#ifdef SQLITE_TEST
+        return sqlite3PendingByte;
+#else
+        return 0x40000000;
+#endif
+}
+
+static inline off_t
+linux_file_reserved_lock_offset(void)
+{
+
+        return linux_file_pending_lock_offset() + 1;
+}
+
+static inline off_t
+linux_file_shared_lock_offset(void)
+{
+
+        return linux_file_pending_lock_offset() + 2;
+}
+
+static const size_t linux_file_shared_lock_size = 510;
+
+/*
+ * The locks all live in a 512-byte region starting at
+ * `linux_file_pending_lock_offset()`.
+ */
+static const size_t linux_file_all_lock_size = 512;
+
+static int
+linux_flock_op(const struct linux_file *file, int op, struct flock *fl,
+    int default_error)
+{
+        int r;
+
+        /* TODO: loop and apply file timeout. */
+        do {
+                r = fcntl(file->fd, op, fl);
+        } while (r < 0 && errno == EINTR);
+
+        if (r != 0) {
+                switch (errno) {
+                case EACCES:
+                case EAGAIN:
+                case ETIMEDOUT:
+                case EBUSY:
+                case EINTR:
+                case ENOLCK:
+                        return SQLITE_BUSY;
+
+                case EPERM:
+                        return SQLITE_PERM;
+
+                default:
+                        return default_error;
+                }
+        }
+
+        return SQLITE_OK;
+}
+
+static int
+acquire_shared_lock(struct linux_file *file)
+{
+        struct flock fl = {
+                .l_type = F_RDLCK,
+                .l_whence = SEEK_SET,
+                .l_start = linux_file_pending_lock_offset(),
+                .l_len = 1,
+        };
+        int r;
+
+        /*
+         * Before acquiring a shared lock, we must make sure that the
+         * PENDING byte is free.  It's OK if the byte is then taken
+         * while we try to grab a read lock on the shared lock range:
+         * the PENDING byte only exists to protect against starvation,
+         * when new readers keep preventing the writer from acquiring
+         * the shared range for writes.
+         *
+         * Once the writer has acquired the PENDING byte, only a
+         * bounded number of readers may have already observed it as
+         * free, but not acquired the shared range for reads yet.
+         * A race here cannot starve the writer forever.
+         */
+        r = linux_flock_op(file, F_OFD_GETLK, &fl, SQLITE_IOERR_LOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        if (fl.l_type != F_UNLCK)
+                return SQLITE_BUSY;
+
+        /* Now, we can try to acquire the shared lock range for reads. */
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_RDLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_shared_lock_offset(),
+                    .l_len = linux_file_shared_lock_size,
+            }, SQLITE_IOERR_LOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        file->lock_level = SQLITE_LOCK_SHARED;
+        return SQLITE_OK;
+}
+
+static int
+acquire_reserved_lock(struct linux_file *file)
+{
+        int r;
+
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_WRLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_reserved_lock_offset(),
+                    .l_len = 1,
+            }, SQLITE_IOERR_LOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        file->lock_level = SQLITE_LOCK_RESERVED;
+        return SQLITE_OK;
+}
+
+static int
+acquire_exclusive_lock(struct linux_file *file)
+{
+        int r;
+
+        /*
+         * Acquire the "intent to write" lock if necessary.
+         *
+         * I don't think this can happen with sqlite, but let's make
+         * the locking code obviously correct.
+         */
+        if (file->lock_level < SQLITE_LOCK_RESERVED) {
+                r = acquire_reserved_lock(file);
+                if (r != SQLITE_OK)
+                        return r;
+        }
+
+        /*
+         * Before acquiring an exclusive lock, we must first acquire
+         * the pending lock byte, to tell readers to drain out.
+         *
+         * This should not fail with SQLITE_BUSY, now that we own the
+         * RESERVED byte.
+         */
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_WRLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_pending_lock_offset(),
+                    .l_len = 1,
+            }, SQLITE_IOERR_LOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        file->lock_level = SQLITE_LOCK_PENDING;
+
+        /* Now, we can try to acquire the shared lock range exclusively. */
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_WRLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_shared_lock_offset(),
+                    .l_len = linux_file_shared_lock_size,
+            }, SQLITE_IOERR_LOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        file->lock_level = SQLITE_LOCK_EXCLUSIVE;
+        return SQLITE_OK;
+}
+
 static int
 linux_file_lock(sqlite3_file *vfile, int level)
 {
@@ -1204,7 +1415,97 @@ linux_file_lock(sqlite3_file *vfile, int level)
         if (file->lock_level >= level)
                 return SQLITE_OK;
 
-        file->lock_level = level;
+        switch (level) {
+        case SQLITE_LOCK_SHARED:
+                return acquire_shared_lock(file);
+
+        case SQLITE_LOCK_RESERVED:
+                /* We're not supposed to go from NONE to RESERVED. */
+                assert(file->lock_level == SQLITE_LOCK_SHARED);
+                return acquire_reserved_lock(file);
+
+        case SQLITE_LOCK_EXCLUSIVE:
+                return acquire_exclusive_lock(file);
+
+        case SQLITE_LOCK_NONE:
+        case SQLITE_LOCK_PENDING:  /* PENDING is an internal state. */
+        default:
+                /* Shouldn't happen. */
+                return SQLITE_ERROR;
+        }
+}
+
+static int
+release_all_locks(struct linux_file *file)
+{
+        int r;
+
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_UNLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_pending_lock_offset(),
+                    .l_len = linux_file_all_lock_size,
+            }, SQLITE_IOERR_UNLOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        file->lock_level = SQLITE_LOCK_NONE;
+        return SQLITE_OK;
+}
+
+static int
+downgrade_write_lock_to_shared(struct linux_file *file)
+{
+        int r;
+
+        /*
+         * Start by converting all our locks to shared.
+         */
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_RDLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_pending_lock_offset(),
+                    .l_len = linux_file_all_lock_size,
+            }, SQLITE_IOERR_UNLOCK);
+        /*
+         * Downgrades should not fail with SQLITE_BUSY (that can only
+         * happen if another process locks the file with an
+         * incompatible scheme).  If they do, the unix VFS says we
+         * should instead return IOERR_RDLOCK to avoid asserts.
+         */
+        if (r == SQLITE_BUSY)
+                return SQLITE_IOERR_RDLOCK;
+        if (r != SQLITE_OK)
+                return r;
+
+        /*
+         * At this point, we definitely don't have an exclusive lock,
+         * and new read locks can be acquired.
+         *
+         * If the next step fails, other writers will not be able to
+         * make progress until we release all our locks, but they
+         * would have been blocked when upgrading from RESERVED to
+         * EXCLUSIVE anyway.
+         */
+        file->lock_level = SQLITE_LOCK_SHARED;
+
+        /*
+         * And now release the (shared) reserved and pending lock: we
+         * may not actually own the pending lock, but, given that we
+         * do hold the reserved lock, no one can.
+         */
+        r = linux_flock_op(file, F_OFD_SETLK,
+            &(struct flock) {
+                    .l_type = F_UNLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = linux_file_pending_lock_offset(),
+                    .l_len = 2,
+            }, SQLITE_IOERR_UNLOCK);
+        if (r != SQLITE_OK)
+                return SQLITE_IOERR_RDLOCK;
+
         return SQLITE_OK;
 }
 
@@ -1217,16 +1518,53 @@ linux_file_unlock(sqlite3_file *vfile, int level)
         if (file->lock_level <= level)
                 return SQLITE_OK;
 
-        file->lock_level = level;
-        return SQLITE_OK;
+        switch (level) {
+        case SQLITE_LOCK_NONE:
+                return release_all_locks(file);
+        case SQLITE_LOCK_SHARED:
+                return downgrade_write_lock_to_shared(file);
+
+        case SQLITE_LOCK_RESERVED:
+        case SQLITE_LOCK_EXCLUSIVE:
+        case SQLITE_LOCK_PENDING:  /* PENDING is an internal state. */
+        default:
+                /* Shouldn't happen. */
+                return SQLITE_ERROR;
+        }
 }
 
 static int
 linux_file_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
 {
+        struct flock fl = {
+                /* The reserved byte is only really acquired for writes. */
+                .l_type = F_RDLCK,
+                .l_whence = SEEK_SET,
+                .l_start = linux_file_reserved_lock_offset(),
+                .l_len = 1,
+        };
         struct linux_file *file = (void *)vfile;
+        int r;
 
-        *OUT_result = (file->lock_level >= SQLITE_LOCK_RESERVED) ? 1 : 0;
+        *OUT_result = 0;
+        /*
+         * This fcntl should say "yes the RESERVED byte lock is taken"
+         * even when it's owned by the current `file`.  OFD locks
+         * can't tell us that (a file description can always override
+         * its own locks), so we must first look at the file's current
+         * lock level.
+         */
+        if (file->lock_level >= SQLITE_LOCK_RESERVED) {
+                *OUT_result = 1;
+                return SQLITE_OK;
+        }
+
+        r = linux_flock_op(file, F_OFD_GETLK, &fl,
+            SQLITE_IOERR_CHECKRESERVEDLOCK);
+        if (r != SQLITE_OK)
+                return r;
+
+        *OUT_result = (fl.l_type == F_UNLCK) ? 0 : 1;
         return SQLITE_OK;
 }
 
