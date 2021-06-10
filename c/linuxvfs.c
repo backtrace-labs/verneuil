@@ -1230,6 +1230,13 @@ linux_file_sync(sqlite3_file *vfile, int flags)
          */
         file->dirsync_pending = false;
 
+        /*
+         * If the file doesn't exist in a directory, it won't be
+         * visible after a crash, so there's nothing to sync.
+         */
+        if (file->path == NULL)
+                return SQLITE_OK;
+
         do {
                 r = fdatasync(file->fd);
         } while (r != 0 && errno == EINTR);
