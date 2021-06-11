@@ -38,6 +38,9 @@ SQLITE_EXTENSION_INIT1
  *  - journal3-1.2.[2-4].4: journal files fail to inherit the main
  *      db's uid/gid/permissions, and instead always use the current
  *      user, and default permissions (0644) after umask.
+ *  - memsubsys1-4.5: setting mxPathname to PATH_MAX (instead of 512
+ *     for the stock unix VFS) makes some allocations to exceed the
+ *     test's hardcoded 7000-byte allocation size limit.
  *  - unixexcl-1.2.4.singleproc: we do not do anything special for
  *      in-process locking, so the `unix-excl` VFS excludes the
  *      Linux VFS even within the same process.
@@ -160,7 +163,7 @@ static const struct sqlite3_io_methods linux_io_methods = {
 static sqlite3_vfs linux_vfs = {
         .iVersion = 3,
         .szOsFile = sizeof(struct linux_file),
-        .mxPathname = 512,  /* default limit for the default VFS */
+        .mxPathname = PATH_MAX,
         .zName = "linux",
         .xOpen = linux_open,
         .xDelete = linux_delete,
