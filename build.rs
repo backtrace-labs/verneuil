@@ -36,9 +36,13 @@ fn build_sqlite() {
 fn main() {
     build_sqlite();
 
-    println!("cargo:rerun-if-changed=c/linuxvfs.c");
-    println!("cargo:rerun-if-changed=c/linuxvfs.h");
+    println!("cargo:rerun-if-changed=c/vfs.c");
+    println!("cargo:rerun-if-changed=include/verneuil.h");
     cc::Build::new()
+        .flag_if_supported("-Wmissing-declarations")
+        .flag_if_supported("-Wmissing-prototypes")
+        .flag_if_supported("-Wstring-prototypes")
+        .flag_if_supported("-Wundef")
         .include("include")
         // We want GNU extensions.
         .define("_GNU_SOURCE", None)
@@ -47,7 +51,7 @@ fn main() {
         .define("SQLITE_CORE", None)
         // We know the linuxvfs doesn't implement dirsync.
         .define("SQLITE_DISABLE_DIRSYNC", None)
-        .file("c/linuxvfs.c")
+        .file("c/vfs.c")
         .opt_level(2)
-        .compile("linuxvfs")
+        .compile("verneuil_vfs")
 }

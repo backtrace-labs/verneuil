@@ -1,4 +1,4 @@
-#include "linuxvfs.h"
+#include "verneuil.h"
 
 #include <assert.h>
 #include <dlfcn.h>
@@ -23,24 +23,8 @@
 SQLITE_EXTENSION_INIT1
 
 /**
- * The Linux VFS implements the basic file operations that sqlite uses
- * for non-WAL databases.  It passes sqlite's test suite
- * (Fossil id 5d4535bfb603d7c8229ef60f99666459f2997e02e186bc1e52b7ec1320251d67)
- * at the same level as a shim VFS that hides the mmap / shmem methods
- * left unimplemented by this VFS, except for:
- *
- *  - diskfull-1.{3,5}: we don't implement failure injection, and these
- *      tests exercise sqlite's handling of VFS errors, not the VFS.
- *  - ioerr2-5: we don't implement failure injection.
- *  - journal3-1.2.[2-4].4: journal files fail to inherit the main
- *      db's uid/gid/permissions, and instead always use the current
- *      user, and default permissions (0644) after umask.
- *  - memsubsys1-4.5: setting mxPathname to PATH_MAX (instead of 512
- *     for the stock unix VFS) makes some allocations to exceed the
- *     test's hardcoded 7000-byte allocation size limit.
- *  - unixexcl-1.2.4.singleproc: we do not do anything special for
- *      in-process locking, so the `unix-excl` VFS excludes the
- *      Linux VFS even within the same process.
+ * The Verneuil VFS layer is based on the Linux VFS, with Rust hooks
+ * around file read, write, and locking operations.
  */
 
 /* Temporary directories must have some room left for filenames. */
@@ -174,7 +158,7 @@ static int linux_file_device_characteristics(sqlite3_file *);
  */
 static const char *_Atomic linux_vfs_tempdir = NULL;
 
-static const struct sqlite3_io_methods linux_io_methods = {
+static const struct sqlite3_io_methods verneuil_io_methods = {
         .iVersion = 1,  /* No WAL or mmap method */
         .xClose = linux_file_close,
 
@@ -194,11 +178,11 @@ static const struct sqlite3_io_methods linux_io_methods = {
         .xDeviceCharacteristics = linux_file_device_characteristics,
 };
 
-static sqlite3_vfs linux_vfs = {
+static sqlite3_vfs verneuil_vfs = {
         .iVersion = 3,
         .szOsFile = sizeof(struct linux_file),
         .mxPathname = PATH_MAX,
-        .zName = "linux",
+        .zName = "verneuil",
         .xOpen = linux_open,
         .xDelete = linux_delete,
         .xAccess = linux_access,
@@ -257,8 +241,8 @@ is_valid_tempdir(const char *dir)
         return r == 0;
 }
 
-bool
-sqlite3_linuxvfs_set_tempdir(const char *dir)
+static int
+verneuil_set_tempdir(const char *dir)
 {
         static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
         /* Reserve room for the file name itself. */
@@ -268,11 +252,11 @@ sqlite3_linuxvfs_set_tempdir(const char *dir)
         bool success = false;
 
         if (is_valid_tempdir(dir) == false)
-                return false;
+                return SQLITE_MISUSE;
 
         r = pthread_mutex_lock(&lock);
         if (r != 0)
-                return false;
+                return SQLITE_INTERNAL;
 
         /* tempdir already computed. */
         if (atomic_load(&linux_vfs_tempdir) != NULL)
@@ -295,7 +279,7 @@ sqlite3_linuxvfs_set_tempdir(const char *dir)
 out:
         r = pthread_mutex_unlock(&lock);
         assert(r == 0 && "pthread_mutex_unlock failed");
-        return success;
+        return (success == true) ? SQLITE_OK : SQLITE_LOCKED;
 }
 
 static const char *
@@ -456,7 +440,7 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          *   filename for some reason.
          */
         *file = (struct linux_file) {
-                .base.pMethods = &linux_io_methods,
+                .base.pMethods = &verneuil_io_methods,
                 .fd = -1,
                 .path = name,
                 /*
@@ -1933,9 +1917,33 @@ linux_file_device_characteristics(sqlite3_file *vfile)
 }
 
 int
-sqlite3_linuxvfs_init(sqlite3 *db, char **pzErrMsg,
+verneuil_configure(const struct verneuil_options *options)
+{
+        static const struct verneuil_options default_options;
+        int rc;
+
+        if (options == NULL)
+                options = &default_options;
+
+        rc = sqlite3_vfs_register(&verneuil_vfs, options->make_default ? 1 : 0);
+        if (rc != SQLITE_OK)
+                return rc;
+
+        if (options->tempdir != NULL)
+                return verneuil_set_tempdir(options->tempdir);
+
+        return SQLITE_OK;
+}
+
+int
+sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
     const sqlite3_api_routines *pApi)
 {
+#ifdef TEST_VFS
+        int make_default = 1;
+#else
+        int make_default = 0;
+#endif
         int rc;
 
         (void)db;
@@ -1949,20 +1957,20 @@ sqlite3_linuxvfs_init(sqlite3 *db, char **pzErrMsg,
          */
 #ifdef TEST_VFS
         {
-                static sqlite3_vfs linux_fake_unix_vfs;
+                static sqlite3_vfs verneuil_fake_unix_vfs;
 
-                if (linux_fake_unix_vfs.zName == NULL) {
-                        linux_fake_unix_vfs = linux_vfs;
-                        linux_fake_unix_vfs.zName = "unix";
+                if (verneuil_fake_unix_vfs.zName == NULL) {
+                        verneuil_fake_unix_vfs = verneuil_vfs;
+                        verneuil_fake_unix_vfs.zName = "unix";
                 }
 
-                rc = sqlite3_vfs_register(&linux_fake_unix_vfs, /*makeDflt=*/0);
+                rc = sqlite3_vfs_register(&verneuil_fake_unix_vfs, /*makeDflt=*/0);
                 if (rc != SQLITE_OK)
                         return rc;
         }
 #endif
 
-        rc = sqlite3_vfs_register(&linux_vfs, /*makeDflt=*/1);
+        rc = sqlite3_vfs_register(&verneuil_vfs, make_default);
         if (rc != SQLITE_OK)
                 return rc;
 
@@ -1977,13 +1985,13 @@ sqlite3_linuxvfs_init(sqlite3 *db, char **pzErrMsg,
  * `SQLITE_EXTENSION_INIT2(pApi);`.
  */
 int
-sqlite3_linuxvfs_register(const char *unused)
+sqlite3_verneuil_register(const char *unused)
 {
         char *error = NULL;
         int rc;
 
         (void)unused;
-        rc = sqlite3_linuxvfs_init(NULL, &error, NULL);
+        rc = sqlite3_verneuil_init(NULL, &error, NULL);
         sqlite3_free(error);
 
         if (rc == SQLITE_OK_LOAD_PERMANENTLY)
