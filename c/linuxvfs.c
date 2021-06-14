@@ -174,8 +174,6 @@ static int linux_file_device_characteristics(sqlite3_file *);
  */
 static const char *_Atomic linux_vfs_tempdir = NULL;
 
-static sqlite3_vfs *base_vfs;
-
 static const struct sqlite3_io_methods linux_io_methods = {
         .iVersion = 1,  /* No WAL or mmap method */
         .xClose = linux_file_close,
@@ -1938,26 +1936,11 @@ int
 sqlite3_linuxvfs_init(sqlite3 *db, char **pzErrMsg,
     const sqlite3_api_routines *pApi)
 {
-        sqlite3_vfs *default_vfs;
         int rc;
 
         (void)db;
+        (void)pzErrMsg;
         SQLITE_EXTENSION_INIT2(pApi);
-
-        default_vfs = sqlite3_vfs_find(0);
-        if (default_vfs == NULL) {
-                *pzErrMsg = sqlite3_mprintf("unable to find default vfs");
-                goto error;
-        }
-
-        if (default_vfs->iVersion < linux_vfs.iVersion) {
-                *pzErrMsg = sqlite3_mprintf("default vfs has version %i < %i",
-                    default_vfs->iVersion, linux_vfs.iVersion);
-                goto error;
-        }
-
-        if (default_vfs != &linux_vfs)
-                base_vfs = default_vfs;
 
         /*
          * When building in test mode, also shadow the "unix" vfs:
@@ -1984,12 +1967,6 @@ sqlite3_linuxvfs_init(sqlite3 *db, char **pzErrMsg,
                 return rc;
 
         return SQLITE_OK_LOAD_PERMANENTLY;
-
-error:
-        if (*pzErrMsg == NULL)
-                return SQLITE_NOMEM;
-
-        return SQLITE_INTERNAL;
 }
 
 #ifdef SQLITE_CORE
