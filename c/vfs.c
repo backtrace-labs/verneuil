@@ -1,4 +1,5 @@
 #include "verneuil.h"
+#include "vfs.h"
 
 #include <assert.h>
 #include <dlfcn.h>
@@ -1917,7 +1918,7 @@ linux_file_device_characteristics(sqlite3_file *vfile)
 }
 
 int
-verneuil_configure(const struct verneuil_options *options)
+verneuil_configure_impl(const struct verneuil_options *options)
 {
         static const struct verneuil_options default_options;
         int rc;

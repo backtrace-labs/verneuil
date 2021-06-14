@@ -37,11 +37,12 @@ fn main() {
     build_sqlite();
 
     println!("cargo:rerun-if-changed=c/vfs.c");
+    println!("cargo:rerun-if-changed=c/vfs.h");
     println!("cargo:rerun-if-changed=include/verneuil.h");
     cc::Build::new()
         .flag_if_supported("-Wmissing-declarations")
         .flag_if_supported("-Wmissing-prototypes")
-        .flag_if_supported("-Wstring-prototypes")
+        .flag_if_supported("-Wstrict-prototypes")
         .flag_if_supported("-Wundef")
         .include("include")
         // We want GNU extensions.
