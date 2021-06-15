@@ -153,15 +153,6 @@ static int linux_set_syscall(sqlite3_vfs *, const char *, sqlite3_syscall_ptr);
 static sqlite3_syscall_ptr linux_get_syscall(sqlite3_vfs *, const char *);
 static const char *linux_next_syscall(sqlite3_vfs *, const char *);
 
-static int linux_file_close(sqlite3_file *);
-static int linux_file_read(sqlite3_file *, void *dst, int n, sqlite3_int64 off);
-static int linux_file_write(sqlite3_file *, const void *src, int n, sqlite3_int64 off);
-static int linux_file_truncate(sqlite3_file *, sqlite3_int64 size);
-static int linux_file_sync(sqlite3_file *, int flags);
-static int linux_file_size(sqlite3_file *, sqlite3_int64 *OUT_size);
-
-static int linux_file_lock(sqlite3_file *, int level);
-static int linux_file_unlock(sqlite3_file *, int level);
 static int linux_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
 
 static int linux_file_control(sqlite3_file *, int op, void *arg);
@@ -177,17 +168,17 @@ static const char *_Atomic linux_vfs_tempdir = NULL;
 
 static const struct sqlite3_io_methods verneuil_io_methods = {
         .iVersion = 1,  /* No WAL or mmap method */
-        .xClose = linux_file_close,
+        .xClose = verneuil__file_close_impl,
 
-        .xRead = linux_file_read,
-        .xWrite = linux_file_write,
-        .xTruncate = linux_file_truncate,
-        .xSync = linux_file_sync,
+        .xRead = verneuil__file_read_impl,
+        .xWrite = verneuil__file_write_impl,
+        .xTruncate = verneuil__file_truncate_impl,
+        .xSync = verneuil__file_sync_impl,
 
-        .xFileSize = linux_file_size,
+        .xFileSize = verneuil__file_size_impl,
 
-        .xLock = linux_file_lock,
-        .xUnlock = linux_file_unlock,
+        .xLock = verneuil__file_lock_impl,
+        .xUnlock = verneuil__file_unlock_impl,
         .xCheckReservedLock = linux_file_check_reserved_lock,
 
         .xFileControl = linux_file_control,
@@ -564,7 +555,7 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                 } while (r != 0 && errno == EINTR);
 
                 if (r != 0) {
-                        linux_file_close(vfile);
+                        verneuil__file_close_impl(vfile);
                         return SQLITE_IOERR_FSTAT;
                 }
 
@@ -1077,8 +1068,8 @@ linux_next_syscall(sqlite3_vfs *vfs, const char *name)
         return NULL;
 }
 
-static int
-linux_file_close(sqlite3_file *vfile)
+int
+verneuil__file_close_impl(sqlite3_file *vfile)
 {
         struct linux_file *file = (void *)vfile;
 
@@ -1100,8 +1091,9 @@ linux_file_close(sqlite3_file *vfile)
         return SQLITE_OK;
 }
 
-static int
-linux_file_read(sqlite3_file *vfile, void *dst, int n, sqlite3_int64 off)
+int
+verneuil__file_read_impl(sqlite3_file *vfile, void *dst, int n,
+    sqlite3_int64 off)
 {
         struct linux_file *file = (void *)vfile;
 
@@ -1145,8 +1137,9 @@ linux_file_read(sqlite3_file *vfile, void *dst, int n, sqlite3_int64 off)
         return SQLITE_IOERR_SHORT_READ;
 }
 
-static int
-linux_file_write(sqlite3_file *vfile, const void *src, int n, sqlite3_int64 off)
+int
+verneuil__file_write_impl(sqlite3_file *vfile, const void *src, int n,
+    sqlite3_int64 off)
 {
         struct linux_file *file = (void *)vfile;
 
@@ -1176,8 +1169,8 @@ linux_file_write(sqlite3_file *vfile, const void *src, int n, sqlite3_int64 off)
         return SQLITE_OK;
 }
 
-static int
-linux_file_truncate(sqlite3_file *vfile, sqlite3_int64 size)
+int
+verneuil__file_truncate_impl(sqlite3_file *vfile, sqlite3_int64 size)
 {
         struct linux_file *file = (void *)vfile;
         int r;
@@ -1202,8 +1195,8 @@ linux_file_truncate(sqlite3_file *vfile, sqlite3_int64 size)
         return SQLITE_OK;
 }
 
-static int
-linux_file_sync(sqlite3_file *vfile, int flags)
+int
+verneuil__file_sync_impl(sqlite3_file *vfile, int flags)
 {
         struct linux_file *file = (void *)vfile;
         int r;
@@ -1254,8 +1247,8 @@ linux_file_sync(sqlite3_file *vfile, int flags)
         return SQLITE_OK;
 }
 
-static int
-linux_file_size(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
+int
+verneuil__file_size_impl(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
 {
         struct stat sb;
         struct linux_file *file = (void *)vfile;
@@ -1564,8 +1557,8 @@ acquire_exclusive_lock(struct linux_file *file)
         return SQLITE_OK;
 }
 
-static int
-linux_file_lock(sqlite3_file *vfile, int level)
+int
+verneuil__file_lock_impl(sqlite3_file *vfile, int level)
 {
         struct linux_file *file = (void *)vfile;
 
@@ -1667,8 +1660,8 @@ downgrade_write_lock_to_shared(struct linux_file *file)
         return SQLITE_OK;
 }
 
-static int
-linux_file_unlock(sqlite3_file *vfile, int level)
+int
+verneuil__file_unlock_impl(sqlite3_file *vfile, int level)
 {
         struct linux_file *file = (void *)vfile;
 
