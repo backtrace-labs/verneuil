@@ -128,6 +128,21 @@ struct linux_file {
         bool dirsync_pending;
 };
 
+static_assert(sizeof(struct sqlite3_file) == sizeof(void *),
+    "vfs_ops.rs assumes sqlite3_file consists of one vtable pointer.");
+
+static_assert(sizeof(dev_t) == sizeof(uint64_t),
+    "vfs_ops.rs assumes dev_t as a u64.");
+
+static_assert(sizeof(ino_t) == sizeof(uint64_t),
+    "vfs_ops.rs assumes ino_t as a u64.");
+
+static_assert(SQLITE_LOCK_NONE == 0, "vfs_ops.rs assumes NONE == 0");
+static_assert(SQLITE_LOCK_SHARED == 1, "vfs_ops.rs assumes SHARED == 1");
+static_assert(SQLITE_LOCK_RESERVED == 2, "vfs_ops.rs assumes RESERVED == 2");
+static_assert(SQLITE_LOCK_PENDING == 3, "vfs_ops.rs assumes PENDING == 3");
+static_assert(SQLITE_LOCK_EXCLUSIVE == 4, "vfs_ops.rs assumes EXCLUSIVE == 4");
+
 typedef void dlfun_t(void);
 
 static int linux_open(sqlite3_vfs *, const char *name, sqlite3_file *,
@@ -166,6 +181,10 @@ static int linux_file_device_characteristics(sqlite3_file *);
  */
 static const char *_Atomic linux_vfs_tempdir = NULL;
 
+/*
+ * We use this vtable of IO methods for files that do not require
+ * write tracking for replication, i.e., everything but main DB files.
+ */
 static const struct sqlite3_io_methods verneuil_io_methods = {
         .iVersion = 1,  /* No WAL or mmap method */
         .xClose = verneuil__file_close_impl,
@@ -179,6 +198,30 @@ static const struct sqlite3_io_methods verneuil_io_methods = {
 
         .xLock = verneuil__file_lock_impl,
         .xUnlock = verneuil__file_unlock_impl,
+        .xCheckReservedLock = linux_file_check_reserved_lock,
+
+        .xFileControl = linux_file_control,
+        .xSectorSize = linux_file_sector_size,
+        .xDeviceCharacteristics = linux_file_device_characteristics,
+};
+
+/*
+ * We use this vtable for main DB files, to let Rust code intercept
+ * I/O.
+ */
+static const struct sqlite3_io_methods verneuil_intercept_io_methods = {
+        .iVersion = 1,  /* No WAL or mmap method */
+        .xClose = verneuil__file_close,
+
+        .xRead = verneuil__file_read,
+        .xWrite = verneuil__file_write,
+        .xTruncate = verneuil__file_truncate,
+        .xSync = verneuil__file_sync,
+
+        .xFileSize = verneuil__file_size,
+
+        .xLock = verneuil__file_lock,
+        .xUnlock = verneuil__file_unlock,
         .xCheckReservedLock = linux_file_check_reserved_lock,
 
         .xFileControl = linux_file_control,
@@ -429,13 +472,32 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
     int flags, int *OUT_flags)
 {
         struct linux_file *file = (void *)vfile;
+        const struct sqlite3_io_methods *io_methods;
         const int journal_mask =
             SQLITE_OPEN_SUPER_JOURNAL | SQLITE_OPEN_MAIN_JOURNAL | SQLITE_OPEN_WAL;
         int open_flags = O_CLOEXEC | O_LARGEFILE | O_NOFOLLOW;
-        int fd;
-        int rc;
+        int fd, rc;
+        const bool is_uri = (flags & SQLITE_OPEN_URI) != 0;
 
         (void)vfs;
+        /*
+         * Intercept IO calls on main DB files.  These DB files should
+         * have a name and be persistent, but if we are ever asked to
+         * open such temporary main DBs, don't intercept their IO.
+         *
+         * When locking is disabled we can't tell what's a good time
+         * to snapshot; there's also no change to track for immutable
+         * files.  In both cases, we don't want to intercept IO.
+         */
+        if ((flags & SQLITE_OPEN_MAIN_DB) != 0 &&
+            name != NULL &&
+            (flags & SQLITE_OPEN_DELETEONCLOSE) == 0 &&
+            sqlite3_uri_boolean(is_uri ? name : NULL, "nolock", 0) == 0 &&
+            sqlite3_uri_boolean(is_uri ? name : NULL, "immutable", 0) == 0) {
+                io_methods = &verneuil_intercept_io_methods;
+        } else {
+                io_methods = &verneuil_io_methods;
+        }
 
         /*
          * It is safe to borrow `name` for the lifetime of the `file`.
@@ -448,7 +510,7 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          *   filename for some reason.
          */
         *file = (struct linux_file) {
-                .base.pMethods = &verneuil_io_methods,
+                .base.pMethods = io_methods,
                 .fd = -1,
                 .path = name,
                 /*

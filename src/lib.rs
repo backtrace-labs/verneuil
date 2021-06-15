@@ -1,3 +1,5 @@
+mod vfs_ops;
+
 use std::ffi::c_void;
 use std::ffi::CStr;
 use std::ffi::CString;
