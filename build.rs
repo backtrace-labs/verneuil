@@ -34,17 +34,37 @@ fn build_sqlite() {
 }
 
 fn main() {
-    build_sqlite();
+    // If we're testing the VFS, we do not want to vendor in our own
+    // sqlite.
+    if cfg!(all(
+        feature = "verneuil_vendor_sqlite",
+        not(feature = "verneuil_test_vfs")
+    )) {
+        build_sqlite();
+    }
 
     println!("cargo:rerun-if-changed=c/vfs.c");
     println!("cargo:rerun-if-changed=c/vfs.h");
     println!("cargo:rerun-if-changed=include/verneuil.h");
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .flag_if_supported("-Wmissing-declarations")
         .flag_if_supported("-Wmissing-prototypes")
         .flag_if_supported("-Wstrict-prototypes")
         .flag_if_supported("-Wundef")
-        .include("include")
+        .include("include");
+
+    if cfg!(feature = "verneuil_test_vfs") {
+        // Enable test-only code, and make sure to build for direct
+        // linking with sqlite, and not a runtime extension module:
+        // the test code only works with the former.
+        build
+            .define("TEST_VFS", None)
+            .define("SQLITE_CORE", None)
+            .define("SQLITE_TEST", None);
+    }
+
+    build
         // We want GNU extensions.
         .define("_GNU_SOURCE", None)
         // We're linking this extension statically, without going

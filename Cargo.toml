@@ -7,6 +7,14 @@ repository = "https://github.com/backtrace-labs/verneuil"
 authors = ["Backtrace I/O <team@backtrace.io>"]
 edition = "2018"
 
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = ["verneuil_vendor_sqlite"]
+verneuil_vendor_sqlite = []
+verneuil_test_vfs = []  # Build an archive for sqlite3 tests.
+
 [dependencies]
 
 [build-dependencies]

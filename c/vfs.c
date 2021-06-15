@@ -26,6 +26,11 @@ SQLITE_EXTENSION_INIT1
 /**
  * The Verneuil VFS layer is based on the Linux VFS, with Rust hooks
  * around file read, write, and locking operations.
+ *
+ * Unlike the Linux VFS, this VFS accidentally passes
+ * `unixexcl-1.2.4.singleproc`, but fails `unixexcl-1.1.4.multiproc`:
+ * the `sqlite3PendingByte` offset is only available when built with
+ * the amalgamated source, so we can't use the test-only lock range.
  */
 
 /* Temporary directories must have some room left for filenames. */
@@ -61,6 +66,17 @@ SQLITE_EXTENSION_INIT1
 
 #if (F_OFD_GETLK != 36) || (F_OFD_SETLK != 37) || (F_OFD_SETLKW != 38)
 # error "Mismatch in fallback OFD fcntl constants."
+#endif
+
+#ifdef SQLITE_TEST
+/*
+ * Define these test-only counters in BSS; when the sqlite test driver
+ * also has a definition for these, they will be merged at link-time.
+ */
+int sqlite3_sync_count;
+int sqlite3_fullsync_count;
+int sqlite3_open_file_count;
+int sqlite3_current_time;
 #endif
 
 struct linux_file {
@@ -1275,11 +1291,7 @@ linux_file_size(sqlite3_file *vfile, sqlite3_int64 *OUT_size)
 static inline off_t
 linux_file_pending_lock_offset(void)
 {
-#ifdef SQLITE_TEST
-        return sqlite3PendingByte;
-#else
         return 0x40000000;
-#endif
 }
 
 static inline off_t
@@ -1937,7 +1949,7 @@ verneuil_configure_impl(const struct verneuil_options *options)
 }
 
 int
-sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
+verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
     const sqlite3_api_routines *pApi)
 {
 #ifdef TEST_VFS
@@ -1978,20 +1990,13 @@ sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
         return SQLITE_OK_LOAD_PERMANENTLY;
 }
 
-#ifdef SQLITE_CORE
-/*
- * Do not define this entry point if we expect to be loaded
- * dynamically by sqlite: when built that way, our call to
- * `sqlite3_linuxvfs_init` will crash in
- * `SQLITE_EXTENSION_INIT2(pApi);`.
- */
+#if defined(TEST_VFS) && defined(SQLITE_CORE)
 int
-sqlite3_verneuil_register(const char *unused)
+verneuil_test_only_register(void)
 {
         char *error = NULL;
         int rc;
 
-        (void)unused;
         rc = sqlite3_verneuil_init(NULL, &error, NULL);
         sqlite3_free(error);
 
