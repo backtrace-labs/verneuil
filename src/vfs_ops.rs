@@ -55,6 +55,9 @@ extern "C" fn verneuil__file_read(
     // We can *mostly* assume that either the read is in the first
     // page, or it's page-aligned, but some of the shim VFSes that
     // sqlite uses in its tests violate that assumption.
+    //
+    // Similarly, some test VFSes read without holding a shared lock
+    // on the file.
 
     unsafe { verneuil__file_read_impl(file, dst, n, offset) }
 }
@@ -71,6 +74,9 @@ extern "C" fn verneuil__file_write(
     // We can *mostly* assume that writes are page-aligned, but some
     // of the shim VFSes that sqlite uses in its tests violate that
     // assumption.
+    //
+    // Similarly, some test VFSes write without holding an exclusive
+    // lock on the file.
 
     unsafe { verneuil__file_write_impl(file, src, n, offset) }
 }
@@ -95,10 +101,38 @@ extern "C" fn verneuil__file_size(file: &LinuxFile, size: &mut i64) -> i32 {
 
 #[no_mangle]
 extern "C" fn verneuil__file_lock(file: &mut LinuxFile, level: LockLevel) -> i32 {
+    if level <= file.lock_level {
+        return 0;
+    }
+
     unsafe { verneuil__file_lock_impl(file, level) }
 }
 
 #[no_mangle]
 extern "C" fn verneuil__file_unlock(file: &mut LinuxFile, level: LockLevel) -> i32 {
+    if level >= file.lock_level {
+        return 0;
+    }
+
+    // We want to trigger a snapshot whenever we downgrade a lock:
+    // sqlite only downgrades when a db file is in a valid state.
+    // However, we don't want to run the snapshotting logic with an
+    // exclusive lock held, so always downgrade to a shared lock
+    // before snapshotting.
+    //
+    // If the file is already LockLevel::Shared or less, the call
+    // will no-op.
+    if level <= LockLevel::Shared {
+        let ret = unsafe { verneuil__file_unlock_impl(file, LockLevel::Shared) };
+
+        if ret != 0 {
+            return ret;
+        }
+    }
+
+    if file.lock_level == LockLevel::Shared {
+        // Snapshot here.
+    }
+
     unsafe { verneuil__file_unlock_impl(file, level) }
 }
