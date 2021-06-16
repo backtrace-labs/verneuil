@@ -1,5 +1,8 @@
+use std::boxed::Box;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+
+use crate::tracker::Tracker;
 
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,8 +25,30 @@ struct LinuxFile {
     path: *const c_char,
     device: u64,
     inode: u64,
+    tracker: *mut c_void, // Really a &mut crate::tracker::Tracker.
     lock_timeout_ms: u32,
     dirsync_pending: bool,
+}
+
+impl LinuxFile {
+    /// Returns a reference to this `LinuxFile`'s `Tracker`, if
+    /// it is populated.
+    #[allow(dead_code)]
+    #[inline]
+    fn tracker(&self) -> Option<&mut Tracker> {
+        unsafe { (self.tracker as *mut Tracker).as_mut() }
+    }
+
+    /// Replaces the `tracker` pointer in this `LinuxFile` with a
+    /// NULL pointer, and returns the old `Tracker`, if it was
+    /// populated.
+    fn consume_tracker(&mut self) -> Option<Box<Tracker>> {
+        let ptr = self.tracker as *mut Tracker;
+        self.tracker = std::ptr::null_mut();
+
+        let tracker = unsafe { ptr.as_mut() }?;
+        Some(unsafe { Box::from_raw(tracker) })
+    }
 }
 
 // See vfs.h
@@ -39,7 +64,26 @@ extern "C" {
 }
 
 #[no_mangle]
+extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> i32 {
+    // If the file doesn't have a name, or the fd is invalid, we can't
+    // track it.  Assume that's by design, and let the caller handle
+    // that state itself.
+    if file.path == std::ptr::null() || file.fd < 0 {
+        return 0;
+    }
+
+    match Tracker::new(file.path, file.fd) {
+        Err(_) => 14, // SQLITE_CANTOPEN
+        Ok(tracker) => {
+            file.tracker = Box::leak(Box::new(tracker)) as *mut Tracker as *mut _;
+            0
+        }
+    }
+}
+
+#[no_mangle]
 extern "C" fn verneuil__file_close(file: &mut LinuxFile) -> i32 {
+    std::mem::drop(file.consume_tracker());
     unsafe { verneuil__file_close_impl(file) }
 }
 

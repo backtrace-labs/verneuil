@@ -79,6 +79,8 @@ int sqlite3_open_file_count;
 int sqlite3_current_time;
 #endif
 
+struct verneuil_tracker;
+
 struct linux_file {
         sqlite3_file base;
         /*
@@ -111,6 +113,11 @@ struct linux_file {
          */
         dev_t device;
         ino_t inode;
+
+        /*
+         * The Rust-side's change tracking state.
+         */
+        struct verneuil_tracker *tracker;
 
         /*
          * Wait up to this many milliseconds for each lock
@@ -623,6 +630,18 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
 
                 file->device = sb.st_dev;
                 file->inode = sb.st_ino;
+        }
+
+        /*
+         * If we're intercepting this file's IO in Rust, run the
+         * post-open logic.
+         */
+        if (io_methods == &verneuil_intercept_io_methods) {
+                rc = verneuil__file_post_open(file);
+                if (rc != SQLITE_OK) {
+                        verneuil__file_close((struct sqlite3_file *)file);
+                        goto fail;
+                }
         }
 
         if (OUT_flags != NULL)

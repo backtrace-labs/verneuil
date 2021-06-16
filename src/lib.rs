@@ -1,3 +1,4 @@
+mod tracker;
 mod vfs_ops;
 
 use std::ffi::c_void;

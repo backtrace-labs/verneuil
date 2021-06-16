@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <stdint.h>
 
+struct linux_file;
+
 /*
  * The functions defined in this header are exported by the C side for
  * Rust to call (with corresponding FFI definitions in `lib.rs` and
@@ -34,6 +36,14 @@ int verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
 int verneuil_test_only_register(void);
 
 /**
+ * Performs additional Rust-side initialisation on a fully-initialised
+ * linux_file for a main db.
+ *
+ * Returns 0 on success, non-zero on error.
+ */
+int verneuil__file_post_open(struct linux_file *);
+
+/**
  * The base implementations for these methods (`verneuil__file_..._impl`)
  * are defined in vfs.c, and perform the actual work.  They're
  * directly called for all files except main database files.
@@ -50,7 +60,8 @@ int verneuil_test_only_register(void);
 int verneuil__file_close_impl(struct sqlite3_file *);
 
 /**
- * Rust implementation for xClose.
+ * Rust implementation for xClose.  Cleans up any state initialised by
+ * `verneuil__file_post_open` before calling `verneuil__file_close_impl`.
  */
 int verneuil__file_close(struct sqlite3_file *);
 
