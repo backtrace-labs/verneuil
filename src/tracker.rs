@@ -5,27 +5,37 @@ use std::ffi::CStr;
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct Tracker {
     // The C-side actually owns the file descriptor, but we can share
     // it with Rust: our C code doesn't use the FD's internal cursor.
     file: ManuallyDrop<File>,
-    path: String,
+    path: PathBuf,
 }
 
 impl Tracker {
     pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker, &'static str> {
         use std::os::unix::io::FromRawFd;
 
-        let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-        let path = unsafe { CStr::from_ptr(c_path) }
-            .to_str()
-            .map_err(|_| "path is not valid utf-8")?
-            .to_owned();
         if fd < 0 {
             return Err("received negative fd");
         }
+
+        let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+        let string = unsafe { CStr::from_ptr(c_path) }
+            .to_str()
+            .map_err(|_| "path is not valid utf-8")?
+            .to_owned();
+
+        let path = std::fs::canonicalize(string).map_err(|_| "failed to canonicalize path")?;
+
+        assert_ne!(
+            path.as_os_str().to_str(),
+            None,
+            "A path generated from a String should be convertible back to a String."
+        );
 
         Ok(Tracker { file, path })
     }
