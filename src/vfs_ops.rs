@@ -2,6 +2,7 @@ use std::boxed::Box;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+use crate::sqlite_code::SqliteCode;
 use crate::tracker::Tracker;
 
 #[allow(dead_code)]
@@ -64,19 +65,19 @@ extern "C" {
 }
 
 #[no_mangle]
-extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> i32 {
+extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> SqliteCode {
     // If the file doesn't have a name, or the fd is invalid, we can't
     // track it.  Assume that's by design, and let the caller handle
     // that state itself.
     if file.path == std::ptr::null() || file.fd < 0 {
-        return 0;
+        return SqliteCode::Ok;
     }
 
     match Tracker::new(file.path, file.fd) {
-        Err(_) => 14, // SQLITE_CANTOPEN
+        Err(_) => SqliteCode::CantOpen,
         Ok(tracker) => {
             file.tracker = Box::leak(Box::new(tracker)) as *mut Tracker as *mut _;
-            0
+            SqliteCode::Ok
         }
     }
 }

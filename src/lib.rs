@@ -1,3 +1,4 @@
+mod sqlite_code;
 mod tracker;
 mod vfs_ops;
 
