@@ -9,6 +9,13 @@ struct verneuil_options {
          * value.
          */
         const char *tempdir;
+
+        /*
+         * NULL disables replication by default. A non-NULL value
+         * enables it by default; all replication buffers will live in
+         * subdirectories of that staging directory.
+         */
+        const char *replication_staging_dir;
 };
 
 /**

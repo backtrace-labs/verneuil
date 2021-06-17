@@ -16,6 +16,7 @@ verneuil_vendor_sqlite = []
 verneuil_test_vfs = []  # Build an archive for sqlite3 tests.
 
 [dependencies]
+lazy_static = "1"
 
 [build-dependencies]
 cc = "1"

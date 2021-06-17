@@ -7,12 +7,15 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::path::PathBuf;
 
+use crate::replication_buffer::ReplicationBuffer;
+
 #[derive(Debug)]
 pub(crate) struct Tracker {
     // The C-side actually owns the file descriptor, but we can share
     // it with Rust: our C code doesn't use the FD's internal cursor.
     file: ManuallyDrop<File>,
     path: PathBuf,
+    buffer: Option<ReplicationBuffer>,
 }
 
 impl Tracker {
@@ -37,6 +40,9 @@ impl Tracker {
             "A path generated from a String should be convertible back to a String."
         );
 
-        Ok(Tracker { file, path })
+        let buffer = ReplicationBuffer::new(&path, &file)
+            .map_err(|_| "failed to create replication buffer")?;
+
+        Ok(Tracker { file, path, buffer })
     }
 }

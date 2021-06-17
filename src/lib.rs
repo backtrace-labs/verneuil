@@ -1,3 +1,5 @@
+mod instance_id;
+mod replication_buffer;
 mod sqlite_code;
 mod tracker;
 mod vfs_ops;
@@ -7,6 +9,7 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
+use std::path::PathBuf;
 
 /// Initialization options for the Verneuil VFS.
 #[derive(Default)]
@@ -16,12 +19,16 @@ pub struct Options<'a> {
     /// All temporary file will live in this directory, or a default
     /// value if `None`.
     pub tempdir: Option<&'a Path>,
+    /// If provided, temporary replication data will live in
+    /// subdirectories of that staging directory.
+    pub replication_staging_dir: Option<&'a Path>,
 }
 
 #[repr(C)]
 pub struct ForeignOptions {
     pub make_default: bool,
     pub tempdir: *const c_char,
+    pub replication_staging_dir: *const c_char,
 }
 
 // See `c/vfs.h`.
@@ -36,24 +43,34 @@ extern "C" {
 pub fn configure(options: Options) -> Result<(), i32> {
     use std::os::unix::ffi::OsStrExt;
 
-    let cstr;
+    let c_path;
+    let c_staging_dir;
     let mut foreign_options = ForeignOptions {
         make_default: options.make_default,
         tempdir: std::ptr::null(),
+        replication_staging_dir: std::ptr::null(),
     };
 
     if let Some(path) = options.tempdir {
-        cstr = CString::new(path.as_os_str().as_bytes()).map_err(|_| -1)?;
-        foreign_options.tempdir = cstr.as_ptr();
+        c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| -1)?;
+        foreign_options.tempdir = c_path.as_ptr();
+    }
+
+    if let Some(staging_dir) = options.replication_staging_dir {
+        c_staging_dir = CString::new(staging_dir.as_os_str().as_bytes()).map_err(|_| -1)?;
+        foreign_options.replication_staging_dir = c_staging_dir.as_ptr();
     }
 
     let ret = unsafe { verneuil_configure_impl(&foreign_options) };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(ret)
+    if ret != 0 {
+        return Err(ret);
     }
+
+    if let Some(staging_dir) = options.replication_staging_dir {
+        crate::replication_buffer::set_default_staging_directory(staging_dir).map_err(|_| -1)?;
+    }
+
+    Ok(())
 }
 
 /// This is the C-visible configuration function.
@@ -63,21 +80,30 @@ pub fn configure(options: Options) -> Result<(), i32> {
 /// Assumes the `options_ptr` is NULL or valid.
 #[no_mangle]
 pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) -> i32 {
-    let path_str;
+    let tempdir_str;
+    let staging_dir_str;
     let mut options: Options = Default::default();
+
+    fn cstr_to_path(ptr: *const c_char) -> Option<PathBuf> {
+        if ptr.is_null() {
+            return None;
+        }
+
+        let cstr = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("string must be valid")
+            .to_owned();
+        Some(cstr.into())
+    }
 
     if !options_ptr.is_null() {
         let foreign_options = &*options_ptr;
 
         options.make_default = foreign_options.make_default;
-        if !foreign_options.tempdir.is_null() {
-            path_str = CStr::from_ptr(foreign_options.tempdir)
-                .to_str()
-                .expect("path must be valid")
-                .to_owned();
-
-            options.tempdir = Some(Path::new(&path_str));
-        }
+        tempdir_str = cstr_to_path(foreign_options.tempdir);
+        options.tempdir = tempdir_str.as_deref();
+        staging_dir_str = cstr_to_path(foreign_options.replication_staging_dir);
+        options.replication_staging_dir = staging_dir_str.as_deref();
     }
 
     match configure(options) {
@@ -116,5 +142,9 @@ pub unsafe extern "C" fn sqlite3_verneuil_init(
 #[no_mangle]
 #[cfg(feature = "verneuil_test_vfs")]
 pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -> i32 {
+    // Harcode the replication staging directory to `/tmp/`.  Verneuil will add
+    // a verneuil-prefixed subdirectory component.
+    crate::replication_buffer::set_default_staging_directory(Path::new("/tmp/"))
+        .expect("Failed to set replication staging directory.");
     verneuil_test_only_register()
 }
