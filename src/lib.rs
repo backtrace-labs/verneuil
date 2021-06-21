@@ -1,3 +1,4 @@
+mod directory_schema;
 mod instance_id;
 mod replication_buffer;
 mod sqlite_code;
