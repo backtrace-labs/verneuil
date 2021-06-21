@@ -17,6 +17,7 @@
 use crate::instance_id;
 use crate::process_id::process_id;
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io::Error;
@@ -218,6 +219,10 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
     Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
 }
 
+fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
+    format!("{:016x}.{:016x}", fprint.hash[0], fprint.hash[1])
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
@@ -284,7 +289,7 @@ impl ReplicationBuffer {
     pub fn stage_chunk(&self, fprint: Fingerprint, data: &[u8]) -> Result<()> {
         use std::io::Write;
 
-        let chunk_name = format!("{:016x}.{:016x}", fprint.hash[0], fprint.hash[1]);
+        let chunk_name = fingerprint_chunk_name(&fprint);
 
         let mut target = self.buffer_directory.clone();
         target.push(STAGING);
@@ -329,6 +334,32 @@ impl ReplicationBuffer {
         let encoded = percent_encode_path_uri(db_path)?;
         target.push(&encoded);
         temp.persist(&target)?;
+        Ok(())
+    }
+
+    /// Attempts to clean up any chunk file that's not referred by the
+    /// `chunks` list.
+    pub fn gc_chunks(&self, chunks: &[Fingerprint]) -> Result<()> {
+        let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
+
+        let mut chunks = self.buffer_directory.clone();
+        chunks.push(STAGING);
+        chunks.push(CHUNKS);
+
+        for file in std::fs::read_dir(chunks)?.flatten() {
+            if let Some(name) = file.file_name().to_str() {
+                if live.contains(name) {
+                    continue;
+                }
+            }
+
+            // Attempt to delete the file.  We don't guarantee
+            // anything except that we keep everyting in `chunks`,
+            // so eat failures, which could happen, e.g., with
+            // concurrent GCs.
+            let _ = std::fs::remove_file(file.path());
+        }
+
         Ok(())
     }
 }

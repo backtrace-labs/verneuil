@@ -171,6 +171,8 @@ impl Tracker {
 
         buf.publish_directory(&self.path, &directory)
             .map_err(|_| "failed to publish directory file")?;
+        // GC is opportunistic, failure is OK.
+        let _ = buf.gc_chunks(&chunks);
         Ok(())
     }
 
