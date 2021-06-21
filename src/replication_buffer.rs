@@ -335,7 +335,6 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current staged directory file.
-    #[allow(dead_code)]
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
         use prost::Message;
 

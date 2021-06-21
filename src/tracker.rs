@@ -196,6 +196,19 @@ impl Tracker {
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
 
+        // If there's already a directory that matches our `header_fprint`,
+        // the replication buffer is already up to date.  This code is
+        // only an optimisation to avoid wasted work, so it's always safe
+        // to enter the rest of the function... and that's what we do
+        // whenever we fail to parse the staged directory file.
+        if let Ok(directory) = buf.read_staged_directory(&self.path) {
+            if let Some(v1) = directory.v1 {
+                if v1.header_fprint == Some(header_fprint.into()) {
+                    return Ok(());
+                }
+            }
+        }
+
         buf.ensure_staging_dir();
         let (len, chunks) = self
             .snapshot_chunks(&buf)
