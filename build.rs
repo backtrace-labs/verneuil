@@ -43,6 +43,8 @@ fn main() {
         build_sqlite();
     }
 
+    println!("cargo:rerun-if-changed=c/file_ops.c");
+    println!("cargo:rerun-if-changed=c/file_ops.h");
     println!("cargo:rerun-if-changed=c/vfs.c");
     println!("cargo:rerun-if-changed=c/vfs.h");
     println!("cargo:rerun-if-changed=include/verneuil.h");
@@ -72,6 +74,7 @@ fn main() {
         .define("SQLITE_CORE", None)
         // We know the linuxvfs doesn't implement dirsync.
         .define("SQLITE_DISABLE_DIRSYNC", None)
+        .file("c/file_ops.c")
         .file("c/vfs.c")
         .opt_level(2)
         .compile("verneuil_vfs")

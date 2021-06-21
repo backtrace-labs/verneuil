@@ -121,6 +121,41 @@ fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Creates a temporary file, populates it with `worker`, and
+/// publishes it to `target` on success.
+fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>) -> Result<T> {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    // See c/file_ops.h
+    extern "C" {
+        fn verneuil__open_temp_file(directory: *const c_char, mode: i32) -> i32;
+        fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
+    }
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::new(ErrorKind::Other, "no parent directory"))?;
+    let parent_str = CString::new(parent.as_os_str().as_bytes())?;
+    let target_str = CString::new(target.as_os_str().as_bytes())?;
+
+    let fd = unsafe { verneuil__open_temp_file(parent_str.as_ptr(), 0o444) };
+    if fd < 0 {
+        return Err(Error::last_os_error());
+    }
+
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = worker(&mut file)?;
+
+    if unsafe { verneuil__link_temp_file(fd, target_str.as_ptr()) } < 0 {
+        return Err(Error::last_os_error());
+    }
+
+    Ok(result)
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
