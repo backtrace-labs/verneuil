@@ -1,6 +1,15 @@
 //! The replication buffer subsystem manages replication data and
 //! ensures that consistent snapshots are regularly propagated to
 //! remote object storage.
+//!
+//! Each buffer is a directory that includes a "staging" directory.
+//!
+//! That staging directory has a "chunks" subdirectory, and a "meta"
+//! subdirectory.  The chunks directory contains content-addressed
+//! file chunks, and the "meta" directory named (url-encoded) metadata.
+//!
+//! Finally, there is also a "scratch" directory, which holds
+//! named temporary files.
 use crate::instance_id;
 
 use std::fs::File;
@@ -12,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+use umash::Fingerprint;
 
 #[derive(Debug)]
 pub(crate) struct ReplicationBuffer {
@@ -21,6 +31,12 @@ pub(crate) struct ReplicationBuffer {
 lazy_static::lazy_static! {
     static ref DEFAULT_STAGING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
+
+const STAGING: &str = "staging";
+const CHUNKS: &str = "chunks";
+const META: &str = "meta";
+const SCRATCH: &str = "scratch";
+const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
 
 /// If this flag is set to true, stale replication directories that
 /// look like they refer to overwritten databases will be deleted.
@@ -198,5 +214,41 @@ impl ReplicationBuffer {
         } else {
             Ok(None)
         }
+    }
+
+    /// Attempts to create a staging directory for the replication
+    /// buffer.
+    ///
+    /// Fails silently: downstream code has to handle all sorts of
+    /// concurrent failures anyway.
+    pub fn ensure_staging_dir(&self) {
+        let mut buf = self.buffer_directory.clone();
+        buf.push(STAGING);
+
+        let _ = std::fs::create_dir_all(&buf);
+        for subdir in &SUBDIRS {
+            buf.push(subdir);
+            let _ = std::fs::create_dir_all(&buf);
+            buf.pop();
+        }
+    }
+
+    /// Attempts to publish a chunk of data for `fprint`.  This file
+    /// might already exist, in which case we don't have to do anything.
+    pub fn stage_chunk(&self, fprint: Fingerprint, data: &[u8]) -> Result<()> {
+        use std::io::Write;
+
+        let chunk_name = format!("{:016x}.{:016x}", fprint.hash[0], fprint.hash[1]);
+
+        let mut target = self.buffer_directory.clone();
+        target.push(STAGING);
+        target.push(CHUNKS);
+        target.push(&chunk_name);
+
+        if target.exists() {
+            return Ok(());
+        }
+
+        call_with_temp_file(&target, |dst| dst.write_all(data))
     }
 }

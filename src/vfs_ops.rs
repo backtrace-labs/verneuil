@@ -176,7 +176,10 @@ extern "C" fn verneuil__file_unlock(file: &mut LinuxFile, level: LockLevel) -> i
     }
 
     if file.lock_level == LockLevel::Shared {
-        // Snapshot here.
+        if let Some(tracker) = file.tracker() {
+            // TODO: consider logging snapshot failures here.
+            let _ = tracker.snapshot();
+        }
     }
 
     unsafe { verneuil__file_unlock_impl(file, level) }
