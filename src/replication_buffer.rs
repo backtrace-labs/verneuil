@@ -14,6 +14,7 @@
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
 //! must have been created after the last crash or reboot.
+use crate::directory_schema::Directory;
 use crate::instance_id;
 use crate::process_id::process_id;
 
@@ -304,11 +305,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to overwrite the directory file for the replicated file.
-    pub fn publish_directory(
-        &self,
-        db_path: &Path,
-        directory: &crate::directory_schema::Directory,
-    ) -> Result<()> {
+    pub fn publish_directory(&self, db_path: &Path, directory: &Directory) -> Result<()> {
         use prost::Message;
         use std::io::Write;
         use tempfile::Builder;
@@ -335,6 +332,30 @@ impl ReplicationBuffer {
         target.push(&encoded);
         temp.persist(&target)?;
         Ok(())
+    }
+
+    /// Attempts to parse the current staged directory file.
+    #[allow(dead_code)]
+    pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
+        use prost::Message;
+
+        let mut src = self.buffer_directory.clone();
+        src.push(STAGING);
+        src.push(&percent_encode_path_uri(db_path)?);
+
+        Directory::decode(&*std::fs::read(src)?)
+            .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))
+    }
+
+    /// Attempts to parse the current staged directory file.
+    #[allow(dead_code)]
+    pub fn read_staged_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
+        let mut src = self.buffer_directory.clone();
+        src.push(STAGING);
+        src.push(CHUNKS);
+        src.push(&fingerprint_chunk_name(fprint));
+
+        std::fs::read(src)
     }
 
     /// Attempts to clean up any chunk file that's not referred by the

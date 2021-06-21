@@ -147,6 +147,48 @@ impl Tracker {
         Ok((len, chunk_fprints))
     }
 
+    /// Attempts to assert that the snapshot's contents match that of
+    /// our db file.
+    #[cfg(feature = "verneuil_test_vfs")]
+    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> std::io::Result<()> {
+        use blake2b_simd::Params;
+        use std::os::unix::io::AsRawFd;
+
+        let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
+        let expected = match File::open(&self_path) {
+            // If we can't open the DB file, this isn't a
+            // replication problem.
+            Err(_) => return Ok(()),
+            Ok(mut file) => {
+                let mut hasher = Params::new().hash_length(32).to_state();
+                std::io::copy(&mut file, &mut hasher)?;
+                hasher.finalize()
+            }
+        };
+
+        let mut hasher = Params::new().hash_length(32).to_state();
+        let directory = buf
+            .read_staged_directory(&self.path)
+            .expect("directory must parse")
+            .v1
+            .expect("v1 component must be populated.");
+        for i in 0..directory.chunks.len() / 2 {
+            let fprint = Fingerprint {
+                hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
+            };
+
+            let contents = buf.read_staged_chunk(&fprint)?;
+            if i + 1 < directory.chunks.len() / 2 {
+                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
+            }
+
+            hasher.update(&contents);
+        }
+
+        assert_eq!(expected, hasher.finalize());
+        Ok(())
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -173,6 +215,9 @@ impl Tracker {
             .map_err(|_| "failed to publish directory file")?;
         // GC is opportunistic, failure is OK.
         let _ = buf.gc_chunks(&chunks);
+
+        #[cfg(feature = "verneuil_test_vfs")]
+        self.compare_snapshot(&buf).expect("snapshots must match");
         Ok(())
     }
 
