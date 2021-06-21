@@ -142,6 +142,8 @@ pub unsafe extern "C" fn sqlite3_verneuil_init(
 #[no_mangle]
 #[cfg(feature = "verneuil_test_vfs")]
 pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -> i32 {
+    crate::replication_buffer::ENABLE_AUTO_CLEANUP
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     // Harcode the replication staging directory to `/tmp/`.  Verneuil will add
     // a verneuil-prefixed subdirectory component.
     crate::replication_buffer::set_default_staging_directory(Path::new("/tmp/"))

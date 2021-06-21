@@ -9,6 +9,8 @@ use std::io::ErrorKind;
 use std::io::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 
 #[derive(Debug)]
@@ -19,6 +21,13 @@ pub(crate) struct ReplicationBuffer {
 lazy_static::lazy_static! {
     static ref DEFAULT_STAGING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
+
+/// If this flag is set to true, stale replication directories that
+/// look like they refer to overwritten databases will be deleted.
+///
+/// This is potentially lossy, since our path-mangling scheme isn't
+/// invertible, so only enabled for sqlite tests.
+pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
 
 /// Sets the default staging directory for replication subdirectories,
 /// if it isn't already set.
@@ -81,6 +90,37 @@ fn db_file_key(db_path: &Path, fd: &File) -> Result<String> {
     Ok(format!("{}@{}.{}", prefix, meta.dev(), meta.ino()))
 }
 
+/// Attempts to delete all directories in the parent of `goal_path`
+/// that start with `prefix`, except `goal_path`.
+fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
+    let mut parent = goal_path.to_owned();
+    if !parent.pop() {
+        return Ok(());
+    }
+
+    let mut to_remove = vec![];
+
+    for subdir_or in std::fs::read_dir(parent)? {
+        let subdir = subdir_or?;
+        if subdir.path() == goal_path {
+            continue;
+        }
+
+        // Traverse the directory, and delete subdirectories in a
+        // separate pass: some filesystems don't like it when you
+        // traverse and mutate the directory at the same time.
+        if subdir.file_name().to_string_lossy().starts_with(prefix) {
+            to_remove.push(subdir);
+        }
+    }
+
+    for subdir in to_remove {
+        let _ = std::fs::remove_dir_all(subdir.path());
+    }
+
+    Ok(())
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
@@ -106,6 +146,16 @@ impl ReplicationBuffer {
             ));
             // And now add the unique local key for the db file.
             staging.push(db_file_key(db_path, fd)?);
+
+            // Attempt to delete directories that refer to the same
+            // path, but different inode.  This will do weird things
+            // when two different paths look the same once slashes
+            // are replaced with '#', so this logic is only enabled
+            // for sqlite tests, which create a lot of dbs.
+            if ENABLE_AUTO_CLEANUP.load(Ordering::Relaxed) {
+                let _ = delete_stale_directories(&staging, &format!("{}@", mangle_path(db_path)?));
+            }
+
             std::fs::create_dir_all(&staging)?;
             Ok(Some(ReplicationBuffer {
                 buffer_directory: staging,
