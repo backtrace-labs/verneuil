@@ -17,8 +17,10 @@ verneuil_test_vfs = []  # Build an archive for sqlite3 tests.
 
 [dependencies]
 lazy_static = "1"
+percent-encoding = "2"
 prost = "0.7"
 regex = "1"
+tempfile = "3"
 umash = "0.1.2"
 
 [build-dependencies]

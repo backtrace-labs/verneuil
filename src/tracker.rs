@@ -9,6 +9,8 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use umash::Fingerprint;
 
+use crate::directory_schema::Directory;
+use crate::directory_schema::DirectoryV1;
 use crate::replication_buffer::ReplicationBuffer;
 
 /// We snapshot db files in 64KB content-addressed chunks.
@@ -19,8 +21,47 @@ pub(crate) struct Tracker {
     // The C-side actually owns the file descriptor, but we can share
     // it with Rust: our C code doesn't use the FD's internal cursor.
     file: ManuallyDrop<File>,
+    // Canonical path for the tracked file.
     path: PathBuf,
     buffer: Option<ReplicationBuffer>,
+}
+
+/// Computes the fingerprint for a sqlite database.  The 100-byte header
+/// (https://www.sqlite.org/fileformat.html#:~:text=1.3.%20the%20database%20header)
+/// includes a "file change counter" field at offset 24; that field is updated
+/// as part of every transaction commit . Fingerprinting the first 100 bytes
+/// of a sqlite database should thus give us something that reliably changes
+/// whenever the file's contents are modified.
+fn fingerprint_sqlite_header(file: &File) -> Option<Fingerprint> {
+    const HEADER_SIZE: usize = 100;
+
+    lazy_static::lazy_static! {
+        static ref HEADER_PARAMS: umash::Params = umash::Params::derive(0, "verneuil sqlite header params");
+    }
+
+    let mut buf = [0u8; HEADER_SIZE];
+    match file.read_exact_at(&mut buf, 0) {
+        Err(_) => None,
+        Ok(_) => Some(Fingerprint::generate(&HEADER_PARAMS, 0, &buf)),
+    }
+}
+
+/// Computes the fingerprint for a list of fingerprints.  Each
+/// fingerprint is converted to little-endian bytes, and the
+/// result is fingerprinted.
+fn fingerprint_file_directory(chunks: &[Fingerprint]) -> Fingerprint {
+    lazy_static::lazy_static! {
+        static ref DIRECTORY_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db directory params");
+    }
+
+    let mut bytes = Vec::with_capacity(chunks.len() * 16);
+
+    for fprint in chunks {
+        bytes.extend(&fprint.hash[0].to_le_bytes());
+        bytes.extend(&fprint.hash[1].to_le_bytes());
+    }
+
+    Fingerprint::generate(&DIRECTORY_PARAMS, 0, &bytes)
 }
 
 /// Computes the fingerprint for a chunk of sqlite db file.
@@ -30,6 +71,16 @@ fn fingerprint_file_chunk(bytes: &[u8]) -> Fingerprint {
     }
 
     Fingerprint::generate(&CHUNK_PARAMS, 0, bytes)
+}
+
+fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
+    let mut ret = Vec::with_capacity(fprints.len() * 2);
+
+    for fprint in fprints {
+        ret.extend(&fprint.hash);
+    }
+
+    ret
 }
 
 impl Tracker {
@@ -101,11 +152,25 @@ impl Tracker {
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
+        let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
+
         buf.ensure_staging_dir();
-        let (_len, _chunks) = self
+        let (len, chunks) = self
             .snapshot_chunks(&buf)
             .map_err(|_| "failed to snapshot chunks")?;
-        // TODO: publish the directory file itself.
+        let directory_fprint = fingerprint_file_directory(&chunks);
+
+        let directory = Directory {
+            v1: Some(DirectoryV1 {
+                header_fprint: Some(header_fprint.into()),
+                contents_fprint: Some(directory_fprint.into()),
+                chunks: flatten_chunk_fprints(&chunks),
+                len,
+            }),
+        };
+
+        buf.publish_directory(&self.path, &directory)
+            .map_err(|_| "failed to publish directory file")?;
         Ok(())
     }
 

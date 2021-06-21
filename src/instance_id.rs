@@ -8,6 +8,8 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result;
 
+const DEFAULT_HOSTNAME: &str = "no.hostname.verneuil";
+
 fn compute_boot_time_slow() -> Result<u64> {
     let file = File::open("/proc/stat")?;
 
@@ -55,6 +57,25 @@ pub(crate) fn boot_id() -> &'static str {
     &*ID
 }
 
+fn find_hostname() -> Result<&'static str> {
+    let file = File::open("/etc/hostname")?;
+
+    match std::io::BufReader::new(file).lines().next() {
+        None => Err(Error::new(ErrorKind::Other, "hostname is empty")),
+        Some(Err(e)) => Err(e),
+        Some(Ok(line)) => Ok(Box::leak(line.into_boxed_str())),
+    }
+}
+
+/// Returns the machine's hostname, or a default placeholder if none.
+pub(crate) fn hostname() -> &'static str {
+    lazy_static::lazy_static! {
+        static ref NAME: &'static str = find_hostname().unwrap_or(DEFAULT_HOSTNAME);
+    }
+
+    &*NAME
+}
+
 /// Returns the verneuil instance id for this incarnation of the
 /// current machine: the first component is the boot timestamp, to
 /// help operations, and the second is the boot UUID, which is
@@ -82,4 +103,10 @@ fn print_boot_id() {
 #[test]
 fn print_instance_id() {
     println!("instance id = '{}'", instance_id());
+}
+
+#[test]
+fn print_hostname() {
+    assert_ne!(hostname(), DEFAULT_HOSTNAME);
+    println!("hostname = '{}'", hostname());
 }

@@ -10,6 +10,21 @@ pub(crate) struct Fprint {
     pub minor: u64,
 }
 
+impl From<umash::Fingerprint> for Fprint {
+    fn from(fp: umash::Fingerprint) -> Fprint {
+        (&fp).into()
+    }
+}
+
+impl From<&umash::Fingerprint> for Fprint {
+    fn from(fp: &umash::Fingerprint) -> Fprint {
+        Fprint {
+            major: fp.hash[0],
+            minor: fp.hash[1],
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub(crate) struct DirectoryV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There

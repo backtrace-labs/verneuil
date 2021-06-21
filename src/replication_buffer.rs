@@ -10,12 +10,19 @@
 //!
 //! Finally, there is also a "scratch" directory, which holds
 //! named temporary files.
+//!
+//! The files are *not* fsynced before publishing them: the buffer
+//! directory is tagged with an instance id, so any file we observe
+//! must have been created after the last crash or reboot.
 use crate::instance_id;
+use crate::process_id::process_id;
 
 use std::fs::File;
+use std::fs::Permissions;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -172,6 +179,45 @@ fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>
     Ok(result)
 }
 
+/// Returns a conservatively percent-encoded URI for `path`.
+/// The URI is of the form `verneuil:${hostname}/${path}`;
+/// there will never be any double slash in `path` (it's a
+/// canonical path), so these URIs should not collide for
+/// different hosts.
+fn percent_encode_path_uri(path: &Path) -> Result<String> {
+    // Per https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html,
+    // safe characters are alphanumeric characters, and a few special characters:
+    // - Forward slash (/)
+    // - Exclamation point (!)
+    // - Hyphen (-)
+    // - Underscore (_)
+    // - Period (.)
+    // - Asterisk (*)
+    // - Single quote (')
+    // - Open parenthesis (()
+    // - Close parenthesis ())
+    //
+    // However, we must also escape forward slashes, since they're
+    // directory separators.
+    const ESCAPED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+        .remove(b'!')
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'*')
+        .remove(b'\'')
+        .remove(b'(')
+        .remove(b')');
+
+    let string = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::Other, "unable to convert path to string"))?;
+
+    let name = format!("verneuil:{}/{}", instance_id::hostname(), string);
+    Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
@@ -251,4 +297,51 @@ impl ReplicationBuffer {
 
         call_with_temp_file(&target, |dst| dst.write_all(data))
     }
+
+    /// Attempts to overwrite the directory file for the replicated file.
+    pub fn publish_directory(
+        &self,
+        db_path: &Path,
+        directory: &crate::directory_schema::Directory,
+    ) -> Result<()> {
+        use prost::Message;
+        use std::io::Write;
+        use tempfile::Builder;
+
+        let mut encoded = Vec::<u8>::new();
+        directory
+            .encode(&mut encoded)
+            .map_err(|_| Error::new(ErrorKind::Other, "failed to serialise directory proto"))?;
+
+        let mut target = self.buffer_directory.clone();
+        target.push(STAGING);
+        target.push(SCRATCH);
+
+        let temp = Builder::new()
+            .prefix(&(process_id() + "."))
+            .suffix(".tmp")
+            .tempfile_in(&target)?;
+        temp.as_file()
+            .set_permissions(Permissions::from_mode(0o444))?;
+        temp.as_file().write_all(&encoded)?;
+
+        target.pop();
+        let encoded = percent_encode_path_uri(db_path)?;
+        target.push(&encoded);
+        temp.persist(&target)?;
+        Ok(())
+    }
+}
+
+#[test]
+fn percent_encode_sample() {
+    const SAMPLE_PATH: &str = "/a@<<sd!%-_/.asd/*'fdg(g/)\\~).db";
+    assert_eq!(
+        percent_encode_path_uri(Path::new(SAMPLE_PATH)).expect("should convert"),
+        // We assume the test host's name doesn't need escaping.
+        format!(
+            "verneuil%3A{}%2F%2Fa%40%3C%3Csd!%25-_%2F.asd%2F*\'fdg(g%2F)%5C%7E).db",
+            instance_id::hostname()
+        )
+    );
 }
