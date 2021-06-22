@@ -492,6 +492,50 @@ impl ReplicationBuffer {
 
         Ok(())
     }
+
+    /// Attempts to delete all temporary files and directory from "staging/scratch."
+    pub fn cleanup_scratch_directory(&self) -> Result<()> {
+        let mut scratch = self.buffer_directory.clone();
+        scratch.push(STAGING);
+        scratch.push(SCRATCH);
+
+        for entry in std::fs::read_dir(&scratch)?.flatten() {
+            let is_dir = match entry.file_type() {
+                Ok(file_type) => file_type.is_dir(),
+                Err(_) => false,
+            };
+
+            if !is_dir {
+                // The entry isn't a directory.  We can unlink it
+                // atomically, and there's nothing to do on failure:
+                // we simply want to remove as many now-useless files
+                // as possible.
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+
+            // Temporary directories always have a ".tmp" suffix.
+            // Atomically change that to ".del" to make sure all
+            // further operations on that directory (including
+            // publishing it as a new ready buffer) fail.
+            let mut path = entry.path().to_owned();
+            if path.extension() != Some(std::ffi::OsStr::new(".del")) {
+                let old_path = path.clone();
+
+                path.set_extension(".del");
+                let _ = std::fs::rename(old_path, &path);
+            }
+
+            // We know `path` is marked for deletion with a ".del"
+            // extension.  We can now delete it recursively.  Nothing
+            // to do if that fails... it's probably a concurrent
+            // deletion, and that we care about is that this
+            // subdirectory eventually goes away, if possible.
+            let _ = std::fs::remove_dir_all(path);
+        }
+
+        Ok(())
+    }
 }
 
 #[test]

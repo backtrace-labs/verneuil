@@ -276,6 +276,15 @@ impl Tracker {
 
             // GC is opportunistic, failure is OK.
             let _ = buf.gc_chunks(&chunks);
+            // There is no further work to do while the sqlite read
+            // lock is held; any temporary file or directory that's
+            // still in flight either was left behind by a crashed
+            // process, or belongs to a thread that will soon discover
+            // it has no work to do.
+            //
+            // Either way, we can delete everything; clean up is
+            // also opportunistic, so failure is OK.
+            let _ = buf.cleanup_scratch_directory();
         }
 
         #[cfg(feature = "verneuil_test_vfs")]
