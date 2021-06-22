@@ -83,6 +83,18 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
     ret
 }
 
+fn rebuild_chunk_fprints(flattened: &[u64]) -> Vec<Fingerprint> {
+    let mut ret = Vec::with_capacity(flattened.len() / 2);
+
+    for i in 0..flattened.len() / 2 {
+        ret.push(Fingerprint {
+            hash: [flattened[2 * i], flattened[2 * i + 1]],
+        });
+    }
+
+    ret
+}
+
 impl Tracker {
     pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker, &'static str> {
         use std::os::unix::io::FromRawFd;
@@ -196,48 +208,75 @@ impl Tracker {
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
 
-        // If there's already a directory that matches our `header_fprint`,
-        // the replication buffer is already up to date.  This code is
-        // only an optimisation to avoid wasted work, so it's always safe
-        // to enter the rest of the function... and that's what we do
-        // whenever we fail to parse the staged directory file.
-        if let Ok(directory) = buf.read_staged_directory(&self.path) {
-            if let Some(v1) = directory.v1 {
-                if v1.header_fprint == Some(header_fprint.into()) {
-                    return Ok(());
+        // Returns the argument's DirectoryV1 if the contents of that
+        // directory proto most likely match that of our sqlite db
+        // file.
+        //
+        // Returns None on mismatch or if the argument is Err: callers
+        // only want to skip work if data is definitely up to date, but
+        // it's never wrong to perform redundant work.
+        let up_to_date = |proto_or: std::io::Result<Directory>| {
+            if let Ok(directory) = proto_or {
+                if let Some(v1) = directory.v1 {
+                    if v1.header_fprint == Some(header_fprint.into()) {
+                        return Some(v1);
+                    }
                 }
             }
+
+            None
+        };
+
+        // If the ready directory is already up to date, there's
+        // nothing to do.
+        if up_to_date(buf.read_ready_directory(&self.path)).is_some() {
+            return Ok(());
         }
 
         buf.ensure_staging_dir();
-        let (len, chunks) = self
-            .snapshot_chunks(&buf)
-            .map_err(|_| "failed to snapshot chunks")?;
-        let directory_fprint = fingerprint_file_directory(&chunks);
 
-        let directory = Directory {
-            v1: Some(DirectoryV1 {
-                header_fprint: Some(header_fprint.into()),
-                contents_fprint: Some(directory_fprint.into()),
-                chunks: flatten_chunk_fprints(&chunks),
-                len,
-            }),
+        // Find the list of chunk fingerprints we care about, either
+        // by parsing an up-to-date "staged" directory file, or
+        // creating one.
+        let chunks = if let Some(directory) = up_to_date(buf.read_staged_directory(&self.path)) {
+            rebuild_chunk_fprints(&directory.chunks)
+        } else {
+            let (len, chunks) = self
+                .snapshot_chunks(&buf)
+                .map_err(|_| "failed to snapshot chunks")?;
+
+            let directory_fprint = fingerprint_file_directory(&chunks);
+            let directory = Directory {
+                v1: Some(DirectoryV1 {
+                    header_fprint: Some(header_fprint.into()),
+                    contents_fprint: Some(directory_fprint.into()),
+                    chunks: flatten_chunk_fprints(&chunks),
+                    len,
+                }),
+            };
+
+            buf.publish_directory(&self.path, &directory)
+                .map_err(|_| "failed to publish directory file")?;
+
+            chunks
         };
 
-        buf.publish_directory(&self.path, &directory)
-            .map_err(|_| "failed to publish directory file")?;
+        // If the ready directory still isn't up to date, make it so.
+        if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
+            let ready = buf
+                .prepare_ready_buffer(&self.path, &chunks)
+                .map_err(|_| "failed to prepare ready buffer")?;
 
-        let ready = buf
-            .prepare_ready_buffer(&self.path, &chunks)
-            .map_err(|_| "failed to prepare ready buffer")?;
+            if let Some(failed_ready) = buf.publish_ready_buffer_fast(ready) {
+                if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
+                    buf.publish_ready_buffer_slow(failed_ready)
+                        .map_err(|_| "failed to update ready buffer")?;
+                }
+            }
 
-        if let Some(failed_ready) = buf.publish_ready_buffer_fast(ready) {
-            buf.publish_ready_buffer_slow(failed_ready)
-                .map_err(|_| "failed to update ready buffer")?;
+            // GC is opportunistic, failure is OK.
+            let _ = buf.gc_chunks(&chunks);
         }
-
-        // GC is opportunistic, failure is OK.
-        let _ = buf.gc_chunks(&chunks);
 
         #[cfg(feature = "verneuil_test_vfs")]
         self.compare_snapshot(&buf).expect("snapshots must match");

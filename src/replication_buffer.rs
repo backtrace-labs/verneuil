@@ -339,6 +339,18 @@ impl ReplicationBuffer {
         Ok(())
     }
 
+    /// Attempts to parse the current ready directory file.
+    pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
+        use prost::Message;
+
+        let mut src = self.buffer_directory.clone();
+        src.push(READY);
+        src.push(&percent_encode_path_uri(db_path)?);
+
+        Directory::decode(&*std::fs::read(src)?)
+            .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))
+    }
+
     /// Attempts to parse the current staged directory file.
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
         use prost::Message;
