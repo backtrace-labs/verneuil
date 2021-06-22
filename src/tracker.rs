@@ -226,6 +226,16 @@ impl Tracker {
 
         buf.publish_directory(&self.path, &directory)
             .map_err(|_| "failed to publish directory file")?;
+
+        let ready = buf
+            .prepare_ready_buffer(&self.path, &chunks)
+            .map_err(|_| "failed to prepare ready buffer")?;
+
+        if let Some(failed_ready) = buf.publish_ready_buffer_fast(ready) {
+            buf.publish_ready_buffer_slow(failed_ready)
+                .map_err(|_| "failed to update ready buffer")?;
+        }
+
         // GC is opportunistic, failure is OK.
         let _ = buf.gc_chunks(&chunks);
 

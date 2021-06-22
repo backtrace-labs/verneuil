@@ -2,14 +2,17 @@
 //! ensures that consistent snapshots are regularly propagated to
 //! remote object storage.
 //!
-//! Each buffer is a directory that includes a "staging" directory.
+//! Each buffer is a directory that includes a "staging" directory,
+//! and a "ready" directory.
 //!
-//! That staging directory has a "chunks" subdirectory, and a "meta"
+//! The staging directory has a "chunks" subdirectory, and a "meta"
 //! subdirectory.  The chunks directory contains content-addressed
-//! file chunks, and the "meta" directory named (url-encoded) metadata.
+//! file chunks, and the "meta" directory named (url-encoded)
+//! metadata. Finally, there is also a "staging/scratch" directory,
+//! which holds named temporary files.
 //!
-//! Finally, there is also a "scratch" directory, which holds
-//! named temporary files.
+//! The "ready" directory always contains a directory that's ready to
+//! be consumed by the replication subsystem.
 //!
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
@@ -19,17 +22,21 @@ use crate::instance_id;
 use crate::process_id::process_id;
 
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result;
+use std::os::raw::c_char;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+use tempfile::TempDir;
 use umash::Fingerprint;
 
 #[derive(Debug)]
@@ -42,6 +49,7 @@ lazy_static::lazy_static! {
 }
 
 const STAGING: &str = "staging";
+const READY: &str = "ready";
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
 const SCRATCH: &str = "scratch";
@@ -149,9 +157,6 @@ fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
 /// Creates a temporary file, populates it with `worker`, and
 /// publishes it to `target` on success.
 fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>) -> Result<T> {
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
 
     // See c/file_ops.h
@@ -355,6 +360,99 @@ impl ReplicationBuffer {
         src.push(&fingerprint_chunk_name(fprint));
 
         std::fs::read(src)
+    }
+
+    /// Attempts to copy the current "staging" buffer to the "ready"
+    /// buffer.
+    pub fn prepare_ready_buffer(&self, db_path: &Path, chunks: &[Fingerprint]) -> Result<TempDir> {
+        use tempfile::Builder;
+
+        let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
+
+        let mut staging = self.buffer_directory.clone();
+        staging.push(STAGING);
+
+        let mut target = self.buffer_directory.clone();
+        target.push(STAGING);
+        target.push(SCRATCH);
+
+        let temp = Builder::new()
+            .prefix(&(process_id() + "."))
+            .suffix(".tmp")
+            .tempdir_in(&target)?;
+
+        let mut temp_path = temp.path().to_owned();
+
+        // hardlink relevant chunk files to `temp_path/chunks`.
+        staging.push(CHUNKS);
+        temp_path.push(CHUNKS);
+        std::fs::create_dir(&temp_path)?;
+
+        {
+            for file in std::fs::read_dir(&staging)?.flatten() {
+                if let Some(name) = file.file_name().to_str() {
+                    if live.contains(name) {
+                        staging.push(name);
+                        temp_path.push(name);
+
+                        std::fs::hard_link(&staging, &temp_path)?;
+
+                        temp_path.pop();
+                        staging.pop();
+                    }
+                }
+            }
+        }
+
+        temp_path.pop();
+        staging.pop();
+
+        // Now hardlink the directory proto file.
+        let directory_file = percent_encode_path_uri(db_path)?;
+        staging.push(&directory_file);
+        temp_path.push(&directory_file);
+        std::fs::hard_link(staging, temp_path)?;
+
+        Ok(temp)
+    }
+
+    /// Attempts to publish a temporary buffer directory to an empty
+    /// or missing "ready" buffer.
+    ///
+    /// Returns `None` on success, the temporary buffer on failure.
+    pub fn publish_ready_buffer_fast(&self, ready: TempDir) -> Option<TempDir> {
+        let mut target = self.buffer_directory.clone();
+        target.push(READY);
+
+        match std::fs::rename(ready.path(), &target) {
+            Err(_) => Some(ready),
+            Ok(_) => None,
+        }
+    }
+
+    /// Attempts to publish a temporary buffer directory to a potentially
+    /// re-existing buffer.
+    pub fn publish_ready_buffer_slow(&self, ready: TempDir) -> Result<()> {
+        // See c/file_ops.h
+        extern "C" {
+            fn verneuil__exchange_paths(x: *const c_char, y: *const c_char) -> i32;
+        }
+
+        let mut target = self.buffer_directory.clone();
+        target.push(READY);
+
+        let ready_str = CString::new(ready.path().as_os_str().as_bytes())?;
+        let target_str = CString::new(target.as_os_str().as_bytes())?;
+        if unsafe { verneuil__exchange_paths(ready_str.as_ptr(), target_str.as_ptr()) } == 0 {
+            Ok(())
+        } else {
+            // In the common case, `exchange_paths` fails because
+            // `target` blinked out of existence.  In that case, `rename`
+            // can only fail if `target` now exists, which should only
+            // be possible if another thread or process has published
+            // its own ready buffer, for the current db state.
+            std::fs::rename(ready.path(), &target)
+        }
     }
 
     /// Attempts to clean up any chunk file that's not referred by the
