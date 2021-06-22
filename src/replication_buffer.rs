@@ -374,6 +374,17 @@ impl ReplicationBuffer {
         std::fs::read(src)
     }
 
+    /// Attempts to parse the current staged directory file.
+    #[allow(dead_code)]
+    pub fn read_ready_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
+        let mut src = self.buffer_directory.clone();
+        src.push(READY);
+        src.push(CHUNKS);
+        src.push(&fingerprint_chunk_name(fprint));
+
+        std::fs::read(src)
+    }
+
     /// Attempts to copy the current "staging" buffer to the "ready"
     /// buffer.
     pub fn prepare_ready_buffer(&self, db_path: &Path, chunks: &[Fingerprint]) -> Result<TempDir> {

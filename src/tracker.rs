@@ -184,12 +184,26 @@ impl Tracker {
             .expect("directory must parse")
             .v1
             .expect("v1 component must be populated.");
+        assert_eq!(
+            directory,
+            buf.read_ready_directory(&self.path)
+                .expect("directory must parse")
+                .v1
+                .expect("v1 component must be populated")
+        );
+
         for i in 0..directory.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
             };
 
             let contents = buf.read_staged_chunk(&fprint)?;
+            assert_eq!(
+                contents,
+                buf.read_ready_chunk(&fprint)
+                    .expect("ready chunk must exist")
+            );
+
             if i + 1 < directory.chunks.len() / 2 {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
             }
