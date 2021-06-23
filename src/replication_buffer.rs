@@ -50,8 +50,16 @@ lazy_static::lazy_static! {
     static ref DEFAULT_STAGING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
 
+/// The "staging" subdirectory is updated in-place to match the db.
 const STAGING: &str = "staging";
+
+/// When the "staging" subdirectory matches the db, it can be copied
+/// atomically to the "ready" subdirectory.
 const READY: &str = "ready";
+
+/// At any time, the "ready" subdirectory can be acquired for copying
+/// and moved to "replicating"
+const REPLICATING: &str = "replicating";
 const DOT_METADATA: &str = ".metadata";
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
@@ -251,6 +259,71 @@ fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
         Some(_) => Err(Error::new(ErrorKind::Other, "invalid chunk list")),
         None => Err(Error::new(ErrorKind::Other, "v1 format not found")),
     }
+}
+
+/// Attempts to open a snapshot of the "replicating" subdirectory of
+/// `parent`.
+///
+/// On success, returns a process-local path to that subdirectory, and
+/// a file object that must be kept alive to ensure the path is valid.
+pub(crate) fn snapshot_replicating_directory(parent: PathBuf) -> Result<(PathBuf, File)> {
+    use std::os::unix::io::FromRawFd;
+
+    // See c/file_ops.h
+    extern "C" {
+        fn verneuil__open_directory(path: *const c_char) -> i32;
+    }
+
+    let mut replicating = parent;
+    replicating.push(REPLICATING);
+
+    let replicating_str = CString::new(replicating.as_os_str().as_bytes())?;
+    let fd = unsafe { verneuil__open_directory(replicating_str.as_ptr()) };
+    if fd < 0 {
+        return Err(Error::last_os_error());
+    }
+
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok((format!("/proc/self/fd/{}/", fd).into(), file))
+}
+
+/// Returns a path for the metadata file in this "replicating" directory.
+pub(crate) fn replicating_metadata_file(replicating: PathBuf) -> PathBuf {
+    let mut metadata = replicating;
+    metadata.push(DOT_METADATA);
+    metadata
+}
+
+/// Returns a path for the chunks subdirectory in this "replicating" directory.
+pub(crate) fn replicating_chunks(replicating: PathBuf) -> PathBuf {
+    let mut chunks = replicating;
+    chunks.push(CHUNKS);
+    chunks
+}
+
+/// Returns a path for the meta subdirectory in this "replicating" directory.
+pub(crate) fn replicating_meta(replicating: PathBuf) -> PathBuf {
+    let mut meta = replicating;
+    meta.push(META);
+    meta
+}
+
+/// Attempts to move the "ready" subdirectory of `parent` to "replicating".
+///
+/// This will no-op if there is no "ready" directory, or "replicating"
+/// is non-empty: in the former case, there is nothing to acquire, and
+/// in the latter we haven't fully copied the last directory that was
+/// acquired.  We must wait until copying is complete, otherwise we
+/// might refer to chunks that do not exist.
+pub(crate) fn acquire_ready_directory(parent: PathBuf) {
+    let mut ready = parent.clone();
+    ready.push(READY);
+
+    let mut replicating = parent;
+    replicating.push(REPLICATING);
+    // There are plenty of reasons this could fail, most of them
+    // benign or expected.  No need to bubble this up.
+    let _ = std::fs::rename(&ready, &replicating);
 }
 
 impl ReplicationBuffer {

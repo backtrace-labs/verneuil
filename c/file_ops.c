@@ -62,3 +62,15 @@ verneuil__exchange_paths(const char *x, const char *y)
 
         return r;
 }
+
+int
+verneuil__open_directory(const char *path)
+{
+        int r;
+
+        do {
+                r = open(path, O_CLOEXEC | O_DIRECTORY | O_PATH);
+        } while (r < 0 && errno == EINTR);
+
+        return r;
+}
