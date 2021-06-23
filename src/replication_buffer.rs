@@ -618,7 +618,7 @@ impl ReplicationBuffer {
         chunks.push(STAGING);
         chunks.push(CHUNKS);
 
-        for file in std::fs::read_dir(chunks)?.flatten() {
+        for file in std::fs::read_dir(&chunks)?.flatten() {
             if let Some(name) = file.file_name().to_str() {
                 if live.contains(name) {
                     continue;
@@ -629,7 +629,9 @@ impl ReplicationBuffer {
             // anything except that we keep everyting in `chunks`,
             // so eat failures, which could happen, e.g., with
             // concurrent GCs.
-            let _ = std::fs::remove_file(file.path());
+            chunks.push(file.file_name());
+            let _ = std::fs::remove_file(&chunks);
+            chunks.pop();
         }
 
         Ok(())
@@ -652,7 +654,9 @@ impl ReplicationBuffer {
                 // atomically, and there's nothing to do on failure:
                 // we simply want to remove as many now-useless files
                 // as possible.
-                let _ = std::fs::remove_file(entry.path());
+                scratch.push(entry.file_name());
+                let _ = std::fs::remove_file(&scratch);
+                scratch.pop();
                 continue;
             }
 
@@ -660,12 +664,12 @@ impl ReplicationBuffer {
             // Atomically change that to ".del" to make sure all
             // further operations on that directory (including
             // publishing it as a new ready buffer) fail.
-            let mut path = entry.path().to_owned();
-            if path.extension() != Some(std::ffi::OsStr::new(".del")) {
-                let old_path = path.clone();
+            scratch.push(entry.file_name());
+            if scratch.extension() != Some(std::ffi::OsStr::new(".del")) {
+                let old_path = scratch.clone();
 
-                path.set_extension(".del");
-                let _ = std::fs::rename(old_path, &path);
+                scratch.set_extension(".del");
+                let _ = std::fs::rename(old_path, &scratch);
             }
 
             // We know `path` is marked for deletion with a ".del"
@@ -673,7 +677,8 @@ impl ReplicationBuffer {
             // to do if that fails... it's probably a concurrent
             // deletion, and that we care about is that this
             // subdirectory eventually goes away, if possible.
-            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_dir_all(&scratch);
+            scratch.pop();
         }
 
         Ok(())
