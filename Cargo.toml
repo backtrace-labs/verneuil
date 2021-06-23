@@ -19,6 +19,7 @@ verneuil_test_vfs = ["blake2b_simd"]  # Build an archive for sqlite3 tests.
 # We use blake2b to compare the actual db file and our replicated snapshot,
 # but only during tests.
 blake2b_simd = { version = "0.5", optional = true }
+crossbeam-channel = "0.5"
 lazy_static = "1"
 percent-encoding = "2"
 prost = "0.7"

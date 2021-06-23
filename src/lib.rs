@@ -1,3 +1,4 @@
+mod copier;
 mod directory_schema;
 mod instance_id;
 mod process_id;

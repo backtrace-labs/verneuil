@@ -9,6 +9,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use umash::Fingerprint;
 
+use crate::copier::Copier;
 use crate::directory_schema::fingerprint_file_chunk;
 use crate::directory_schema::fingerprint_sqlite_header;
 use crate::directory_schema::fingerprint_v1_chunk_list;
@@ -28,6 +29,7 @@ pub(crate) struct Tracker {
     // Canonical path for the tracked file.
     path: PathBuf,
     buffer: Option<ReplicationBuffer>,
+    copier: Copier,
     replication_targets: ReplicationTargetList,
 }
 
@@ -78,12 +80,21 @@ impl Tracker {
         let buffer = ReplicationBuffer::new(&path, &file)
             .map_err(|_| "failed to create replication buffer")?;
 
+        let copier = Copier::get_global_copier();
+
+        // Let the copier pick up any ready snapshot left behind, e.g,
+        // by an older crashed process.
+        if let Some(buf) = &buffer {
+            buf.signal_copier(&copier);
+        }
+
         let replication_targets = crate::replication_target::get_default_replication_targets();
 
         Ok(Tracker {
             file,
             path,
             buffer,
+            copier,
             replication_targets,
         })
     }
@@ -253,6 +264,9 @@ impl Tracker {
                         .map_err(|_| "failed to update ready buffer")?;
                 }
             }
+
+            // The buffer is newly ready and updated.  Tell the copier.
+            buf.signal_copier(&self.copier);
 
             // GC is opportunistic, failure is OK.
             let _ = buf.gc_chunks(&chunks);

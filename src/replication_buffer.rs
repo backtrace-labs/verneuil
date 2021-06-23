@@ -522,6 +522,11 @@ impl ReplicationBuffer {
         }
     }
 
+    /// Attempts to signal this new `ready` subdirectory to the `copier`.
+    pub fn signal_copier(&self, copier: &crate::copier::Copier) {
+        copier.signal_ready_buffer(self.buffer_directory.clone());
+    }
+
     /// Attempts to clean up any chunk file that's not referred by the
     /// `chunks` list.
     pub fn gc_chunks(&self, chunks: &[Fingerprint]) -> Result<()> {
