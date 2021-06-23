@@ -363,6 +363,15 @@ impl ReplicationBuffer {
         Ok(())
     }
 
+    /// Returns whether the "ready" subdirectory definitely exists.
+    #[allow(dead_code)]
+    pub fn ready_directory_present(&self) -> bool {
+        let mut probe = self.buffer_directory.clone();
+        probe.push(READY);
+
+        probe.exists()
+    }
+
     /// Attempts to parse the current ready directory file.
     pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
         let mut src = self.buffer_directory.clone();

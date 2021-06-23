@@ -160,13 +160,22 @@ impl Tracker {
             .expect("directory must parse")
             .v1
             .expect("v1 component must be populated.");
+
+        // The header fingerprint must match the current header.
         assert_eq!(
-            directory,
-            buf.read_ready_directory(&self.path)
-                .expect("directory must parse")
-                .v1
-                .expect("v1 component must be populated")
+            directory.header_fprint,
+            fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
+                .map(|fp| fp.into())
         );
+
+        // If the ready file still exists, it must match the staged
+        // one.  Otherwise, the directory must have been consumed by
+        // the copier.
+        if let Ok(ready) = buf.read_ready_directory(&self.path) {
+            assert_eq!(directory, ready.v1.expect("v1 component must be populated"));
+        } else {
+            assert!(!buf.ready_directory_present());
+        }
 
         for i in 0..directory.chunks.len() / 2 {
             let fprint = Fingerprint {
@@ -174,11 +183,17 @@ impl Tracker {
             };
 
             let contents = buf.read_staged_chunk(&fprint)?;
-            assert_eq!(
-                contents,
-                buf.read_ready_chunk(&fprint)
-                    .expect("ready chunk must exist")
-            );
+            // The contents of a content-addressed chunk must have the same
+            // fingerprint as the chunk's name.
+            assert_eq!(fprint, fingerprint_file_chunk(&contents));
+
+            // If the ready chunk still exists, it must match the
+            // staged one.
+            if let Ok(ready) = buf.read_ready_chunk(&fprint) {
+                assert_eq!(contents, ready);
+            } else {
+                assert!(!buf.ready_directory_present());
+            }
 
             if i + 1 < directory.chunks.len() / 2 {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
