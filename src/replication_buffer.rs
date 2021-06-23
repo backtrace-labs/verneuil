@@ -355,8 +355,8 @@ impl ReplicationBuffer {
         temp.as_file().write_all(&encoded)?;
 
         target.pop();
-        let encoded = percent_encode_path_uri(db_path)?;
-        target.push(&encoded);
+        target.push(META);
+        target.push(&percent_encode_path_uri(db_path)?);
         temp.persist(&target)?;
         Ok(())
     }
@@ -365,6 +365,7 @@ impl ReplicationBuffer {
     pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
         let mut src = self.buffer_directory.clone();
         src.push(READY);
+        src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
         read_directory_at_path(&src)
     }
@@ -373,6 +374,7 @@ impl ReplicationBuffer {
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
         let mut src = self.buffer_directory.clone();
         src.push(STAGING);
+        src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
         read_directory_at_path(&src)
     }
@@ -401,7 +403,10 @@ impl ReplicationBuffer {
 
     /// Attempts to copy the current "staging" buffer to the "ready"
     /// buffer.
-    pub fn prepare_ready_buffer(&self, db_path: &Path, chunks: &[Fingerprint]) -> Result<TempDir> {
+    ///
+    /// This function should fail eagerly: it's better to fail
+    /// spuriously and retry than to publish a partial buffer.
+    pub fn prepare_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<TempDir> {
         use tempfile::Builder;
 
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
@@ -425,18 +430,16 @@ impl ReplicationBuffer {
         temp_path.push(CHUNKS);
         std::fs::create_dir(&temp_path)?;
 
-        {
-            for file in std::fs::read_dir(&staging)?.flatten() {
-                if let Some(name) = file.file_name().to_str() {
-                    if live.contains(name) {
-                        staging.push(name);
-                        temp_path.push(name);
+        for file in std::fs::read_dir(&staging)? {
+            if let Some(name) = file?.file_name().to_str() {
+                if live.contains(name) {
+                    staging.push(name);
+                    temp_path.push(name);
 
-                        std::fs::hard_link(&staging, &temp_path)?;
+                    std::fs::hard_link(&staging, &temp_path)?;
 
-                        temp_path.pop();
-                        staging.pop();
-                    }
+                    temp_path.pop();
+                    staging.pop();
                 }
             }
         }
@@ -444,11 +447,21 @@ impl ReplicationBuffer {
         temp_path.pop();
         staging.pop();
 
-        // Now hardlink the directory proto file.
-        let directory_file = percent_encode_path_uri(db_path)?;
-        staging.push(&directory_file);
-        temp_path.push(&directory_file);
-        std::fs::hard_link(staging, temp_path)?;
+        // hardlink all meta files to `temp_path/meta`.
+        staging.push(META);
+        temp_path.push(META);
+        std::fs::create_dir(&temp_path)?;
+
+        for file_or in std::fs::read_dir(&staging)? {
+            let file = file_or?;
+            staging.push(file.file_name());
+            temp_path.push(file.file_name());
+
+            std::fs::hard_link(&staging, &temp_path)?;
+
+            temp_path.pop();
+            staging.pop();
+        }
 
         Ok(temp)
     }
