@@ -12,19 +12,18 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
-use std::path::PathBuf;
 
 /// Initialization options for the Verneuil VFS.
 #[derive(Default)]
-pub struct Options<'a> {
+pub struct Options {
     /// If true, the Verneuil VFS overrides the default sqlite VFS.
     pub make_default: bool,
     /// All temporary file will live in this directory, or a default
     /// value if `None`.
-    pub tempdir: Option<&'a Path>,
+    pub tempdir: Option<String>,
     /// If provided, temporary replication data will live in
     /// subdirectories of that staging directory.
-    pub replication_staging_dir: Option<&'a Path>,
+    pub replication_staging_dir: Option<String>,
 }
 
 #[repr(C)]
@@ -44,10 +43,7 @@ extern "C" {
 
 /// Configures the Verneuil VFS
 pub fn configure(options: Options) -> Result<(), i32> {
-    use std::os::unix::ffi::OsStrExt;
-
     let c_path;
-    let c_staging_dir;
     let mut foreign_options = ForeignOptions {
         make_default: options.make_default,
         tempdir: std::ptr::null(),
@@ -55,22 +51,19 @@ pub fn configure(options: Options) -> Result<(), i32> {
     };
 
     if let Some(path) = options.tempdir {
-        c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| -1)?;
+        c_path = CString::new(path).map_err(|_| -1)?;
         foreign_options.tempdir = c_path.as_ptr();
     }
 
-    if let Some(staging_dir) = options.replication_staging_dir {
-        c_staging_dir = CString::new(staging_dir.as_os_str().as_bytes()).map_err(|_| -1)?;
-        foreign_options.replication_staging_dir = c_staging_dir.as_ptr();
-    }
-
+    // The C VFS only cares about `make_default` and `tempdir`.
     let ret = unsafe { verneuil_configure_impl(&foreign_options) };
     if ret != 0 {
         return Err(ret);
     }
 
     if let Some(staging_dir) = options.replication_staging_dir {
-        crate::replication_buffer::set_default_staging_directory(staging_dir).map_err(|_| -1)?;
+        crate::replication_buffer::set_default_staging_directory(Path::new(&staging_dir))
+            .map_err(|_| -1)?;
     }
 
     Ok(())
@@ -83,11 +76,9 @@ pub fn configure(options: Options) -> Result<(), i32> {
 /// Assumes the `options_ptr` is NULL or valid.
 #[no_mangle]
 pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) -> i32 {
-    let tempdir_str;
-    let staging_dir_str;
     let mut options: Options = Default::default();
 
-    fn cstr_to_path(ptr: *const c_char) -> Option<PathBuf> {
+    fn cstr_to_string(ptr: *const c_char) -> Option<String> {
         if ptr.is_null() {
             return None;
         }
@@ -96,17 +87,15 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
             .to_str()
             .expect("string must be valid")
             .to_owned();
-        Some(cstr.into())
+        Some(cstr)
     }
 
     if !options_ptr.is_null() {
         let foreign_options = &*options_ptr;
 
         options.make_default = foreign_options.make_default;
-        tempdir_str = cstr_to_path(foreign_options.tempdir);
-        options.tempdir = tempdir_str.as_deref();
-        staging_dir_str = cstr_to_path(foreign_options.replication_staging_dir);
-        options.replication_staging_dir = staging_dir_str.as_deref();
+        options.tempdir = cstr_to_string(foreign_options.tempdir);
+        options.replication_staging_dir = cstr_to_string(foreign_options.replication_staging_dir);
     }
 
     match configure(options) {
