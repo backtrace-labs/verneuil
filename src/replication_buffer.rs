@@ -17,6 +17,7 @@
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
 //! must have been created after the last crash or reboot.
+use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::Directory;
 use crate::instance_id;
 use crate::process_id::process_id;
@@ -229,6 +230,27 @@ fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
     format!("{:016x}.{:016x}", fprint.hash[0], fprint.hash[1])
 }
 
+/// Attempts to read a valid Directory message from `file_path`.
+fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
+    use prost::Message;
+
+    let directory = Directory::decode(&*std::fs::read(file_path)?)
+        .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))?;
+
+    match &directory.v1 {
+        Some(v1)
+            // We must have a v1 entry, the chunk fingerprints must match, and there
+            // must be an even number of u64 in the list (we need two per fingerprint).
+            if Some(fingerprint_v1_chunk_list(&v1.chunks).into()) == v1.contents_fprint
+                && (v1.chunks.len() % 2) == 0 =>
+        {
+            Ok(directory)
+        },
+        Some(_) => Err(Error::new(ErrorKind::Other, "invalid chunk list")),
+        None => Err(Error::new(ErrorKind::Other, "v1 format not found")),
+    }
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
@@ -341,26 +363,18 @@ impl ReplicationBuffer {
 
     /// Attempts to parse the current ready directory file.
     pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
-        use prost::Message;
-
         let mut src = self.buffer_directory.clone();
         src.push(READY);
         src.push(&percent_encode_path_uri(db_path)?);
-
-        Directory::decode(&*std::fs::read(src)?)
-            .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))
+        read_directory_at_path(&src)
     }
 
     /// Attempts to parse the current staged directory file.
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
-        use prost::Message;
-
         let mut src = self.buffer_directory.clone();
         src.push(STAGING);
         src.push(&percent_encode_path_uri(db_path)?);
-
-        Directory::decode(&*std::fs::read(src)?)
-            .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))
+        read_directory_at_path(&src)
     }
 
     /// Attempts to parse the current staged directory file.
