@@ -21,6 +21,7 @@ use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::Directory;
 use crate::instance_id;
 use crate::process_id::process_id;
+use crate::replication_target::ReplicationTargetList;
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -51,6 +52,7 @@ lazy_static::lazy_static! {
 
 const STAGING: &str = "staging";
 const READY: &str = "ready";
+const DOT_METADATA: &str = ".metadata";
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
 const SCRATCH: &str = "scratch";
@@ -406,7 +408,11 @@ impl ReplicationBuffer {
     ///
     /// This function should fail eagerly: it's better to fail
     /// spuriously and retry than to publish a partial buffer.
-    pub fn prepare_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<TempDir> {
+    pub fn prepare_ready_buffer(
+        &self,
+        chunks: &[Fingerprint],
+        targets: &ReplicationTargetList,
+    ) -> Result<TempDir> {
         use tempfile::Builder;
 
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
@@ -424,6 +430,17 @@ impl ReplicationBuffer {
             .tempdir_in(&target)?;
 
         let mut temp_path = temp.path().to_owned();
+
+        // Publish the replication targets to `.metadata`.
+        {
+            use std::io::Write;
+
+            let json_bytes = serde_json::to_vec(&targets)?;
+
+            temp_path.push(DOT_METADATA);
+            call_with_temp_file(&temp_path, |file| file.write_all(&json_bytes))?;
+            temp_path.pop();
+        }
 
         // hardlink relevant chunk files to `temp_path/chunks`.
         staging.push(CHUNKS);
