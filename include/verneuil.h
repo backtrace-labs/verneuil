@@ -4,6 +4,7 @@
 
 struct verneuil_options {
         bool make_default;
+
         /*
          * NULL leaves the temporary directory to its default
          * value.
@@ -16,6 +17,14 @@ struct verneuil_options {
          * subdirectories of that staging directory.
          */
         const char *replication_staging_dir;
+
+        /*
+         * Optional JSON-encoded options.  The fields directly in
+         * `verneuil_options` always take priority over the JSON.
+         *
+         * In particular, `make_default` is a no-op in the JSON.
+         */
+        const char *json_options;
 };
 
 /**

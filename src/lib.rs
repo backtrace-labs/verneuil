@@ -14,13 +14,16 @@ use std::os::raw::c_char;
 use std::path::Path;
 
 /// Initialization options for the Verneuil VFS.
-#[derive(Default)]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
 pub struct Options {
     /// If true, the Verneuil VFS overrides the default sqlite VFS.
     pub make_default: bool,
+
     /// All temporary file will live in this directory, or a default
     /// value if `None`.
     pub tempdir: Option<String>,
+
     /// If provided, temporary replication data will live in
     /// subdirectories of that staging directory.
     pub replication_staging_dir: Option<String>,
@@ -31,6 +34,7 @@ pub struct ForeignOptions {
     pub make_default: bool,
     pub tempdir: *const c_char,
     pub replication_staging_dir: *const c_char,
+    pub json_options: *const c_char,
 }
 
 // See `c/vfs.h`.
@@ -48,6 +52,7 @@ pub fn configure(options: Options) -> Result<(), i32> {
         make_default: options.make_default,
         tempdir: std::ptr::null(),
         replication_staging_dir: std::ptr::null(),
+        json_options: std::ptr::null(),
     };
 
     if let Some(path) = options.tempdir {
@@ -93,9 +98,21 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
     if !options_ptr.is_null() {
         let foreign_options = &*options_ptr;
 
+        if let Some(json) = cstr_to_string(foreign_options.json_options) {
+            match serde_json::from_str(&json) {
+                Ok(parsed) => options = parsed,
+                Err(_) => return -1,
+            }
+        }
+
         options.make_default = foreign_options.make_default;
-        options.tempdir = cstr_to_string(foreign_options.tempdir);
-        options.replication_staging_dir = cstr_to_string(foreign_options.replication_staging_dir);
+        if let Some(dir) = cstr_to_string(foreign_options.tempdir) {
+            options.tempdir = Some(dir);
+        }
+
+        if let Some(dir) = cstr_to_string(foreign_options.replication_staging_dir) {
+            options.replication_staging_dir = Some(dir);
+        }
     }
 
     match configure(options) {
