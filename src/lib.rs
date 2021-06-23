@@ -27,6 +27,10 @@ pub struct Options {
     /// If provided, temporary replication data will live in
     /// subdirectories of that staging directory.
     pub replication_staging_dir: Option<String>,
+
+    /// List of default replication targets.
+    #[serde(default)]
+    pub replication_targets: Vec<replication_target::ReplicationTarget>,
 }
 
 #[repr(C)]
@@ -67,10 +71,11 @@ pub fn configure(options: Options) -> Result<(), i32> {
     }
 
     if let Some(staging_dir) = options.replication_staging_dir {
-        crate::replication_buffer::set_default_staging_directory(Path::new(&staging_dir))
+        replication_buffer::set_default_staging_directory(Path::new(&staging_dir))
             .map_err(|_| -1)?;
     }
 
+    replication_target::set_default_replication_targets(options.replication_targets);
     Ok(())
 }
 

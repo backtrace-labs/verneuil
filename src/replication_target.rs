@@ -11,6 +11,7 @@
 //! we can use all the flexibility offered by serde_json.
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::RwLock;
 
 /// A S3 replication target sends content-addressed chunks to one
 /// S3-compatible bucket, and named directory blobs to another.
@@ -53,6 +54,22 @@ pub struct ReplicationTargetList {
     // the list of replication targets is the only metadata we
     // currently track, that could change.
     pub replication_targets: Vec<ReplicationTarget>,
+}
+
+lazy_static::lazy_static! {
+    static ref DEFAULT_REPLICATION_TARGETS: RwLock<Vec<ReplicationTarget>> = Default::default();
+}
+
+/// Sets the global default list of replication targets.
+pub(crate) fn set_default_replication_targets(targets: Vec<ReplicationTarget>) {
+    *DEFAULT_REPLICATION_TARGETS.write().unwrap() = targets;
+}
+
+/// Returns the global default list of replication targets.
+pub(crate) fn get_default_replication_targets() -> ReplicationTargetList {
+    ReplicationTargetList {
+        replication_targets: DEFAULT_REPLICATION_TARGETS.read().unwrap().clone(),
+    }
 }
 
 #[test]

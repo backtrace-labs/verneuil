@@ -15,6 +15,7 @@ use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::Directory;
 use crate::directory_schema::DirectoryV1;
 use crate::replication_buffer::ReplicationBuffer;
+use crate::replication_target::ReplicationTargetList;
 
 /// We snapshot db files in 64KB content-addressed chunks.
 const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
@@ -27,6 +28,7 @@ pub(crate) struct Tracker {
     // Canonical path for the tracked file.
     path: PathBuf,
     buffer: Option<ReplicationBuffer>,
+    replication_targets: ReplicationTargetList,
 }
 
 fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
@@ -76,7 +78,14 @@ impl Tracker {
         let buffer = ReplicationBuffer::new(&path, &file)
             .map_err(|_| "failed to create replication buffer")?;
 
-        Ok(Tracker { file, path, buffer })
+        let replication_targets = crate::replication_target::get_default_replication_targets();
+
+        Ok(Tracker {
+            file,
+            path,
+            buffer,
+            replication_targets,
+        })
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
