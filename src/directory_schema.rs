@@ -100,6 +100,17 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
         static ref DIRECTORY_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db directory params");
     }
 
+    if cfg!(target_endian = "little") {
+        let slice = unsafe {
+            std::slice::from_raw_parts(
+                chunks.as_ptr() as *const u8,
+                chunks.len() * std::mem::size_of::<u64>(),
+            )
+        };
+
+        return Fingerprint::generate(&DIRECTORY_PARAMS, 0, &slice);
+    }
+
     let mut bytes = Vec::with_capacity(chunks.len() * 8);
 
     for word in chunks {
