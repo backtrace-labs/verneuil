@@ -142,24 +142,18 @@ fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
         return Ok(());
     }
 
-    let mut to_remove = vec![];
+    let goal_filename = goal_path.file_name();
 
-    for subdir_or in std::fs::read_dir(parent)? {
-        let subdir = subdir_or?;
-        if subdir.path() == goal_path {
-            continue;
-        }
-
-        // Traverse the directory, and delete subdirectories in a
-        // separate pass: some filesystems don't like it when you
-        // traverse and mutate the directory at the same time.
+    for subdir in std::fs::read_dir(&parent)?.flatten() {
+        // Only consider deleting if the prefix matches.
         if subdir.file_name().to_string_lossy().starts_with(prefix) {
-            to_remove.push(subdir);
+            // And now make sure the path doesn't match.
+            if Some(subdir.file_name().as_os_str()) != goal_filename {
+                parent.push(subdir.file_name());
+                let _ = std::fs::remove_dir_all(&parent);
+                parent.pop();
+            }
         }
-    }
-
-    for subdir in to_remove {
-        let _ = std::fs::remove_dir_all(subdir.path());
     }
 
     Ok(())
