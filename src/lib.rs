@@ -2,6 +2,7 @@ mod directory_schema;
 mod instance_id;
 mod process_id;
 mod replication_buffer;
+mod replication_target;
 mod sqlite_code;
 mod tracker;
 mod vfs_ops;

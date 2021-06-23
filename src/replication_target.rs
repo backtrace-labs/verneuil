@@ -1,0 +1,81 @@
+//! A replication target tells Verneuil where to copy the
+//! content-addressed chunks and directory files it finds
+//! in "ready" directories.
+//!
+//! Targets only describe location, not credentials: they are
+//! persisted on disk in globally-readable files!
+//!
+//! We serialize to json because the data is small and short-lived,
+//! so schema evolution isn't an important concern.  We also only
+//! expect our own Rust code to deserialize the JSON we write, so
+//! we can use all the flexibility offered by serde_json.
+use serde::Deserialize;
+use serde::Serialize;
+
+/// A S3 replication target sends content-addressed chunks to one
+/// S3-compatible bucket, and named directory blobs to another.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct S3ReplicationTarget {
+    /// Region for the blob store.  Either one of the hardcoded strings
+    /// supported by Rust-S3 (https://github.com/durch/rust-s3/blob/0.26.3/aws-region/src/region.rs#L132-L160),
+    /// or a URL like "https://s3.us-east-1.amazonaws.com".
+    pub region: String,
+
+    /// Bucket name for content-addressed chunks.
+    pub chunk_bucket: String,
+
+    /// Bucket name for directory blobs.
+    pub directory_bucket: String,
+
+    /// If true, address buckets as subdomains (modern); otherwise,
+    /// use the legacy bucket-as-path mode.
+    pub domain_addressing: bool,
+
+    /// If true, the buckets will be created with default "private"
+    /// permissions if they don't already exist or disappear.
+    #[serde(default)]
+    pub create_buckets_on_demand: bool,
+}
+
+/// A replication target tells us where to replicate data, but not
+/// with what credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationTarget {
+    S3(S3ReplicationTarget),
+}
+
+/// Verneuil will replicate content-addressed chunks and named
+/// directory blobs to all the replication targets in the list.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicationTargetList {
+    // Use a long and distinctive name for this field because, while
+    // the list of replication targets is the only metadata we
+    // currently track, that could change.
+    pub replication_targets: Vec<ReplicationTarget>,
+}
+
+#[test]
+fn test_serialization_smoke_test() {
+    let targets = ReplicationTargetList {
+        replication_targets: vec![ReplicationTarget::S3(S3ReplicationTarget {
+            region: "minio.test.com".into(),
+            chunk_bucket: "chunks".into(),
+            directory_bucket: "directories".into(),
+            domain_addressing: true,
+            create_buckets_on_demand: false,
+        })],
+    };
+
+    let expected = "{\"replication_targets\":[{\"s3\":{\"region\":\"minio.test.com\",\"chunk_bucket\":\"chunks\",\"directory_bucket\":\"directories\",\"domain_addressing\":true,\"create_buckets_on_demand\":false}}]}";
+
+    assert_eq!(
+        serde_json::to_string(&targets).expect("should serialize"),
+        expected
+    );
+
+    assert_eq!(
+        serde_json::from_str::<ReplicationTargetList>(expected).expect("should deserialize"),
+        targets
+    );
+}
