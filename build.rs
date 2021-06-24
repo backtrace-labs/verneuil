@@ -26,6 +26,12 @@ fn build_sqlite() {
         .define("SQLITE_ENABLE_MATH_FUNCTIONS", None)
         // We use a lot of JSON; might be good to push down to sqlite.
         .define("SQLITE_ENABLE_JSON1", None)
+        // Make sqlite use calloc instead of malloc: the pager likes to
+        // malloc(3) full pages, but only populate them partially before
+        // fully persisting them to disk.  That leaks nondeterministic
+        // garbage to disk, which is bad for privacy and when testing
+        // replication for correctness.
+        .flag_if_supported("-include replace_malloc.h")
         .include("include")
         .flag_if_supported("-Wno-unused-parameter") // We don't tweak sqlite3.c
         .file("c/sqlite3.c")
