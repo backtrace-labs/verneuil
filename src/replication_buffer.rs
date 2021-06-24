@@ -120,23 +120,18 @@ fn mangle_path(path: &Path) -> Result<String> {
     Ok(replace_slashes(string))
 }
 
-/// Constructs a unique human-readable filename for `fd` at `db_path`:
-/// we derive a unique key with the file' device and inode ids (sqlite
-/// does not support DB files with multiple links), and prefix that
-/// with something that looks like the db file's canonical path for
-/// debuggability.
-fn db_file_key(db_path: &Path, fd: &File) -> Result<String> {
+/// Constructs a unique human-readable filename for `fd`: we derive a
+/// unique key with the file's device and inode ids.
+fn db_file_key(fd: &File) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let prefix = mangle_path(db_path)?;
     let meta = fd.metadata()?;
-
-    Ok(format!("{}@{}.{}", prefix, meta.dev(), meta.ino()))
+    Ok(format!("{}.{}", meta.dev(), meta.ino()))
 }
 
 /// Attempts to delete all directories in the parent of `goal_path`
-/// that start with `prefix`, except `goal_path`.
-fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
+/// except `goal_path`.
+fn delete_stale_directories(goal_path: &Path) -> Result<()> {
     let mut parent = goal_path.to_owned();
     if !parent.pop() {
         return Ok(());
@@ -145,14 +140,10 @@ fn delete_stale_directories(goal_path: &Path, prefix: &str) -> Result<()> {
     let goal_filename = goal_path.file_name();
 
     for subdir in std::fs::read_dir(&parent)?.flatten() {
-        // Only consider deleting if the prefix matches.
-        if subdir.file_name().to_string_lossy().starts_with(prefix) {
-            // And now make sure the path doesn't match.
-            if Some(subdir.file_name().as_os_str()) != goal_filename {
-                parent.push(subdir.file_name());
-                let _ = std::fs::remove_dir_all(&parent);
-                parent.pop();
-            }
+        if Some(subdir.file_name().as_os_str()) != goal_filename {
+            parent.push(subdir.file_name());
+            let _ = std::fs::remove_dir_all(&parent);
+            parent.pop();
         }
     }
 
@@ -357,15 +348,17 @@ impl ReplicationBuffer {
                 replace_slashes(instance_id::instance_id())
             ));
             // And now add the unique local key for the db file.
-            staging.push(db_file_key(db_path, fd)?);
+            staging.push(mangle_path(db_path)?);
+            staging.push(db_file_key(fd)?);
 
             // Attempt to delete directories that refer to the same
             // path, but different inode.  This will do weird things
             // when two different paths look the same once slashes
             // are replaced with '#', so this logic is only enabled
-            // for sqlite tests, which create a lot of dbs.
+            // for sqlite tests, which create a lot of dbs, none of
+            // which have colliding names.
             if ENABLE_AUTO_CLEANUP.load(Ordering::Relaxed) {
-                let _ = delete_stale_directories(&staging, &format!("{}@", mangle_path(db_path)?));
+                let _ = delete_stale_directories(&staging);
             }
 
             std::fs::create_dir_all(&staging)?;
