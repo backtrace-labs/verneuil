@@ -3,14 +3,21 @@
 //! of replication directories, and sending the ready snapshot to
 //! object stores like S3.
 use crate::replication_buffer;
+use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
+use crate::replication_target::S3ReplicationTarget;
 
+use s3::bucket::Bucket;
+use s3::creds::Credentials;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Result;
 use std::path::Path;
 use std::path::PathBuf;
+
+const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// A `Copier` is only a message-passing handle to a background worker
 /// thread.
@@ -110,12 +117,108 @@ fn consume_directory(
     }
 }
 
-/// Dummy implementations of the code to send blobs to S3.
-fn send_chunk(_name: &OsStr, _contents: File, _targets: &ReplicationTargetList) -> Result<()> {
-    Ok(())
+/// Creates `bucket` if it does not already exists.
+fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
+    if matches!(bucket.location(), Ok((_, 200))) {
+        return Ok(());
+    }
+
+    let result = if bucket.is_subdomain_style() {
+        Bucket::create
+    } else {
+        Bucket::create_with_path_style
+    }(
+        &bucket.name(),
+        bucket.region(),
+        bucket.credentials().clone(),
+        s3::bucket_ops::BucketConfiguration::private(),
+    );
+
+    match result {
+        Ok(response)
+            if (response.response_code >= 200 && response.response_code < 300) ||
+            // Conflicts on create is usually because the bucket already exists.
+            response.response_code == 409 =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::new(
+            ErrorKind::Other,
+            "failed to create bucket in S3",
+        )),
+    }
 }
 
-fn send_meta(_name: &OsStr, _contents: File, _targets: &ReplicationTargetList) -> Result<()> {
+/// Attempts to configure a `Bucket` from a `ReplicationTarget`.  Once
+/// configured, the `Copier` will use the same bucket object to
+/// publish objects.
+fn create_target(
+    target: &ReplicationTarget,
+    bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
+    creds: Credentials,
+) -> Result<Bucket> {
+    use ReplicationTarget::*;
+
+    match target {
+        S3(s3) => {
+            let region = if let Some(endpoint) = &s3.endpoint {
+                s3::Region::Custom {
+                    region: s3.region.clone(),
+                    endpoint: endpoint.clone(),
+                }
+            } else {
+                s3.region
+                    .parse()
+                    .map_err(|_| Error::new(ErrorKind::Other, "failed to parse region"))?
+            };
+
+            let bucket_name = bucket_extractor(&s3);
+            let mut bucket = Bucket::new(bucket_name, region, creds)
+                .map_err(|_| Error::new(ErrorKind::Other, "failed to create bucket object"))?;
+
+            if s3.domain_addressing {
+                bucket.set_subdomain_style();
+            } else {
+                bucket.set_path_style();
+            }
+
+            if s3.create_buckets_on_demand {
+                ensure_bucket_exists(&bucket)?;
+            }
+
+            Ok(bucket)
+        }
+    }
+}
+
+/// Attempts to publish the `contents` to `name` in all `targets.
+fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()> {
+    use std::io::Read;
+
+    let blob_name = name
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::Other, "invalid name"))?;
+
+    let mut bytes = Vec::new();
+    // TODO: check that chunk fingerprints match, check that directories checksum?
+    contents.read_to_end(&mut bytes)?;
+
+    for target in targets {
+        match target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE) {
+            Ok((_, code)) if (200..300).contains(&code) => {
+                // Success!
+            }
+            Ok((_, code)) if code < 500 => {
+                // Permanent failure.
+                return Err(Error::new(ErrorKind::Other, "failed to post chunk"));
+            }
+            _ => {
+                // Should retry here.
+                return Err(Error::new(ErrorKind::Other, "transient failure"));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -123,7 +226,7 @@ fn send_meta(_name: &OsStr, _contents: File, _targets: &ReplicationTargetList) -
 /// the corresponding files and directory as we go.  Once *everything*
 /// has been copied, the `parent` directory will be empty, which will
 /// make it possible to rename the "ready" directory to "replicating."
-fn handle_directory(parent: PathBuf) -> Result<()> {
+fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
     let (replicating, _file) = replication_buffer::snapshot_replicating_directory(parent)?;
 
     let metadata = replication_buffer::replicating_metadata_file(replicating.clone());
@@ -142,14 +245,33 @@ fn handle_directory(parent: PathBuf) -> Result<()> {
     // amount of replication data we keep around.
     let targets: ReplicationTargetList = serde_json::from_slice(&std::fs::read(&metadata)?)?;
 
-    consume_directory(
-        replication_buffer::replicating_chunks(replicating.clone()),
-        |name, file| send_chunk(name, file, &targets),
-    )?;
-    consume_directory(
-        replication_buffer::replicating_meta(replicating),
-        |name, file| send_meta(name, file, &targets),
-    )?;
+    {
+        let chunks_buckets = targets
+            .replication_targets
+            .iter()
+            .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+            .flatten() // TODO: how do we want to handle failures here?
+            .collect::<Vec<_>>();
+
+        consume_directory(
+            replication_buffer::replicating_chunks(replicating.clone()),
+            |name, file| copy_file(name, file, &chunks_buckets),
+        )?;
+    }
+
+    {
+        let meta_buckets = targets
+            .replication_targets
+            .iter()
+            .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
+            .flatten() // TODO: how do we want to handle failures here?
+            .collect::<Vec<_>>();
+
+        consume_directory(
+            replication_buffer::replicating_meta(replicating),
+            |name, file| copy_file(name, file, &meta_buckets),
+        )?;
+    }
 
     // Try to get rid of the metadata file.  If this fails, there's
     // nothing to do: the replicating directory is now empty, or
@@ -166,13 +288,15 @@ fn handle_directory(parent: PathBuf) -> Result<()> {
 fn handle_requests(receiver: crossbeam_channel::Receiver<PathBuf>) {
     // This only fails when the channel is closed.
     while let Ok(path) = receiver.recv() {
-        // Failures are expected when concurrent processes or copiers
-        // work on the same `path`.  Even when `handle_directory`
-        // fails, we're either making progress, or `path` is in a bad
-        // state and we choose to keep it untouched rather than drop
-        // data that we have failed to copy to the replication targets.
-        let _ = handle_directory(path.clone());
-        replication_buffer::acquire_ready_directory(path.clone());
-        let _ = handle_directory(path);
+        if let Ok(creds) = Credentials::default() {
+            // Failures are expected when concurrent processes or copiers
+            // work on the same `path`.  Even when `handle_directory`
+            // fails, we're either making progress, or `path` is in a bad
+            // state and we choose to keep it untouched rather than drop
+            // data that we have failed to copy to the replication targets.
+            let _ = handle_directory(creds.clone(), path.clone());
+            replication_buffer::acquire_ready_directory(path.clone());
+            let _ = handle_directory(creds, path);
+        }
     }
 }
