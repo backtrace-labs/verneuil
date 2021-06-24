@@ -7,6 +7,8 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use umash::Fingerprint;
 
 use crate::copier::Copier;
@@ -31,6 +33,12 @@ pub(crate) struct Tracker {
     buffer: Option<ReplicationBuffer>,
     copier: Copier,
     replication_targets: ReplicationTargetList,
+
+    // Set to true whenever the tracked sqlite file is written to.
+    //
+    // When that happens, the Tracker will force a snapshot as soon as
+    // possible.
+    mutated_since_last_snapshot: AtomicBool,
 }
 
 fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
@@ -96,7 +104,15 @@ impl Tracker {
             buffer,
             copier,
             replication_targets,
+            mutated_since_last_snapshot: AtomicBool::new(false),
         })
+    }
+
+    /// Make a note that the tracked file has acquired a write lock.
+    #[inline]
+    pub fn flag_write(&self) {
+        self.mutated_since_last_snapshot
+            .store(true, Ordering::Relaxed);
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
@@ -210,7 +226,18 @@ impl Tracker {
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
-    fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
+    ///
+    /// If `force` is true, always go through the whole process,
+    /// without trying to fast-path over redundant work.  This is
+    /// useful after writes: sqlite will sometimes update the data on
+    /// disk in ways that are semantically irrelevant after a rolled
+    /// back write.  When that happens, the header isn't changed, but
+    /// bits on disks differ, and we care about the latter.
+    fn snapshot_file_contents(
+        &self,
+        buf: &ReplicationBuffer,
+        force: bool,
+    ) -> Result<(), &'static str> {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
 
         // Returns the argument's DirectoryV1 if the contents of that
@@ -221,6 +248,10 @@ impl Tracker {
         // only want to skip work if data is definitely up to date, but
         // it's never wrong to perform redundant work.
         let up_to_date = |proto_or: std::io::Result<Directory>| {
+            if force {
+                return None;
+            }
+
             if let Ok(directory) = proto_or {
                 if let Some(v1) = directory.v1 {
                     if v1.header_fprint == Some(header_fprint.into()) {
@@ -243,29 +274,34 @@ impl Tracker {
         // Find the list of chunk fingerprints we care about, either
         // by parsing an up-to-date "staged" directory file, or
         // creating one.
-        let chunks = if let Some(directory) = up_to_date(buf.read_staged_directory(&self.path)) {
-            rebuild_chunk_fprints(&directory.chunks)
-        } else {
-            let (len, chunks) = self
-                .snapshot_chunks(&buf)
-                .map_err(|_| "failed to snapshot chunks")?;
+        //
+        // The variable `updated` is set to true whenever we
+        // reconstructed a new snapshot, instead of reading it
+        // from the staged file.
+        let (chunks, updated) =
+            if let Some(directory) = up_to_date(buf.read_staged_directory(&self.path)) {
+                (rebuild_chunk_fprints(&directory.chunks), false)
+            } else {
+                let (len, chunks) = self
+                    .snapshot_chunks(&buf)
+                    .map_err(|_| "failed to snapshot chunks")?;
 
-            let flattened = flatten_chunk_fprints(&chunks);
-            let directory_fprint = fingerprint_v1_chunk_list(&flattened);
-            let directory = Directory {
-                v1: Some(DirectoryV1 {
-                    header_fprint: Some(header_fprint.into()),
-                    contents_fprint: Some(directory_fprint.into()),
-                    chunks: flattened,
-                    len,
-                }),
+                let flattened = flatten_chunk_fprints(&chunks);
+                let directory_fprint = fingerprint_v1_chunk_list(&flattened);
+                let directory = Directory {
+                    v1: Some(DirectoryV1 {
+                        header_fprint: Some(header_fprint.into()),
+                        contents_fprint: Some(directory_fprint.into()),
+                        chunks: flattened,
+                        len,
+                    }),
+                };
+
+                buf.publish_directory(&self.path, &directory)
+                    .map_err(|_| "failed to publish directory file")?;
+
+                (chunks, true)
             };
-
-            buf.publish_directory(&self.path, &directory)
-                .map_err(|_| "failed to publish directory file")?;
-
-            chunks
-        };
 
         // If the ready directory still isn't up to date, make it so.
         if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
@@ -296,8 +332,17 @@ impl Tracker {
             let _ = buf.cleanup_scratch_directory();
         }
 
-        #[cfg(feature = "verneuil_test_vfs")]
-        self.compare_snapshot(&buf).expect("snapshots must match");
+        // It's possible for readers to observe a database file where
+        // some of the contents have changed, but not the header (not
+        // yet).  For example, this happens in sqlite's `cacheflush`
+        // tests.  That's why we can only expect the snapshot to be
+        // bitwise identical to the DB state when we know we just
+        // reconstructed a fresh snapshot.
+        if updated {
+            #[cfg(feature = "verneuil_test_vfs")]
+            self.compare_snapshot(&buf).expect("snapshots must match");
+        }
+
         Ok(())
     }
 
@@ -306,8 +351,12 @@ impl Tracker {
     ///
     /// Must be called with a read lock held on the underlying file.
     pub fn snapshot(&self) -> Result<(), &'static str> {
+        let force = self
+            .mutated_since_last_snapshot
+            .swap(false, Ordering::Relaxed);
+
         if let Some(buffer) = &self.buffer {
-            self.snapshot_file_contents(&buffer)
+            self.snapshot_file_contents(&buffer, force)
         } else {
             Ok(())
         }

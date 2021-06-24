@@ -123,6 +123,10 @@ extern "C" fn verneuil__file_write(
     // Similarly, some test VFSes write without holding an exclusive
     // lock on the file.
 
+    if let Some(tracker) = file.tracker() {
+        tracker.flag_write();
+    }
+
     unsafe { verneuil__file_write_impl(file, src, n, offset) }
 }
 
@@ -131,11 +135,20 @@ extern "C" fn verneuil__file_truncate(file: &LinuxFile, size: i64) -> i32 {
     // We can mostly assume truncations are page-aligned, except some
     // sqlite tests likes to do fun stuff.
 
+    if let Some(tracker) = file.tracker() {
+        tracker.flag_write();
+    }
+
     unsafe { verneuil__file_truncate_impl(file, size) }
 }
 
 #[no_mangle]
 extern "C" fn verneuil__file_sync(file: &mut LinuxFile, flags: i32) -> i32 {
+    // If there's something to sync, there was a write.
+    if let Some(tracker) = file.tracker() {
+        tracker.flag_write();
+    }
+
     unsafe { verneuil__file_sync_impl(file, flags) }
 }
 
