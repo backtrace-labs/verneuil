@@ -31,8 +31,33 @@ CFLAGS="-g -O2 -DSQLITE_OS_UNIX=1 -include '$HERE/../c/replace_malloc.h'"
 
 make clean
 
+function cleanup() {
+    # Don't fail the script if there's no container to remove.
+    docker rm -f verneuil_test_minio 2>&1 | cat /dev/null
+}
+
+cleanup
+
+trap cleanup EXIT
+
+mkdir -p minio
+rm -rf minio
+mkdir -p minio
+
+docker run -p 7777:7777 \
+  --user $(id -u):$(id -g) \
+  --name verneuil_test_minio \
+  -v $CURRENT/minio:/data \
+  -e "MINIO_ROOT_USER=VERNEUIL_TEST_ACCOUNT" \
+  -e "MINIO_ROOT_PASSWORD=VERNEUIL_TEST_KEY" \
+  minio/minio server --address :7777  /data &
+
+sleep 5;
+
 # Other interesting targets:
 #  mptest: multi-process locks
 #  fulltestonly, fulltest, soaktest: more extensive tests
 #  valgrindtest
+export AWS_ACCESS_KEY_ID=VERNEUIL_TEST_ACCOUNT
+export AWS_SECRET_ACCESS_KEY=VERNEUIL_TEST_KEY
 make "OPTS=$OPTS" "CFLAGS=$CFLAGS" "LIBS=release/libverneuil.a -lpthread -lm -ldl" test "$@"
