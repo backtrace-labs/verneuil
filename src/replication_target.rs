@@ -19,8 +19,15 @@ use std::sync::RwLock;
 pub struct S3ReplicationTarget {
     /// Region for the blob store.  Either one of the hardcoded strings
     /// supported by Rust-S3 (https://github.com/durch/rust-s3/blob/0.26.3/aws-region/src/region.rs#L132-L160),
-    /// or a URL like "https://s3.us-east-1.amazonaws.com".
+    /// or a local domain like "minio".
     pub region: String,
+
+    /// Endpoint override for custom regions, e.g.,
+    /// "http://127.0.0.1:9000".  Targets with custom regions should
+    /// specify an endpoint, but if they don't, the endpoint will
+    /// default to the same string as the region.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 
     /// Bucket name for content-addressed chunks.
     pub chunk_bucket: String,
@@ -76,7 +83,8 @@ pub(crate) fn get_default_replication_targets() -> ReplicationTargetList {
 fn test_serialization_smoke_test() {
     let targets = ReplicationTargetList {
         replication_targets: vec![ReplicationTarget::S3(S3ReplicationTarget {
-            region: "minio.test.com".into(),
+            region: "minio".into(),
+            endpoint: Some("http://127.0.0.1:9000".into()),
             chunk_bucket: "chunks".into(),
             directory_bucket: "directories".into(),
             domain_addressing: true,
@@ -84,7 +92,7 @@ fn test_serialization_smoke_test() {
         })],
     };
 
-    let expected = "{\"replication_targets\":[{\"s3\":{\"region\":\"minio.test.com\",\"chunk_bucket\":\"chunks\",\"directory_bucket\":\"directories\",\"domain_addressing\":true,\"create_buckets_on_demand\":false}}]}";
+    let expected = "{\"replication_targets\":[{\"s3\":{\"region\":\"minio\",\"endpoint\":\"http://127.0.0.1:9000\",\"chunk_bucket\":\"chunks\",\"directory_bucket\":\"directories\",\"domain_addressing\":true,\"create_buckets_on_demand\":false}}]}";
 
     assert_eq!(
         serde_json::to_string(&targets).expect("should serialize"),
