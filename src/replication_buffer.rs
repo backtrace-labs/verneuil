@@ -476,16 +476,19 @@ impl ReplicationBuffer {
         std::fs::read(src)
     }
 
-    /// Attempts to copy the current "staging" buffer to the "ready"
-    /// buffer.
+    /// Attempts to copy the current "staging" buffer to a temporary
+    /// buffer directory.
     ///
     /// This function should fail eagerly: it's better to fail
     /// spuriously and retry than to publish a partial buffer.
+    ///
+    /// On success, returns the number of chunk files copied, and
+    /// the temporary directory.
     pub fn prepare_ready_buffer(
         &self,
         chunks: &[Fingerprint],
         targets: &ReplicationTargetList,
-    ) -> Result<TempDir> {
+    ) -> Result<(usize, TempDir)> {
         use tempfile::Builder;
 
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
@@ -520,6 +523,7 @@ impl ReplicationBuffer {
         temp_path.push(CHUNKS);
         std::fs::create_dir(&temp_path)?;
 
+        let mut count = 0;
         for file in std::fs::read_dir(&staging)? {
             if let Some(name) = file?.file_name().to_str() {
                 if live.contains(name) {
@@ -527,6 +531,7 @@ impl ReplicationBuffer {
                     temp_path.push(name);
 
                     std::fs::hard_link(&staging, &temp_path)?;
+                    count += 1;
 
                     temp_path.pop();
                     staging.pop();
@@ -553,7 +558,7 @@ impl ReplicationBuffer {
             staging.pop();
         }
 
-        Ok(temp)
+        Ok((count, temp))
     }
 
     /// Attempts to publish a temporary buffer directory to an empty

@@ -23,6 +23,7 @@ crossbeam-channel = "0.5"
 lazy_static = "1"
 percent-encoding = "2"
 prost = "0.7"
+rand = "0.8"
 regex = "1"
 rust-s3 = { version = "0.27.0-rc4", default-features = false, features = ["sync-rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -382,7 +382,7 @@ impl Tracker {
 
         // If the ready directory still isn't up to date, make it so.
         if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
-            let ready = buf
+            let (copied, ready) = buf
                 .prepare_ready_buffer(&chunks, &self.replication_targets)
                 .map_err(|_| "failed to prepare ready buffer")?;
 
@@ -401,7 +401,25 @@ impl Tracker {
                 // buffer, we can delete all chunks.
                 let _ = buf.gc_chunks(&[]);
             } else {
-                let _ = buf.gc_chunks(&chunks);
+                use rand::Rng;
+
+                let mut rng = rand::thread_rng();
+
+                // If the ready buffer is stale, we can only remove
+                // now-useless chunks, with probability slightly
+                // greater than copied / chunks.len(): a GC wastes
+                // time linear in `chunks.len()` (the time it takes to
+                // scan chunks we don't want to delete), so we
+                // amortise that with randomised counting.
+                //
+                // We trigger a gc with low probability even when
+                // `copied == 0` to help eventually clear up unused
+                // chunks.  The probability is low enough that we can
+                // amortise the wasted work as constant overhead for
+                // each call to `snapshot_file_contents`.
+                if copied >= rng.gen_range(0..=chunks.len()) {
+                    let _ = buf.gc_chunks(&chunks);
+                }
             }
 
             // There is no further work to do while the sqlite read
