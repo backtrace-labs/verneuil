@@ -221,7 +221,9 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
     Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
 }
 
-fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
+/// Returns the chunk name for a given fingerprint.  This name is
+/// unambiguous and valid as both a POSIX filename and a S3 blob name.
+pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
     lazy_static::lazy_static! {
         // We separate the primary and secondary hashes with a
         // percent-encoded slash: we don't expect many collisions in

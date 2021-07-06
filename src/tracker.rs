@@ -154,18 +154,27 @@ impl Tracker {
     /// Fetches the contents of the chunk for `fprint`, or dies
     /// trying.
     #[cfg(feature = "verneuil_test_vfs")]
-    fn fetch_chunk_or_die(&self, fprint: &Fingerprint) -> Vec<u8> {
+    fn fetch_chunk_or_die(&self, buf: &ReplicationBuffer, fprint: &Fingerprint) -> Vec<u8> {
         let contents = buf
             .read_staged_chunk(&fprint)
             .expect("staged chunk must exist");
 
         // The contents of a content-addressed chunk must have the same
         // fingerprint as the chunk's name.
-        assert_eq!(fprint, fingerprint_file_chunk(&contents));
+        assert_eq!(fprint, &fingerprint_file_chunk(&contents));
 
         // If the ready chunk exists, it must match the staged one.
         if let Ok(ready) = buf.read_ready_chunk(&fprint) {
             assert_eq!(contents, ready);
+        }
+
+        for blob_value in crate::copier::fetch_chunk_from_targets(
+            &self.replication_targets.replication_targets,
+            &crate::replication_buffer::fingerprint_chunk_name(fprint),
+        ) {
+            if let Some(data) = blob_value.expect("target must be reachable") {
+                assert_eq!(contents, data);
+            }
         }
 
         contents
@@ -209,7 +218,7 @@ impl Tracker {
                 hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
             };
 
-            let contents = fetch_chunk_or_die(&fprint);
+            let contents = self.fetch_chunk_or_die(buf, &fprint);
             if i + 1 < directory.chunks.len() / 2 {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
             }

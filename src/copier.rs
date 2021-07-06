@@ -66,6 +66,21 @@ impl Copier {
     }
 }
 
+/// Attempts to fetch `name` from each chunk bucket in `targets`.
+/// Returns the result for each target, or None if missing.
+///
+/// Only used for internal testing.
+#[cfg(feature = "verneuil_test_vfs")]
+pub(crate) fn fetch_chunk_from_targets(
+    targets: &[ReplicationTarget],
+    name: &str,
+) -> Vec<Result<Option<Vec<u8>>>> {
+    targets
+        .iter()
+        .map(|target| fetch_chunk_from_one_target(target, name))
+        .collect()
+}
+
 /// Ensures the directory at `target` does not exist.
 ///
 /// Returns Ok if this was achieved, and Err otherwise.
@@ -220,6 +235,21 @@ fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Fetches the contents of blob `name` in `target`'s chunk bucket.
+#[cfg(feature = "verneuil_test_vfs")]
+fn fetch_chunk_from_one_target(target: &ReplicationTarget, name: &str) -> Result<Option<Vec<u8>>> {
+    let creds = Credentials::default()
+        .map_err(|_| Error::new(ErrorKind::Other, "failed to get credentials"))?;
+    let bucket = create_target(target, |s3| &s3.chunk_bucket, creds)?;
+
+    match bucket.get_object(name) {
+        Ok((payload, 200)) => Ok(Some(payload)),
+        Ok((_, 404)) => Ok(None),
+        Ok(_) => Err(Error::new(ErrorKind::Other, "failed to get chunk")),
+        _ => Err(Error::new(ErrorKind::Other, "failed to connect")),
+    }
 }
 
 /// Handles one "replicating" directory: copy the contents, and delete
