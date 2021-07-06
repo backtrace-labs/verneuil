@@ -54,12 +54,10 @@ lazy_static::lazy_static! {
 const STAGING: &str = "staging";
 
 /// When the "staging" subdirectory matches the db, it can be copied
-/// atomically to the "ready" subdirectory.
+/// atomically to an empty or missing "ready" subdirectory: the copy
+/// logic clears the directory once everything has been copied.
 const READY: &str = "ready";
 
-/// At any time, the "ready" subdirectory can be acquired for copying
-/// and moved to "replicating"
-const REPLICATING: &str = "replicating";
 const DOT_METADATA: &str = ".metadata";
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
@@ -261,12 +259,12 @@ fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
     }
 }
 
-/// Attempts to open a snapshot of the "replicating" subdirectory of
+/// Attempts to open a snapshot of the "ready" subdirectory of
 /// `parent`.
 ///
 /// On success, returns a process-local path to that subdirectory, and
 /// a file object that must be kept alive to ensure the path is valid.
-pub(crate) fn snapshot_replicating_directory(parent: PathBuf) -> Result<(PathBuf, File)> {
+pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File)> {
     use std::os::unix::io::FromRawFd;
 
     // See c/file_ops.h
@@ -274,11 +272,11 @@ pub(crate) fn snapshot_replicating_directory(parent: PathBuf) -> Result<(PathBuf
         fn verneuil__open_directory(path: *const c_char) -> i32;
     }
 
-    let mut replicating = parent;
-    replicating.push(REPLICATING);
+    let mut ready = parent;
+    ready.push(READY);
 
-    let replicating_str = CString::new(replicating.as_os_str().as_bytes())?;
-    let fd = unsafe { verneuil__open_directory(replicating_str.as_ptr()) };
+    let ready_str = CString::new(ready.as_os_str().as_bytes())?;
+    let fd = unsafe { verneuil__open_directory(ready_str.as_ptr()) };
     if fd < 0 {
         return Err(Error::last_os_error());
     }
@@ -287,43 +285,34 @@ pub(crate) fn snapshot_replicating_directory(parent: PathBuf) -> Result<(PathBuf
     Ok((format!("/proc/self/fd/{}/", fd).into(), file))
 }
 
-/// Returns a path for the metadata file in this "replicating" directory.
-pub(crate) fn replicating_metadata_file(replicating: PathBuf) -> PathBuf {
-    let mut metadata = replicating;
+/// Attempts to remove the "ready" subdirectory of `parent`, if it is
+/// empty.
+pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
+    let mut ready = parent;
+    ready.push(READY);
+
+    std::fs::remove_dir(ready)
+}
+
+/// Returns a path for the metadata file in this "ready" directory.
+pub(crate) fn ready_metadata_file(ready: PathBuf) -> PathBuf {
+    let mut metadata = ready;
     metadata.push(DOT_METADATA);
     metadata
 }
 
-/// Returns a path for the chunks subdirectory in this "replicating" directory.
-pub(crate) fn replicating_chunks(replicating: PathBuf) -> PathBuf {
-    let mut chunks = replicating;
+/// Returns a path for the chunks subdirectory in this "ready" directory.
+pub(crate) fn ready_chunks(ready: PathBuf) -> PathBuf {
+    let mut chunks = ready;
     chunks.push(CHUNKS);
     chunks
 }
 
-/// Returns a path for the meta subdirectory in this "replicating" directory.
-pub(crate) fn replicating_meta(replicating: PathBuf) -> PathBuf {
-    let mut meta = replicating;
+/// Returns a path for the meta subdirectory in this "ready" directory.
+pub(crate) fn ready_meta(ready: PathBuf) -> PathBuf {
+    let mut meta = ready;
     meta.push(META);
     meta
-}
-
-/// Attempts to move the "ready" subdirectory of `parent` to "replicating".
-///
-/// This will no-op if there is no "ready" directory, or "replicating"
-/// is non-empty: in the former case, there is nothing to acquire, and
-/// in the latter we haven't fully copied the last directory that was
-/// acquired.  We must wait until copying is complete, otherwise we
-/// might refer to chunks that do not exist.
-pub(crate) fn acquire_ready_directory(parent: PathBuf) {
-    let mut ready = parent.clone();
-    ready.push(READY);
-
-    let mut replicating = parent;
-    replicating.push(REPLICATING);
-    // There are plenty of reasons this could fail, most of them
-    // benign or expected.  No need to bubble this up.
-    let _ = std::fs::rename(&ready, &replicating);
 }
 
 impl ReplicationBuffer {

@@ -252,14 +252,14 @@ fn fetch_chunk_from_one_target(target: &ReplicationTarget, name: &str) -> Result
     }
 }
 
-/// Handles one "replicating" directory: copy the contents, and delete
+/// Handles one "ready" directory: copy the contents, and delete
 /// the corresponding files and directory as we go.  Once *everything*
-/// has been copied, the `parent` directory will be empty, which will
-/// make it possible to rename the "ready" directory to "replicating."
+/// has been copied, the directory will be empty, which will
+/// make it possible to rename fresh replication data over it.
 fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
-    let (replicating, _file) = replication_buffer::snapshot_replicating_directory(parent)?;
+    let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
 
-    let metadata = replication_buffer::replicating_metadata_file(replicating.clone());
+    let metadata = replication_buffer::ready_metadata_file(ready.clone());
 
     // Try to read the metadata JSON, which tells us where to
     // replicate the chunks and meta files.  If we can't do
@@ -284,7 +284,7 @@ fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
             .collect::<Vec<_>>();
 
         consume_directory(
-            replication_buffer::replicating_chunks(replicating.clone()),
+            replication_buffer::ready_chunks(ready.clone()),
             |name, file| copy_file(name, file, &chunks_buckets),
         )?;
     }
@@ -297,16 +297,18 @@ fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
 
-        consume_directory(
-            replication_buffer::replicating_meta(replicating),
-            |name, file| copy_file(name, file, &meta_buckets),
-        )?;
+        consume_directory(replication_buffer::ready_meta(ready), |name, file| {
+            copy_file(name, file, &meta_buckets)
+        })?;
     }
 
     // Try to get rid of the metadata file.  If this fails, there's
-    // nothing to do: the replicating directory is now empty, or
+    // nothing to do: the ready directory is now empty, or
     // it's wedged in a bad state.
     let _ = std::fs::remove_file(&metadata);
+
+    // And now try to get rid of the hopefully empty directory.
+    let _ = replication_buffer::remove_ready_directory_if_empty(parent);
 
     Ok(())
 }
@@ -324,8 +326,6 @@ fn handle_requests(receiver: crossbeam_channel::Receiver<PathBuf>) {
             // fails, we're either making progress, or `path` is in a bad
             // state and we choose to keep it untouched rather than drop
             // data that we have failed to copy to the replication targets.
-            let _ = handle_directory(creds.clone(), path.clone());
-            replication_buffer::acquire_ready_directory(path.clone());
             let _ = handle_directory(creds, path);
         }
     }
