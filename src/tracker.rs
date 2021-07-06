@@ -38,6 +38,9 @@ pub(crate) struct Tracker {
     //
     // When that happens, the Tracker will force a snapshot as soon as
     // possible.
+    //
+    // This field is also initialised to true in order to force a
+    // snapshot immediately after opening the database file.
     mutated_since_last_snapshot: AtomicBool,
 }
 
@@ -104,7 +107,7 @@ impl Tracker {
             buffer,
             copier,
             replication_targets,
-            mutated_since_last_snapshot: AtomicBool::new(false),
+            mutated_since_last_snapshot: AtomicBool::new(true),
         })
     }
 
