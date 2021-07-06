@@ -9,6 +9,7 @@ use crate::replication_target::S3ReplicationTarget;
 
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Error;
@@ -92,15 +93,34 @@ fn ensure_directory_removed(target: &Path) -> Result<()> {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum ConsumeDirectoryPolicy {
+    /// If we remove nothing, we just iterate over the files...
+    /// "scan" directory might be a more appropriate name.
+    KeepAll,
+
+    /// Remove files that have been successfully consumed.
+    RemoveFiles,
+
+    /// Also remove the directory, if it's now empty.
+    RemoveFilesAndDirectory,
+}
+
 /// Lists the files in `to_consume`, and passes them to `consumer`.
-/// When the `consumer` returns Ok for a file, attempts to remove it.
+/// When the `consumer` returns Ok for a file, attempts to remove it
+/// if the policy is `RemoveFiles` or `RemoveFilesAndDirectory`.
 ///
-/// Finally, ensures the `to_consume` directory is gone, which implies
-/// the every file in it has been consumed.
+/// Finally, ensures the `to_consume` directory is gone if the policy
+/// is `RemoveFilesAndDirectory`; on success, this implies that every
+/// file in it has been consumed.
 fn consume_directory(
     mut to_consume: PathBuf,
     mut consumer: impl FnMut(&OsStr, File) -> Result<()>,
+    policy: ConsumeDirectoryPolicy,
 ) -> Result<()> {
+    use ConsumeDirectoryPolicy::*;
+
+    let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
     match std::fs::read_dir(&to_consume) {
         Ok(dirents) => {
             for file in dirents.flatten() {
@@ -108,7 +128,7 @@ fn consume_directory(
 
                 to_consume.push(&name);
                 if let Ok(contents) = File::open(&to_consume) {
-                    if consumer(&name, contents).is_ok() {
+                    if consumer(&name, contents).is_ok() && delete_file {
                         // Attempt to remove the file.  It's ok if
                         // this fails: either someone else removed
                         // the file, or `ensure_directory_removed`
@@ -120,10 +140,14 @@ fn consume_directory(
                 to_consume.pop();
             }
 
-            // If we can't get rid of that directory, it must be
-            // non-empty, which means we failed to consume some
-            // file... in which case we must report failure.
-            ensure_directory_removed(&to_consume)
+            if policy == RemoveFilesAndDirectory {
+                // If we can't get rid of that directory, it must be
+                // non-empty, which means we failed to consume some
+                // file... in which case we must report failure.
+                ensure_directory_removed(&to_consume)
+            } else {
+                Ok(())
+            }
         }
 
         // It's OK if the directory is already gone (and thus empty).
@@ -206,7 +230,7 @@ fn create_target(
     }
 }
 
-/// Attempts to publish the `contents` to `name` in all `targets.
+/// Attempts to publish the `contents` to `name` in all `targets`.
 fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()> {
     use std::io::Read;
 
@@ -256,10 +280,10 @@ fn fetch_chunk_from_one_target(target: &ReplicationTarget, name: &str) -> Result
 /// the corresponding files and directory as we go.  Once *everything*
 /// has been copied, the directory will be empty, which will
 /// make it possible to rename fresh replication data over it.
-fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
+fn handle_ready_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
     let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
 
-    let metadata = replication_buffer::ready_metadata_file(ready.clone());
+    let metadata = replication_buffer::directory_metadata_file(ready.clone());
 
     // Try to read the metadata JSON, which tells us where to
     // replicate the chunks and meta files.  If we can't do
@@ -284,8 +308,9 @@ fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
             .collect::<Vec<_>>();
 
         consume_directory(
-            replication_buffer::ready_chunks(ready.clone()),
+            replication_buffer::directory_chunks(ready.clone()),
             |name, file| copy_file(name, file, &chunks_buckets),
+            ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
         )?;
     }
 
@@ -297,9 +322,11 @@ fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
 
-        consume_directory(replication_buffer::ready_meta(ready), |name, file| {
-            copy_file(name, file, &meta_buckets)
-        })?;
+        consume_directory(
+            replication_buffer::directory_meta(ready),
+            |name, file| copy_file(name, file, &meta_buckets),
+            ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
+        )?;
     }
 
     // Try to get rid of the metadata file.  If this fails, there's
@@ -309,6 +336,134 @@ fn handle_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
 
     // And now try to get rid of the hopefully empty directory.
     let _ = replication_buffer::remove_ready_directory_if_empty(parent);
+
+    Ok(())
+}
+
+/// Returns whether the directory at `path` is empty or just does
+/// not exist at all.
+fn directory_is_empty_or_absent(path: &Path) -> Result<bool> {
+    match std::fs::read_dir(path) {
+        Ok(mut dirents) => Ok(dirents.next().is_none()),
+        // It's OK if the directory is already gone (and thus empty).
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+/// Returns a tuple that identifies a given file; if a given path has
+/// the same identifier, it is the same (unless someone is maliciously
+/// tampering with it).
+fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata()?;
+    Ok((
+        meta.created()?,
+        meta.len(),
+        meta.dev(),
+        meta.ino(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ))
+}
+
+/// Handles one "staging" directory: copy the chunks, then copy
+/// the metadata blobs if nothing has changed since.
+///
+/// This function can only make progress if the caller first
+/// calls `handle_ready_directory`.
+fn handle_staging_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
+    let staging = replication_buffer::mutable_staging_directory(parent.clone());
+    let chunks_directory = replication_buffer::directory_chunks(staging.clone());
+    let meta_directory = replication_buffer::directory_meta(staging.clone());
+
+    let targets: ReplicationTargetList = {
+        let metadata = replication_buffer::directory_metadata_file(staging);
+        serde_json::from_slice(&std::fs::read(&metadata)?)?
+    };
+
+    // It's always safe to publish chunks: they don't have any
+    // dependency.
+    {
+        let chunks_buckets = targets
+            .replication_targets
+            .iter()
+            .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+            .flatten() // TODO: how do we want to handle failures here?
+            .collect::<Vec<_>>();
+
+        let mut published = 0;
+
+        consume_directory(
+            chunks_directory.clone(),
+            &mut |name: &OsStr, file| {
+                copy_file(name, file, &chunks_buckets)?;
+                published += 1;
+                Ok(())
+            },
+            ConsumeDirectoryPolicy::RemoveFiles,
+        )?;
+
+        // Assume there is no update to publish if the chunks
+        // directory is empty.
+        if published == 0 {
+            return Ok(());
+        }
+    }
+
+    // Snapshot the current meta files.
+    let mut initial_meta = HashMap::new();
+    consume_directory(
+        meta_directory.clone(),
+        &mut |name: &OsStr, file| {
+            initial_meta.insert(name.to_owned(), file_identifier(&file)?);
+            Ok(())
+        },
+        ConsumeDirectoryPolicy::KeepAll,
+    )?;
+
+    // We must now make sure that we have published all the chunks
+    // before publishing the meta files.
+    if !directory_is_empty_or_absent(&chunks_directory)? {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "unpublished staged chunks remain",
+        ));
+    }
+
+    // If the "ready" directory now exists, we may have observed an
+    // empty `chunks_directory` because a Tracker cleared everything
+    // once the data to replicate was in "ready."
+    //
+    // However, if we now observe that the ready directory doesn't
+    // exist, either that didn't happen, or another copier already
+    // replicated its contents.  Either way, it's safe to copy the
+    // meta files (unless they have changed).
+    if !directory_is_empty_or_absent(&replication_buffer::mutable_ready_directory(parent))? {
+        return Err(Error::new(ErrorKind::Other, "ready directory exists"));
+    }
+
+    {
+        let meta_buckets = targets
+            .replication_targets
+            .iter()
+            .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
+            .flatten() // TODO: how do we want to handle failures here?
+            .collect::<Vec<_>>();
+
+        consume_directory(
+            meta_directory,
+            &mut |name: &OsStr, file| {
+                if initial_meta.get(name) == Some(&file_identifier(&file)?) {
+                    copy_file(name, file, &meta_buckets)
+                } else {
+                    Ok(())
+                }
+            },
+            ConsumeDirectoryPolicy::KeepAll,
+        )?;
+    }
 
     Ok(())
 }
@@ -326,7 +481,26 @@ fn handle_requests(receiver: crossbeam_channel::Receiver<PathBuf>) {
             // fails, we're either making progress, or `path` is in a bad
             // state and we choose to keep it untouched rather than drop
             // data that we have failed to copy to the replication targets.
-            let _ = handle_directory(creds, path);
+            let _ = handle_ready_directory(creds.clone(), path.clone());
+
+            // Opportunistically try to copy from the "staging"
+            // directory.  That's never staler than "ready", so we do
+            // not go backward in our replication.
+            let _ = handle_staging_directory(creds.clone(), path.clone());
+
+            // And now see if the ready directory was updated again.
+            // We only upload meta files (directory protos) if we
+            // observed that the "ready" directory was empty while the
+            // meta files had the same value as when we entered
+            // "handle_staging_directory".  Anything we now find in
+            // the "ready" directory must be at least as recent as
+            // what we found in staging, so, again, replication
+            // cannot go backwards.
+            let _ = handle_ready_directory(creds, path);
+
+            // When we get here, the remote data should be at least as
+            // fresh as the last staged snapshot when we entered the
+            // loop body.
         }
     }
 }

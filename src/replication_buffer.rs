@@ -17,6 +17,98 @@
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
 //! must have been created after the last crash or reboot.
+//!
+//! Two classes of processes interact with a replication buffer
+//! directory: `Tracker`s produce data (update the replication
+//! snapshot), while `Copier`s consume it.  The producers and
+//! consumers' usage of a replication buffers provides the following
+//! guarantees:
+//!
+//! - Except for "staging/scratch", files in "ready" and in "staging"
+//!   are write-once: they may be overwritten, but only by atomic
+//!   rename(2)/link(2).  The files are also created with read-only
+//!   permissions.
+//!
+//! - Data in a "ready" directory only goes away once it has been
+//!   copied to remote storage.  A Tracker can thus only publish a new
+//!   "ready" directory once the old one (if any) has been fully copied.
+//!
+//! - When a new "ready" directory exists, all chunks referenced by
+//!   its "ready/meta" files have already been copied, or are in the
+//!   "ready/chunks" subdirectory.  This is true when a Tracker
+//!   constructs a fresh "ready" directory and publishes it
+//!   atomically, and remains true because copiers always consume
+//!   (upload and delete) "ready/chunks" before "ready/meta".
+//!
+//! - Copiers eventually empty or delete a "ready" directory when its
+//!   "chunks" and "meta" subdirectories are empty or absent.
+//!
+//! - All chunks referenced by "staging/meta" files have already been
+//!   copied, are in "ready/chunks", or are in "staging/chunks".
+//!   Copiers maintain this invariant by only deleting a file from
+//!   "ready/chunks" once it has been uploaded.  Trackers maintain
+//!   this invariant by:
+//!     1. writing chunks to "staging/chunks" before publishing to
+//!        "staging/meta";
+//!     2. deleting all files in "staging/chunks" whenever the current
+//!        snapshot has been published to "ready";
+//!     3. otherwise only deleting unused files in "staging/chunks".
+//!
+//! The conditions for consumers (`Copier`s) are easy to enforce,
+//! since copiers only perform monotonic or idempotent actions (upload
+//! a file then delete it, remove an empty directory).  Of course,
+//! producers (`Tracker`s) will publish new data, so consumers must
+//! still worry about ABA.
+//!
+//! For the "ready" directory, `Copier`s access a snapshot of the
+//! current directory via a file descriptor for that current directory
+//! structure.  The snapshot is mutable, but, once published, only
+//! `Copier`s update a "ready" directory, and only by removing files
+//! or subdirectory once they are useless.  This RCU-like protocol
+//! ensures that `Copier`s can always make progress even when
+//! `Tracker`s constantly observe new writes.
+//!
+//! For the "staging" directory, it makes sense to split the analysis
+//! between the easy part (chunks) and and the hard part (meta files).
+//!
+//! The invariant on chunks only refer to individual chunk files: a
+//! chunk file never has any dependency.  We also don't have to worry
+//! about ABA on chunk files: two chunk files with the same name are
+//! assumed to have the same contents (that's how deduplication
+//! works).  A `Copier` can thus always upload a given chunk file and
+//! then delete it: even if the path now refers to a different inode,.
+//!
+//! The invariant on "meta" files refers to chunk files, but not to
+//! other "meta" files.  This lets `Copier`s use something like a
+//! sequence lock scheme on each "meta" file.  A `Copier` computes a
+//! unique identifier for (the inode of) each meta file, checks that
+//! all relevant chunks have definitely been published
+//! ("staging/chunks" is empty, *and then* "ready" is empty or
+//! missing), and finally uploads all meta files that have not changed.
+//!
+//! It's important to check for chunks to upload first in "staging",
+//! and then in "ready" because we can't check for both atomically,
+//! and "ready" is sticky: when we observe an empty "staging/chunks"
+//! subdirectory, that might be because relevant chunks are now
+//! in "ready".  However, if we then observe an empty "ready", either
+//! that did not happen, or all chunks that used to be there have
+//! been uploaded.  Either way, the unchanged meta files' dependencies
+//! should all have been copied to remote storage.
+//!
+//! The conditions for producers (`Tracker`s) are more complex, and
+//! involve non-monotonic/idempotent state updates.  However, they can
+//! already rely on locking: `Tracker`s only update "staging" or
+//! "ready" directories for a given db file while holding a read lock
+//! on that file (and the db file is only mutated with a write lock
+//! held).  While multiple `Tracker`s may concurrently update the
+//! same directories, they will always work off the same db file,
+//! and will thus always progress towards the same goal.
+//!
+//! The sequence lock approach for "staging" lets `Copier`s make
+//! progress when there is data to copy, and `Tracker`s are idle.
+//! Combined with the RCU approach for the "ready" directory, we can
+//! guarantee progress both when `Tracker`s are idle, and when they're
+//! constantly churning.
 use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::Directory;
 use crate::instance_id;
@@ -264,6 +356,22 @@ fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
     }
 }
 
+/// Returns the path to the staging directory under `parent`; it may
+/// be updated concurrently.
+pub(crate) fn mutable_staging_directory(parent: PathBuf) -> PathBuf {
+    let mut staging = parent;
+    staging.push(STAGING);
+    staging
+}
+
+/// Returns the path to the ready directory under `parent`; it may
+/// be updated concurrently.
+pub(crate) fn mutable_ready_directory(parent: PathBuf) -> PathBuf {
+    let mut ready = parent;
+    ready.push(READY);
+    ready
+}
+
 /// Attempts to open a snapshot of the "ready" subdirectory of
 /// `parent`.
 ///
@@ -277,9 +385,7 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File
         fn verneuil__open_directory(path: *const c_char) -> i32;
     }
 
-    let mut ready = parent;
-    ready.push(READY);
-
+    let ready = mutable_ready_directory(parent);
     let ready_str = CString::new(ready.as_os_str().as_bytes())?;
     let fd = unsafe { verneuil__open_directory(ready_str.as_ptr()) };
     if fd < 0 {
@@ -299,23 +405,23 @@ pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
     std::fs::remove_dir(ready)
 }
 
-/// Returns a path for the metadata file in this "ready" directory.
-pub(crate) fn ready_metadata_file(ready: PathBuf) -> PathBuf {
-    let mut metadata = ready;
+/// Returns a path for the metadata file in this `parent` directory.
+pub(crate) fn directory_metadata_file(parent: PathBuf) -> PathBuf {
+    let mut metadata = parent;
     metadata.push(DOT_METADATA);
     metadata
 }
 
-/// Returns a path for the chunks subdirectory in this "ready" directory.
-pub(crate) fn ready_chunks(ready: PathBuf) -> PathBuf {
-    let mut chunks = ready;
+/// Returns a path for the chunks subdirectory in this `parent` directory.
+pub(crate) fn directory_chunks(parent: PathBuf) -> PathBuf {
+    let mut chunks = parent;
     chunks.push(CHUNKS);
     chunks
 }
 
-/// Returns a path for the meta subdirectory in this "ready" directory.
-pub(crate) fn ready_meta(ready: PathBuf) -> PathBuf {
-    let mut meta = ready;
+/// Returns a path for the meta subdirectory in this `parent` directory.
+pub(crate) fn directory_meta(parent: PathBuf) -> PathBuf {
+    let mut meta = parent;
     meta.push(META);
     meta
 }
@@ -544,7 +650,20 @@ impl ReplicationBuffer {
                     staging.push(name);
                     temp_path.push(name);
 
-                    std::fs::hard_link(&staging, &temp_path)?;
+                    // Attempt to hard-link the chunk.  It's ok if
+                    // this fails because the file does not exist
+                    // anymore: we expect copiers to come in and
+                    // opportunistically publish chunks.
+                    //
+                    // We could also get a `NotFound` error if some
+                    // path component is missing in `staging` or in
+                    // `temp_path`; if that happens, we will fail
+                    // downstream, when linking the meta files.
+                    match std::fs::hard_link(&staging, &temp_path) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        err => err?,
+                    }
                     count += 1;
 
                     temp_path.pop();
