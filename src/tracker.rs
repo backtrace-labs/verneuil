@@ -386,17 +386,24 @@ impl Tracker {
                 .prepare_ready_buffer(&chunks, &self.replication_targets)
                 .map_err(|_| "failed to prepare ready buffer")?;
 
-            // If we failed to publish the new ready directory,
-            // assume it *now* exists.
-            let _ = buf.publish_ready_buffer(ready);
+            let published = buf.publish_ready_buffer(ready).is_ok();
 
             validate_all_snapshots();
 
             // The buffer is newly ready and updated.  Tell the copier.
             buf.signal_copier(&self.copier);
 
-            // GC is opportunistic, failure is OK.
-            let _ = buf.gc_chunks(&chunks);
+            // GC is opportunistic, failure is OK.  It's important to
+            // the copier that we only remove chunks after attempting
+            // to publish the ready buffer.
+            if published {
+                // If we just published our snapshot to the ready
+                // buffer, we can delete all chunks.
+                let _ = buf.gc_chunks(&[]);
+            } else {
+                let _ = buf.gc_chunks(&chunks);
+            }
+
             // There is no further work to do while the sqlite read
             // lock is held; any temporary file or directory that's
             // still in flight either was left behind by a crashed
