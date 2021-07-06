@@ -151,6 +151,26 @@ impl Tracker {
         Ok((len, chunk_fprints))
     }
 
+    /// Fetches the contents of the chunk for `fprint`, or dies
+    /// trying.
+    #[cfg(feature = "verneuil_test_vfs")]
+    fn fetch_chunk_or_die(&self, fprint: &Fingerprint) -> Vec<u8> {
+        let contents = buf
+            .read_staged_chunk(&fprint)
+            .expect("staged chunk must exist");
+
+        // The contents of a content-addressed chunk must have the same
+        // fingerprint as the chunk's name.
+        assert_eq!(fprint, fingerprint_file_chunk(&contents));
+
+        // If the ready chunk exists, it must match the staged one.
+        if let Ok(ready) = buf.read_ready_chunk(&fprint) {
+            assert_eq!(contents, ready);
+        }
+
+        contents
+    }
+
     /// Attempts to assert that the snapshot's contents match that of
     /// our db file.
     #[cfg(feature = "verneuil_test_vfs")]
@@ -184,33 +204,12 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
-        // If the ready file still exists, it must match the staged
-        // one.  Otherwise, the directory must have been consumed by
-        // the copier.
-        if let Ok(ready) = buf.read_ready_directory(&self.path) {
-            assert_eq!(directory, ready.v1.expect("v1 component must be populated"));
-        } else {
-            assert!(!buf.ready_directory_present());
-        }
-
         for i in 0..directory.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
             };
 
-            let contents = buf.read_staged_chunk(&fprint)?;
-            // The contents of a content-addressed chunk must have the same
-            // fingerprint as the chunk's name.
-            assert_eq!(fprint, fingerprint_file_chunk(&contents));
-
-            // If the ready chunk still exists, it must match the
-            // staged one.
-            if let Ok(ready) = buf.read_ready_chunk(&fprint) {
-                assert_eq!(contents, ready);
-            } else {
-                assert!(!buf.ready_directory_present());
-            }
-
+            let contents = fetch_chunk_or_die(&fprint);
             if i + 1 < directory.chunks.len() / 2 {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
             }
