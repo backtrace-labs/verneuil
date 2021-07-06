@@ -23,6 +23,31 @@ struct verneuil_options {
          * `verneuil_options` always take priority over the JSON.
          *
          * In particular, `make_default` is a no-op in the JSON.
+         *
+         * Fields (see `struct Options` in lib.rs and `struct
+         * ReplicationTarget` in replication_target.rs for more
+         * details):
+         *
+         *  - make_default: ignored
+         *
+         *  - tempdir: optional, directory for temporary sqlite files.
+         *    (the files are never linked in the filesystem, but this
+         *    option directs what filesystem backs their storage).
+         *
+         *  - replication_staging_dir: optional, path prefix for
+         *    replication data.  Must be set to enable replication.
+         *
+         *  - replication_targets: array of sinks for replication
+         *    data.  Each entry should look like
+         *        {
+         *          "s3":
+         *          {
+         *            "region": "us-east-1",
+         *            "chunk_bucket": "verneuil_chunks",
+         *            "directory_buckets": "verneuil_directories",
+         *            "domain_addressing": false
+         *          }
+         *        }
          */
         const char *json_options;
 };
