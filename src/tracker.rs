@@ -346,7 +346,7 @@ impl Tracker {
             return Ok(());
         }
 
-        buf.ensure_staging_dir();
+        buf.ensure_staging_dir(&self.replication_targets, force);
 
         // Find the list of chunk fingerprints we care about, either
         // by parsing an up-to-date "staged" directory file, or

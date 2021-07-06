@@ -366,7 +366,7 @@ impl ReplicationBuffer {
     ///
     /// Fails silently: downstream code has to handle all sorts of
     /// concurrent failures anyway.
-    pub fn ensure_staging_dir(&self) {
+    pub fn ensure_staging_dir(&self, targets: &ReplicationTargetList, overwrite_meta: bool) {
         let mut buf = self.buffer_directory.clone();
         buf.push(STAGING);
 
@@ -375,6 +375,15 @@ impl ReplicationBuffer {
             buf.push(subdir);
             let _ = std::fs::create_dir_all(&buf);
             buf.pop();
+        }
+
+        // Make sure the metadata file exists.
+        buf.push(DOT_METADATA);
+        if overwrite_meta || !buf.exists() {
+            use std::io::Write;
+
+            let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
+            let _ = call_with_temp_file(&buf, |file| file.write_all(&json_bytes));
         }
     }
 
@@ -511,7 +520,7 @@ impl ReplicationBuffer {
         {
             use std::io::Write;
 
-            let json_bytes = serde_json::to_vec(&targets)?;
+            let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
 
             temp_path.push(DOT_METADATA);
             call_with_temp_file(&temp_path, |file| file.write_all(&json_bytes))?;
