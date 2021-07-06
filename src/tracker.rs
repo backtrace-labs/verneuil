@@ -317,12 +317,9 @@ impl Tracker {
                 .prepare_ready_buffer(&chunks, &self.replication_targets)
                 .map_err(|_| "failed to prepare ready buffer")?;
 
-            if let Some(failed_ready) = buf.publish_ready_buffer_fast(ready) {
-                if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
-                    buf.publish_ready_buffer_slow(failed_ready)
-                        .map_err(|_| "failed to update ready buffer")?;
-                }
-            }
+            // If we failed to publish the new ready directory,
+            // assume it *now* exists.
+            let _ = buf.publish_ready_buffer(ready);
 
             // The buffer is newly ready and updated.  Tell the copier.
             buf.signal_copier(&self.copier);

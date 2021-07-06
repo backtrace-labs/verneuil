@@ -571,39 +571,11 @@ impl ReplicationBuffer {
     /// or missing "ready" buffer.
     ///
     /// Returns `None` on success, the temporary buffer on failure.
-    pub fn publish_ready_buffer_fast(&self, ready: TempDir) -> Option<TempDir> {
+    pub fn publish_ready_buffer(&self, ready: TempDir) -> Result<()> {
         let mut target = self.buffer_directory.clone();
         target.push(READY);
 
-        match std::fs::rename(ready.path(), &target) {
-            Err(_) => Some(ready),
-            Ok(_) => None,
-        }
-    }
-
-    /// Attempts to publish a temporary buffer directory to a potentially
-    /// re-existing buffer.
-    pub fn publish_ready_buffer_slow(&self, ready: TempDir) -> Result<()> {
-        // See c/file_ops.h
-        extern "C" {
-            fn verneuil__exchange_paths(x: *const c_char, y: *const c_char) -> i32;
-        }
-
-        let mut target = self.buffer_directory.clone();
-        target.push(READY);
-
-        let ready_str = CString::new(ready.path().as_os_str().as_bytes())?;
-        let target_str = CString::new(target.as_os_str().as_bytes())?;
-        if unsafe { verneuil__exchange_paths(ready_str.as_ptr(), target_str.as_ptr()) } == 0 {
-            Ok(())
-        } else {
-            // In the common case, `exchange_paths` fails because
-            // `target` blinked out of existence.  In that case, `rename`
-            // can only fail if `target` now exists, which should only
-            // be possible if another thread or process has published
-            // its own ready buffer, for the current db state.
-            std::fs::rename(ready.path(), &target)
-        }
+        std::fs::rename(ready.path(), &target)
     }
 
     /// Attempts to signal this new `ready` subdirectory to the `copier`.
