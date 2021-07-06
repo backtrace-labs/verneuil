@@ -231,7 +231,20 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
 }
 
 fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
-    format!("{:016x}.{:016x}", fprint.hash[0], fprint.hash[1])
+    lazy_static::lazy_static! {
+        // We separate the primary and secondary hashes with a
+        // percent-encoded slash: we don't expect many collisions in
+        // the primary hash, but some platforms seem to shard based on
+        // everything left of the last slash.  Without that separator,
+        // our data might end up hashing to the same shard, despite
+        // the high amount of entropy spread everywhere.
+        static ref SEPARATOR: String = percent_encoding::utf8_percent_encode("/", percent_encoding::NON_ALPHANUMERIC).to_string();
+    }
+
+    format!(
+        "{:016x}{}{:016x}",
+        fprint.hash[0], &*SEPARATOR, fprint.hash[1]
+    )
 }
 
 /// Attempts to read a valid Directory message from `file_path`.
