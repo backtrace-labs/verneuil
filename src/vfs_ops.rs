@@ -124,7 +124,7 @@ extern "C" fn verneuil__file_write(
     // lock on the file.
 
     if let Some(tracker) = file.tracker() {
-        tracker.flag_write();
+        tracker.flag_write(offset as u64, n as u64);
     }
 
     unsafe { verneuil__file_write_impl(file, src, n, offset) }
@@ -136,7 +136,19 @@ extern "C" fn verneuil__file_truncate(file: &LinuxFile, size: i64) -> i32 {
     // sqlite tests likes to do fun stuff.
 
     if let Some(tracker) = file.tracker() {
-        tracker.flag_write();
+        let mut current_size = 0i64;
+        let ret = verneuil__file_size(file, &mut current_size);
+
+        if ret != 0 {
+            return ret;
+        }
+
+        // Mark the range between the old and new size as dirty.
+        let min = size.min(current_size);
+        let max = size.max(current_size);
+        if min >= 0 && max >= 0 {
+            tracker.flag_write(min as u64, (max - min) as u64);
+        }
     }
 
     unsafe { verneuil__file_truncate_impl(file, size) }
@@ -146,7 +158,7 @@ extern "C" fn verneuil__file_truncate(file: &LinuxFile, size: i64) -> i32 {
 extern "C" fn verneuil__file_sync(file: &mut LinuxFile, flags: i32) -> i32 {
     // If there's something to sync, there was a write.
     if let Some(tracker) = file.tracker() {
-        tracker.flag_write();
+        tracker.flag_write(0, 0);
     }
 
     unsafe { verneuil__file_sync_impl(file, flags) }

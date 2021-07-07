@@ -230,6 +230,24 @@ pub(crate) fn update_version_id(
     }
 }
 
+/// Erases the version id on `file`.  Change `Tracker`s will have to
+/// rebuild the replication state from scratch.
+pub(crate) fn clear_version_id(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    extern "C" {
+        fn verneuil__setxattr(fd: i32, name: *const i8, buf: *const u8, bufsz: usize) -> isize;
+    }
+
+    let ret = unsafe { verneuil__setxattr(file.as_raw_fd(), XATTR_NAME.as_ptr(), [].as_ptr(), 0) };
+
+    if ret >= 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Computes the fingerprint for a chunk of sqlite db file.
 pub(crate) fn fingerprint_file_chunk(bytes: &[u8]) -> Fingerprint {
     lazy_static::lazy_static! {

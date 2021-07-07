@@ -1,6 +1,7 @@
 //! A `Tracker` is responsible for determining the byte ranges that
 //! should be synchronised for a given file.
 
+use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::fs::File;
 use std::mem::ManuallyDrop;
@@ -11,6 +12,7 @@ use umash::Fingerprint;
 use uuid::Uuid;
 
 use crate::copier::Copier;
+use crate::directory_schema::clear_version_id;
 use crate::directory_schema::extract_version_id;
 use crate::directory_schema::fingerprint_file_chunk;
 use crate::directory_schema::fingerprint_sqlite_header;
@@ -45,6 +47,10 @@ pub(crate) struct Tracker {
     // We cache up to one v4 uuid, to speed up calls to
     // `update_version_id`.
     cached_uuid: Option<Uuid>,
+
+    // The base offset for all chunks that we know have been mutated
+    // since the last snapshot.
+    dirty_chunks: BTreeSet<u64>,
 
     // Do we think the backing (replication source) file is clean or
     // dirty, or do we just not know?
@@ -107,6 +113,7 @@ impl Tracker {
             copier,
             cached_uuid: Some(Uuid::new_v4()),
             replication_targets,
+            dirty_chunks: BTreeSet::new(),
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
         })
@@ -127,9 +134,10 @@ impl Tracker {
         self.previous_version_id = extract_version_id(&self.file, None, buf);
     }
 
-    /// Notes that we are about to update the tracked file.
+    /// Notes that we are about to update the tracked file, and
+    /// that bytes in [offset, offset + count) are about to change.
     #[inline]
-    pub fn flag_write(&mut self) {
+    pub fn flag_write(&mut self, offset: u64, count: u64) {
         // Attempt to update the version id xattr if this is the
         // first write since our last snapshot.
         if self.backing_file_state != MutationState::Dirty {
@@ -139,6 +147,15 @@ impl Tracker {
         }
 
         self.backing_file_state = MutationState::Dirty;
+
+        if count > 0 {
+            let min = offset / SNAPSHOT_GRANULARITY;
+            let max = offset.saturating_add(count - 1) / SNAPSHOT_GRANULARITY;
+
+            for chunk_index in min..=max {
+                self.dirty_chunks.insert(SNAPSHOT_GRANULARITY * chunk_index);
+            }
+        }
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
@@ -181,19 +198,14 @@ impl Tracker {
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
-    ///
-    /// If `after_write` is true, always go through the whole process,
-    /// without trying to fast-path over redundant work.  We know we
-    /// made some changes, so it makes sense to try and publish them.
-    ///
-    /// This is important because our "no op" detection can be lossy:
-    /// sqlite will sometimes update the data on disk in ways that are
-    /// semantically irrelevant, and not update the header.
-    fn snapshot_file_contents(
-        &self,
-        buf: &ReplicationBuffer,
-        after_write: bool,
-    ) -> Result<(), &'static str> {
+    fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
+        // If we're snapshotting after a write, we always want to go
+        // through the whole process.  We made some changes, let's
+        // guarantee we try and publish them.  That's important because,
+        // if xattrs are missing, we can sometimes observe an unchanged
+        // file header after physical writes to the db file that aren't
+        // yet relevant for readers (e.g., after a page cache flush).
+        let after_write = self.backing_file_state == MutationState::Dirty;
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
 
@@ -308,22 +320,33 @@ impl Tracker {
     ///
     /// Must be called with a read lock held on the underlying file.
     pub fn snapshot(&mut self) -> Result<(), &'static str> {
-        let old_state = self.backing_file_state;
-
-        self.backing_file_state = MutationState::Clean;
-        self.cached_uuid.get_or_insert_with(Uuid::new_v4);
-        self.previous_version_id.clear();
-        if let Some(buffer) = &self.buffer {
-            #[cfg(feature = "verneuil_test_validate_reads")]
-            self.validate_all_snapshots(&buffer);
-            // Nothing to do if we know we're clean.
-            if old_state != MutationState::Clean {
-                // And we're snapshotting after a write if the file was dirty.
-                return self.snapshot_file_contents(&buffer, old_state == MutationState::Dirty);
+        let ret = (|| {
+            if let Some(buffer) = &self.buffer {
+                #[cfg(feature = "verneuil_test_validate_reads")]
+                self.validate_all_snapshots(&buffer);
+                // Nothing to do if we know we're clean.
+                if self.backing_file_state != MutationState::Clean {
+                    return self.snapshot_file_contents(&buffer);
+                }
             }
+
+            Ok(())
+        })();
+
+        // Always reset our state after a snapshot attempt.
+        self.cached_uuid.get_or_insert_with(Uuid::new_v4);
+        self.backing_file_state = MutationState::Clean;
+        self.previous_version_id.clear();
+        self.dirty_chunks.clear();
+
+        // If this attempt failed, force the next one to recompute the
+        // state from scratch: we *know* the current replication data
+        // is currently out of sync.
+        if ret.is_err() {
+            let _ = clear_version_id(&self.file);
         }
 
-        Ok(())
+        ret
     }
 
     /// Performs test-only checks before a transaction's initial lock
