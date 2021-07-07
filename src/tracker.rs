@@ -154,140 +154,6 @@ impl Tracker {
         Ok((len, chunk_fprints))
     }
 
-    /// Fetches the contents of the chunk for `fprint`, or dies
-    /// trying.
-    #[cfg(feature = "verneuil_test_vfs")]
-    fn fetch_chunk_or_die(
-        &self,
-        buf: &ReplicationBuffer,
-        fprint: &Fingerprint,
-        from_staging: bool,
-    ) -> Vec<u8> {
-        let mut contents: Option<Vec<u8>> = None;
-
-        let mut update_contents = |new_contents: Vec<u8>| {
-            // If we already know the chunk's contents, the new ones must match.
-            if let Some(old) = &contents {
-                assert_eq!(old, &new_contents);
-                return;
-            }
-
-            // The contents of a content-addressed chunk must have the same
-            // fingerprint as the chunk's name.
-            assert_eq!(fprint, &fingerprint_file_chunk(&new_contents));
-            contents = Some(new_contents);
-        };
-
-        // Chunks move from staging to ready to replication targets.
-        // Reading in the same order guarantees we will not miss
-        // a chunk that was deleted after successful replication.
-        if from_staging {
-            if let Ok(staged) = buf.read_staged_chunk(&fprint) {
-                update_contents(staged);
-            }
-        }
-
-        // If the ready chunk exists, it must match the staged one.
-        if let Ok(ready) = buf.read_ready_chunk(&fprint) {
-            update_contents(ready);
-        }
-
-        for blob_value in crate::copier::fetch_chunk_from_targets(
-            &self.replication_targets.replication_targets,
-            &crate::replication_buffer::fingerprint_chunk_name(fprint),
-        ) {
-            if let Some(data) = blob_value.expect("target must be reachable") {
-                update_contents(data);
-            }
-        }
-
-        contents.expect("chunk data must exist")
-    }
-
-    /// If the snapshot directory exists, confirms that we can get
-    /// every chunk in that snapshot.
-    #[cfg(feature = "verneuil_test_vfs")]
-    fn validate_snapshot(
-        &self,
-        buf: &ReplicationBuffer,
-        directory_or: std::io::Result<Directory>,
-        from_staging: bool,
-    ) -> std::io::Result<()> {
-        let directory = match directory_or {
-            // If the directory file can't be found, assume it was
-            // replicated correctly, and checked earlier.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            result => result?,
-        };
-
-        let v1 = directory.v1.expect("v1 must exist");
-        for i in 0..v1.chunks.len() / 2 {
-            let fprint = Fingerprint {
-                hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
-            };
-
-            let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
-            if i + 1 < v1.chunks.len() / 2 {
-                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Attempts to assert that the snapshot's contents match that of
-    /// our db file, and that the ready snapshot is valid.
-    #[cfg(feature = "verneuil_test_vfs")]
-    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> std::io::Result<()> {
-        use blake2b_simd::Params;
-        use std::os::unix::io::AsRawFd;
-
-        self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
-            .expect("ready snapshot must be valid");
-
-        let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
-        let expected = match File::open(&self_path) {
-            // If we can't open the DB file, this isn't a
-            // replication problem.
-            Err(_) => return Ok(()),
-            Ok(mut file) => {
-                let mut hasher = Params::new().hash_length(32).to_state();
-                std::io::copy(&mut file, &mut hasher)?;
-                hasher.finalize()
-            }
-        };
-
-        let mut hasher = Params::new().hash_length(32).to_state();
-        let directory = buf
-            .read_staged_directory(&self.path)
-            .expect("directory must parse")
-            .v1
-            .expect("v1 component must be populated.");
-
-        // The header fingerprint must match the current header.
-        assert_eq!(
-            directory.header_fprint,
-            fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
-                .map(|fp| fp.into())
-        );
-
-        for i in 0..directory.chunks.len() / 2 {
-            let fprint = Fingerprint {
-                hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
-            };
-
-            let contents = self.fetch_chunk_or_die(buf, &fprint, true);
-            if i + 1 < directory.chunks.len() / 2 {
-                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
-            }
-
-            hasher.update(&contents);
-        }
-
-        assert_eq!(expected, hasher.finalize());
-        Ok(())
-    }
-
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -464,5 +330,139 @@ impl Tracker {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(feature = "verneuil_test_vfs")]
+impl Tracker {
+    /// Fetches the contents of the chunk for `fprint`, or dies
+    /// trying.
+    fn fetch_chunk_or_die(
+        &self,
+        buf: &ReplicationBuffer,
+        fprint: &Fingerprint,
+        from_staging: bool,
+    ) -> Vec<u8> {
+        let mut contents: Option<Vec<u8>> = None;
+
+        let mut update_contents = |new_contents: Vec<u8>| {
+            // If we already know the chunk's contents, the new ones must match.
+            if let Some(old) = &contents {
+                assert_eq!(old, &new_contents);
+                return;
+            }
+
+            // The contents of a content-addressed chunk must have the same
+            // fingerprint as the chunk's name.
+            assert_eq!(fprint, &fingerprint_file_chunk(&new_contents));
+            contents = Some(new_contents);
+        };
+
+        // Chunks move from staging to ready to replication targets.
+        // Reading in the same order guarantees we will not miss
+        // a chunk that was deleted after successful replication.
+        if from_staging {
+            if let Ok(staged) = buf.read_staged_chunk(&fprint) {
+                update_contents(staged);
+            }
+        }
+
+        // If the ready chunk exists, it must match the staged one.
+        if let Ok(ready) = buf.read_ready_chunk(&fprint) {
+            update_contents(ready);
+        }
+
+        for blob_value in crate::copier::fetch_chunk_from_targets(
+            &self.replication_targets.replication_targets,
+            &crate::replication_buffer::fingerprint_chunk_name(fprint),
+        ) {
+            if let Some(data) = blob_value.expect("target must be reachable") {
+                update_contents(data);
+            }
+        }
+
+        contents.expect("chunk data must exist")
+    }
+
+    /// If the snapshot directory exists, confirms that we can get
+    /// every chunk in that snapshot.
+    fn validate_snapshot(
+        &self,
+        buf: &ReplicationBuffer,
+        directory_or: std::io::Result<Directory>,
+        from_staging: bool,
+    ) -> std::io::Result<()> {
+        let directory = match directory_or {
+            // If the directory file can't be found, assume it was
+            // replicated correctly, and checked earlier.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            result => result?,
+        };
+
+        let v1 = directory.v1.expect("v1 must exist");
+        for i in 0..v1.chunks.len() / 2 {
+            let fprint = Fingerprint {
+                hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
+            };
+
+            let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
+            if i + 1 < v1.chunks.len() / 2 {
+                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Attempts to assert that the snapshot's contents match that of
+    /// our db file, and that the ready snapshot is valid.
+    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> std::io::Result<()> {
+        use blake2b_simd::Params;
+        use std::os::unix::io::AsRawFd;
+
+        self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
+            .expect("ready snapshot must be valid");
+
+        let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
+        let expected = match File::open(&self_path) {
+            // If we can't open the DB file, this isn't a
+            // replication problem.
+            Err(_) => return Ok(()),
+            Ok(mut file) => {
+                let mut hasher = Params::new().hash_length(32).to_state();
+                std::io::copy(&mut file, &mut hasher)?;
+                hasher.finalize()
+            }
+        };
+
+        let mut hasher = Params::new().hash_length(32).to_state();
+        let directory = buf
+            .read_staged_directory(&self.path)
+            .expect("directory must parse")
+            .v1
+            .expect("v1 component must be populated.");
+
+        // The header fingerprint must match the current header.
+        assert_eq!(
+            directory.header_fprint,
+            fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
+                .map(|fp| fp.into())
+        );
+
+        for i in 0..directory.chunks.len() / 2 {
+            let fprint = Fingerprint {
+                hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
+            };
+
+            let contents = self.fetch_chunk_or_die(buf, &fprint, true);
+            if i + 1 < directory.chunks.len() / 2 {
+                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
+            }
+
+            hasher.update(&contents);
+        }
+
+        assert_eq!(expected, hasher.finalize());
+        Ok(())
     }
 }
