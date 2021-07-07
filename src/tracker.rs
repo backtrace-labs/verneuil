@@ -400,17 +400,20 @@ impl Tracker {
         };
 
         let v1 = directory.v1.expect("v1 must exist");
+        let mut len = 0;
         for i in 0..v1.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
             };
 
             let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
+            len += contents.len() as u64;
             if i + 1 < v1.chunks.len() / 2 {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
             }
         }
 
+        assert_eq!(len, v1.len);
         Ok(())
     }
 
@@ -449,6 +452,7 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
+        let mut len = 0;
         for i in 0..directory.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
@@ -459,9 +463,11 @@ impl Tracker {
                 assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
             }
 
+            len += contents.len() as u64;
             hasher.update(&contents);
         }
 
+        assert_eq!(directory.len, len);
         assert_eq!(expected, hasher.finalize());
         Ok(())
     }
