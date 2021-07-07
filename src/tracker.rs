@@ -333,6 +333,38 @@ impl Tracker {
     }
 }
 
+/// Returns a zero-filled chunk of `SNAPSHOT_GRANULARITY` bytes.
+#[cfg(feature = "verneuil_test_vfs")]
+fn zero_filled_chunk() -> &'static [u8] {
+    lazy_static::lazy_static! {
+        static ref BUF: Vec<u8> = {
+            let mut buf = Vec::new();
+
+            buf.resize(SNAPSHOT_GRANULARITY as usize, 0u8);
+            buf
+        };
+    }
+
+    &BUF
+}
+
+/// Returns the fingerprint for a zero-filled chunk of `SNAPSHOT_GRANULARITY` bytes.
+#[cfg(feature = "verneuil_test_vfs")]
+fn fingerprint_for_zero_filled_chunk() -> Fingerprint {
+    lazy_static::lazy_static! {
+        static ref FPRINT: Fingerprint = fingerprint_file_chunk(zero_filled_chunk());
+    }
+
+    // This should not change.
+    assert_eq!(
+        *FPRINT,
+        Fingerprint {
+            hash: [8155395758008617606, 2728302605148947890]
+        }
+    );
+    *FPRINT
+}
+
 #[cfg(feature = "verneuil_test_vfs")]
 impl Tracker {
     /// Fetches the contents of the chunk for `fprint`, or dies
@@ -399,12 +431,20 @@ impl Tracker {
             result => result?,
         };
 
+        let zero_fprint = fingerprint_for_zero_filled_chunk();
         let v1 = directory.v1.expect("v1 must exist");
         let mut len = 0;
         for i in 0..v1.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
             };
+
+            // Don't bother fetching the zero-filled chunk: we know
+            // what it is.
+            if fprint == zero_fprint {
+                len += zero_filled_chunk().len() as u64;
+                continue;
+            }
 
             let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
             len += contents.len() as u64;
@@ -452,11 +492,21 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
+        let zero_fprint = fingerprint_for_zero_filled_chunk();
         let mut len = 0;
         for i in 0..directory.chunks.len() / 2 {
             let fprint = Fingerprint {
                 hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
             };
+
+            // Fast-path the zero-filled chunk: some tests create multi-GB
+            // sparse DB file.
+            if fprint == zero_fprint {
+                let chunk = zero_filled_chunk();
+                len += chunk.len() as u64;
+                hasher.update(chunk);
+                continue;
+            }
 
             let contents = self.fetch_chunk_or_die(buf, &fprint, true);
             if i + 1 < directory.chunks.len() / 2 {
