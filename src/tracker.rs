@@ -7,8 +7,6 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use umash::Fingerprint;
 
 use crate::copier::Copier;
@@ -23,6 +21,13 @@ use crate::replication_target::ReplicationTargetList;
 /// We snapshot db files in 64KB content-addressed chunks.
 const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationState {
+    Clean,   // No mutation since the last snapshot
+    Unknown, // Unknown (we just opened the file)
+    Dirty,   // Some mutation since the last snapshot.
+}
+
 #[derive(Debug)]
 pub(crate) struct Tracker {
     // The C-side actually owns the file descriptor, but we can share
@@ -34,14 +39,9 @@ pub(crate) struct Tracker {
     copier: Copier,
     replication_targets: ReplicationTargetList,
 
-    // Set to true whenever the tracked sqlite file is written to.
-    //
-    // When that happens, the Tracker will force a snapshot as soon as
-    // possible.
-    //
-    // This field is also initialised to true in order to force a
-    // snapshot immediately after opening the database file.
-    mutated_since_last_snapshot: AtomicBool,
+    // Do we think the backing (replication source) file is clean or
+    // dirty, or do we just not know?
+    backing_file_state: MutationState,
 }
 
 fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
@@ -107,15 +107,14 @@ impl Tracker {
             buffer,
             copier,
             replication_targets,
-            mutated_since_last_snapshot: AtomicBool::new(true),
+            backing_file_state: MutationState::Unknown,
         })
     }
 
-    /// Make a note that the tracked file has acquired a write lock.
+    /// Notes that we are about to update the tracked file.
     #[inline]
-    pub fn flag_write(&self) {
-        self.mutated_since_last_snapshot
-            .store(true, Ordering::Relaxed);
+    pub fn flag_write(&mut self) {
+        self.backing_file_state = MutationState::Dirty;
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
@@ -310,11 +309,10 @@ impl Tracker {
     /// it exists.
     ///
     /// Must be called with a read lock held on the underlying file.
-    pub fn snapshot(&self) -> Result<(), &'static str> {
-        let force = self
-            .mutated_since_last_snapshot
-            .swap(false, Ordering::Relaxed);
+    pub fn snapshot(&mut self) -> Result<(), &'static str> {
+        let force = self.backing_file_state != MutationState::Clean;
 
+        self.backing_file_state = MutationState::Clean;
         if let Some(buffer) = &self.buffer {
             #[cfg(feature = "verneuil_test_validate_reads")]
             self.validate_all_snapshots(&buffer);
