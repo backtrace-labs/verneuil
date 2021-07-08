@@ -44,13 +44,13 @@ mkdir -p minio
 rm -rf minio
 mkdir -p minio
 
-docker run -p 7777:7777 \
+docker run --net=host \
   --user $(id -u):$(id -g) \
   --name verneuil_test_minio \
   -v $CURRENT/minio:/data \
   -e "MINIO_ROOT_USER=VERNEUIL_TEST_ACCOUNT" \
   -e "MINIO_ROOT_PASSWORD=VERNEUIL_TEST_KEY" \
-  minio/minio server --address :7777  /data &
+  minio/minio server --address 127.0.0.1:7777  /data &
 
 sleep 5;
 
