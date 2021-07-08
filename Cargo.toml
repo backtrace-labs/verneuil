@@ -14,6 +14,10 @@ crate-type = ["lib", "staticlib", "cdylib"]
 default = ["verneuil_vendor_sqlite"]
 verneuil_vendor_sqlite = []
 verneuil_test_vfs = ["blake2b_simd"]  # Build an archive for sqlite3 tests.
+verneuil_test_minio = []  # Publish data to 127.0.0.1:7777
+verneuil_test_validate_writes = ["verneuil_test_vfs"]  # Validate snapshots after writes
+verneuil_test_validate_reads = ["verneuil_test_vfs"]  # Validate snapshots after reads as well (extra slow)
+verneuil_test_validate_all = ["verneuil_test_validate_writes", "verneuil_test_validate_reads"]
 
 [dependencies]
 # We use blake2b to compare the actual db file and our replicated snapshot,

@@ -9,8 +9,24 @@ CURRENT="$PWD"
 
 HERE=$(dirname $(readlink -f "$0"))
 
+# Default test features: validate after read and write transactions,
+# and publish data to a local minio server.  That gives us a lot of
+# coverage, but can be slow.
+FEATURES="verneuil_test_validate_all,verneuil_test_minio"
+
+# Other options:
+#
+# Maximise test speed, no assertion.  Useful for mptest.
+# FEATURES="verneuil_test_vfs"
+#
+# Restore some assertions.  Useful for soaktest.
+# FEATURES="verneuil_test_validate_writes,verneuil_test_minio"
+#
+# Make sure that we behave usefully without replication targets.
+# FEATURES="verneuil_test_validate_all"
+
 (cd "$HERE/..";
- cargo build  --release --target-dir "$CURRENT" --no-default-features --features 'verneuil_test_vfs')
+ cargo build  --release --target-dir "$CURRENT" --no-default-features --features "$FEATURES")
 
 # We want sqlite to call our test-only registration function, which
 # will mark the verneuil VFS as the one, and pretend it's the Unix

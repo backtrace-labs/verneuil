@@ -198,14 +198,14 @@ impl Tracker {
         // When testing the replication VFS, check that the snapshot are valid
         // when they exist, without comparing with the current DB file.  We
         // do that in a separate call to `self.compare_snapshot`.
-        #[cfg(feature = "verneuil_test_vfs")]
+        #[cfg(feature = "verneuil_test_validate_reads")]
         let validate_all_snapshots = || {
             self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
                 .expect("ready snapshot must be valid");
             self.validate_snapshot(buf, buf.read_staged_directory(&self.path), true)
                 .expect("staged snapshot must be valid");
         };
-        #[cfg(not(feature = "verneuil_test_vfs"))]
+        #[cfg(not(feature = "verneuil_test_validate_reads"))]
         let validate_all_snapshots = || {};
 
         // If the ready directory is already up to date, there's
@@ -309,7 +309,7 @@ impl Tracker {
         // bitwise identical to the DB state when we know we just
         // reconstructed a fresh snapshot.
         if updated {
-            #[cfg(feature = "verneuil_test_vfs")]
+            #[cfg(feature = "verneuil_test_validate_writes")]
             self.compare_snapshot(&buf).expect("snapshots must match");
         }
 

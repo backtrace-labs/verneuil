@@ -166,14 +166,17 @@ pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -
         make_default: true,
         tempdir: None,
         replication_staging_dir: Some("/tmp".into()),
-        replication_targets: vec![ReplicationTarget::S3(S3ReplicationTarget {
-            region: "minio".into(),
-            endpoint: Some("http://127.0.0.1:7777".into()),
-            chunk_bucket: "chunks".into(),
-            directory_bucket: "directories".into(),
-            domain_addressing: false,
-            create_buckets_on_demand: true,
-        })],
+        replication_targets: vec![
+            #[cfg(feature = "verneuil_test_minio")]
+            ReplicationTarget::S3(S3ReplicationTarget {
+                region: "minio".into(),
+                endpoint: Some("http://127.0.0.1:7777".into()),
+                chunk_bucket: "chunks".into(),
+                directory_bucket: "directories".into(),
+                domain_addressing: false,
+                create_buckets_on_demand: true,
+            }),
+        ],
     }) {
         return code;
     }
