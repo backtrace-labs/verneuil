@@ -8,11 +8,14 @@ use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use umash::Fingerprint;
+use uuid::Uuid;
 
 use crate::copier::Copier;
+use crate::directory_schema::extract_version_id;
 use crate::directory_schema::fingerprint_file_chunk;
 use crate::directory_schema::fingerprint_sqlite_header;
 use crate::directory_schema::fingerprint_v1_chunk_list;
+use crate::directory_schema::update_version_id;
 use crate::directory_schema::Directory;
 use crate::directory_schema::DirectoryV1;
 use crate::replication_buffer::ReplicationBuffer;
@@ -38,6 +41,10 @@ pub(crate) struct Tracker {
     buffer: Option<ReplicationBuffer>,
     copier: Copier,
     replication_targets: ReplicationTargetList,
+
+    // We cache up to one v4 uuid, to speed up calls to
+    // `update_version_id`.
+    cached_uuid: Option<Uuid>,
 
     // Do we think the backing (replication source) file is clean or
     // dirty, or do we just not know?
@@ -94,6 +101,7 @@ impl Tracker {
             path,
             buffer,
             copier,
+            cached_uuid: Some(Uuid::new_v4()),
             replication_targets,
             backing_file_state: MutationState::Unknown,
         })
@@ -102,6 +110,14 @@ impl Tracker {
     /// Notes that we are about to update the tracked file.
     #[inline]
     pub fn flag_write(&mut self) {
+        // Attempt to update the version id xattr if this is the
+        // first write since our last snapshot.
+        if self.backing_file_state != MutationState::Dirty {
+            // Any error isn't fatal: we can still use the header
+            // fingerprint.
+            let _ = update_version_id(&self.file, self.cached_uuid.take());
+        }
+
         self.backing_file_state = MutationState::Dirty;
     }
 
@@ -159,15 +175,18 @@ impl Tracker {
         after_write: bool,
     ) -> Result<(), &'static str> {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
+        let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
 
         // If we're doing this opportunistically (not after a write)
         // and the staging directory seems up to date, there's nothing
         // to do.  We don't even have to update "ready": the `Copier`
         // reads from quiescent staging directories.
-        if !after_write {
+        //
+        // We special-case empty version ids: they never match
+        // anything, much like NaNs.
+        if !after_write && !version_id.is_empty() {
             if let Ok(directory) = buf.read_staged_directory(&self.path) {
-                if matches!(directory.v1, Some(v1) if v1.header_fprint == Some(header_fprint.into()))
-                {
+                if matches!(directory.v1, Some(v1) if v1.version_id == version_id) {
                     return Ok(());
                 }
             }
@@ -190,6 +209,7 @@ impl Tracker {
             let directory = Directory {
                 v1: Some(DirectoryV1 {
                     header_fprint: Some(header_fprint.into()),
+                    version_id,
                     contents_fprint: Some(directory_fprint.into()),
                     chunks: flattened,
                     len,
@@ -271,6 +291,7 @@ impl Tracker {
         let old_state = self.backing_file_state;
 
         self.backing_file_state = MutationState::Clean;
+        self.cached_uuid.get_or_insert_with(Uuid::new_v4);
         if let Some(buffer) = &self.buffer {
             #[cfg(feature = "verneuil_test_validate_reads")]
             self.validate_all_snapshots(&buffer);

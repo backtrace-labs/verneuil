@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #ifndef RENAME_EXCHANGE
@@ -73,4 +73,40 @@ verneuil__open_directory(const char *path)
         } while (r < 0 && errno == EINTR);
 
         return r;
+}
+
+ssize_t
+verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz)
+{
+        ssize_t ret;
+
+        do {
+                ret = fgetxattr(fd, name, buf, bufsz);
+        } while (ret < 0 && errno == EINTR);
+
+        if (ret >= 0)
+                return ret;
+
+        if (errno == ENOTSUP)
+                return -1;
+
+        return 0;
+}
+
+int
+verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz)
+{
+        ssize_t ret;
+
+        do {
+                ret = fsetxattr(fd, name, buf, bufsz, /*flags=*/0);
+        } while (ret < 0 && errno == EINTR);
+
+        if (ret == 0)
+                return 0;
+
+        if (errno == ENOTSUP)
+                return 1;
+
+        return -1;
 }

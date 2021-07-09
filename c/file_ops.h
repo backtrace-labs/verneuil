@@ -1,8 +1,9 @@
 #pragma once
+#include <sys/types.h>
 
 /**
- * replication_buffer.rs calls into these functions for low-level file
- * operations.
+ * replication_buffer.rs and directory_schema.rs call into these
+ * functions for low-level file operations.
  */
 
 /**
@@ -24,3 +25,20 @@ int verneuil__exchange_paths(const char *x, const char *y);
  * Opens a directory as O_PATH.
  */
 int verneuil__open_directory(const char *);
+
+/**
+ * Attempts to get xattr `name` from `fd`.
+ *
+ * Returns the xattr size on success, and -1 on error.
+ *
+ * This function only errors out if the filesystem does not support
+ * xattrs; everything else is mapped to an empty value.
+ */
+ssize_t verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz);
+
+/**
+ * Attempts to set xattr `name` on `fd` to `buf[0..bufsz - 1]`.
+ *
+ * Returns 0 on success, 1 if ENOTSUP, and -1 on all other errors.
+ */
+int verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz);

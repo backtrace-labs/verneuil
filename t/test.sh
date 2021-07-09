@@ -19,8 +19,14 @@ FEATURES="verneuil_test_validate_all,verneuil_test_minio"
 # Maximise test speed, no assertion.  Useful for mptest.
 # FEATURES="verneuil_test_vfs"
 #
+# Slightly lower test speed, some assertions.  Also useful for mptest.
+# FEATURES="verneuil_test_validate_writes"
+#
 # Restore some assertions.  Useful for soaktest.
 # FEATURES="verneuil_test_validate_writes,verneuil_test_minio"
+#
+# Run full assertions, without xattr support.
+# FEATURES="verneuil_test_validate_all,verneuil_test_minio,verneuil_compat_no_xattr"
 #
 # Make sure that we behave usefully without replication targets.
 # FEATURES="verneuil_test_validate_all"
