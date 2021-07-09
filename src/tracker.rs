@@ -71,6 +71,22 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
     ret
 }
 
+fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
+    if (flattened.len() % 2) != 0 {
+        return None;
+    }
+
+    let mut ret = Vec::with_capacity(flattened.len() / 2);
+
+    for i in 0..flattened.len() / 2 {
+        ret.push(Fingerprint {
+            hash: [flattened[2 * i], flattened[2 * i + 1]],
+        });
+    }
+
+    Some(ret)
+}
+
 impl Tracker {
     pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker, &'static str> {
         use std::os::unix::io::FromRawFd;
@@ -159,11 +175,13 @@ impl Tracker {
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
-    /// the list of chunk fingerprints.
+    /// the file's size as well, a list of chunk fingerprints, and the
+    /// number of chunks that were actually snapshotted.
     fn snapshot_chunks(
         &self,
         repl: &ReplicationBuffer,
-    ) -> std::io::Result<(u64, Vec<Fingerprint>)> {
+        base: Option<Vec<Fingerprint>>,
+    ) -> std::io::Result<(u64, Vec<Fingerprint>, usize)> {
         let len = self.file.metadata()?.len();
         let num_chunks = len / SNAPSHOT_GRANULARITY
             + (if (len % SNAPSHOT_GRANULARITY) > 0 {
@@ -171,27 +189,84 @@ impl Tracker {
             } else {
                 0
             });
-        let mut chunk_fprints = Vec::with_capacity(num_chunks as usize);
+        // Always copy everything in [backfill_begin, num_chunks),
+        // in addition to any known dirty chunk.
+        let backfill_begin: u64;
 
-        for i in 0..num_chunks {
-            let begin = i * SNAPSHOT_GRANULARITY;
+        // Setup the initial chunk fingerprint vector.
+        let mut chunk_fprints = if let Some(fprints) = base {
+            // If we're doing incremental snapshotting and the file
+            // has grown, make sure to also diff what used to be the
+            // last chunk: it can grow implicitly after a write.
+            //
+            // The same thing could also happen if we wrote to an
+            // offset >= the last chunk's first byte.
+            //
+            // When we observe either situation, we ignore the last
+            // chunk in `fprints`.
+            let grown = (fprints.len() as u64) < num_chunks;
+            let wrote_past_end = self
+                .dirty_chunks
+                .range(fprints.len() as u64 * SNAPSHOT_GRANULARITY..=u64::MAX)
+                .next()
+                .is_some();
+            let delta = (grown || wrote_past_end) as u64;
+
+            // We definitely don't know anything about what's at or
+            // after chunk index `fprints.len()`.  We also don't
+            // want to go out of bounds if the new file shrunk.
+            backfill_begin = (fprints.len() as u64)
+                .clamp(0, num_chunks)
+                .saturating_sub(delta);
+            fprints
+        } else {
+            backfill_begin = 0;
+            Vec::with_capacity(num_chunks as usize)
+        };
+
+        // And make sure list's size matches the file's.
+        chunk_fprints.resize(num_chunks as usize, Fingerprint { hash: [0, 0] });
+
+        // Box this allocation to avoid a 64KB stack allocation.
+        let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);
+
+        let mut num_snapshotted: usize = 0;
+        let update = &mut |chunk_index| -> std::io::Result<()> {
+            num_snapshotted += 1;
+
+            let begin = chunk_index * SNAPSHOT_GRANULARITY;
             let end = if (len - begin) > SNAPSHOT_GRANULARITY {
                 begin + SNAPSHOT_GRANULARITY
             } else {
                 len
             };
 
-            let mut buf = [0u8; SNAPSHOT_GRANULARITY as usize];
             let slice = &mut buf[0..(end - begin) as usize];
             self.file.read_exact_at(slice, begin)?;
 
             let fprint = fingerprint_file_chunk(slice);
 
             repl.stage_chunk(fprint, slice)?;
-            chunk_fprints.push(fprint);
+            chunk_fprints[chunk_index as usize] = fprint;
+            Ok(())
+        };
+
+        for base in &self.dirty_chunks {
+            let chunk_index = base / SNAPSHOT_GRANULARITY;
+
+            // Everything greater than or equal to `backfill_begin`
+            // will be handled by the loop below.  This avoids
+            // snapshotting chunks twice after growing a db file.
+            if chunk_index < backfill_begin {
+                update(chunk_index)?;
+            }
         }
 
-        Ok((len, chunk_fprints))
+        for chunk_index in backfill_begin..num_chunks {
+            update(chunk_index)?;
+        }
+
+        Ok((len, chunk_fprints, num_snapshotted))
     }
 
     /// Snapshots the contents of the tracked file to its replication
@@ -199,29 +274,84 @@ impl Tracker {
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
+        let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
+        let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
+
+        let mut current_directory: Option<Directory> = buf.read_staged_directory(&self.path).ok();
+
         // If we're snapshotting after a write, we always want to go
         // through the whole process.  We made some changes, let's
         // guarantee we try and publish them.  That's important because,
         // if xattrs are missing, we can sometimes observe an unchanged
         // file header after physical writes to the db file that aren't
         // yet relevant for readers (e.g., after a page cache flush).
-        let after_write = self.backing_file_state == MutationState::Dirty;
-        let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
-        let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
-
-        // If we're doing this opportunistically (not after a write)
-        // and the staging directory seems up to date, there's nothing
-        // to do.  We don't even have to update "ready": the `Copier`
-        // reads from quiescent staging directories.
         //
-        // We special-case empty version ids: they never match
-        // anything, much like NaNs.
-        if !after_write && !version_id.is_empty() {
-            if let Ok(directory) = buf.read_staged_directory(&self.path) {
-                if matches!(directory.v1, Some(v1) if v1.version_id == version_id) {
-                    return Ok(());
+        // We must also figure out whether we trust `current_directory`
+        // enough to build our snapshot as a diff on top of that file.
+        if self.backing_file_state == MutationState::Dirty {
+            let mut up_to_date = false;
+
+            if let Some(directory) = &current_directory {
+                if let Some(v1) = &directory.v1 {
+                    // The current snapshot seems to have everything
+                    // up to our last write transaction.  We can use that!
+                    //
+                    // Remember to special-case empty version strings: they
+                    // never match anything, much like NaNs.
+                    if !self.previous_version_id.is_empty()
+                        && v1.version_id == self.previous_version_id
+                    {
+                        up_to_date = true;
+                    }
+
+                    // The current snapshot seems to also include
+                    // write transaction.  Use it as a base, but
+                    // don't bail out, just in case this is a
+                    // spurious match.
+                    if !version_id.is_empty() && v1.version_id == version_id {
+                        up_to_date = true;
+                    }
                 }
             }
+
+            // If the version ids are empty, something's wrong with
+            // xattrs.  If we know we wrote something, but the
+            // versions match, our id system must be wrong (probably
+            // because xattrs don't work).  Finally, if we know
+            // we wrote something but our list of dirty chunks is
+            // empty, we probably missed an update.
+            //
+            // In all cases, we want to force a full snapshot.
+            if self.previous_version_id.is_empty()
+                || version_id.is_empty()
+                || self.previous_version_id == version_id
+                || self.dirty_chunks.is_empty()
+            {
+                // TODO: log here.
+                up_to_date = false;
+            }
+
+            // If the directory isn't up to date, we can't use it.
+            if !up_to_date {
+                current_directory = None;
+            }
+        } else {
+            // If we're doing this opportunistically (not after a write)
+            // and the staging directory seems up to date, there's nothing
+            // to do.  We don't even have to update "ready": the `Copier`
+            // will read from the staging directory when we don't change it.
+            if !version_id.is_empty() {
+                if let Some(directory) = &current_directory {
+                    if matches!(&directory.v1, Some(v1) if v1.version_id == version_id) {
+                        return Ok(());
+                    }
+                }
+            }
+
+            // If we think there's work to do after a read
+            // transaction, assume the worst, and rebuild
+            // the snapshot from scratch.
+            current_directory = None;
         }
 
         // We don't *have* to overwrite the .metadata file, but we
@@ -231,9 +361,18 @@ impl Tracker {
 
         // Publish an updated snapshot, and remember the chunks we
         // care about.
+
+        // Try to get an initial list of chunks to work off.
+        let mut base_fprints = None;
+        if let Some(directory) = current_directory {
+            if let Some(v1) = directory.v1 {
+                base_fprints = rebuild_chunk_fprints(&v1.chunks);
+            }
+        }
+
         let (copied, chunks) = {
-            let (len, chunks) = self
-                .snapshot_chunks(&buf)
+            let (len, chunks, copied) = self
+                .snapshot_chunks(&buf, base_fprints)
                 .map_err(|_| "failed to snapshot chunks")?;
 
             let flattened = flatten_chunk_fprints(&chunks);
@@ -251,7 +390,7 @@ impl Tracker {
             buf.publish_directory(&self.path, &directory)
                 .map_err(|_| "failed to publish directory file")?;
 
-            (chunks.len(), chunks)
+            (copied, chunks)
         };
 
         let mut published = false;
