@@ -280,24 +280,12 @@ fn fetch_chunk_from_one_target(target: &ReplicationTarget, name: &str) -> Result
 /// the corresponding files and directory as we go.  Once *everything*
 /// has been copied, the directory will be empty, which will
 /// make it possible to rename fresh replication data over it.
-fn handle_ready_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
+fn handle_ready_directory(
+    targets: &ReplicationTargetList,
+    creds: Credentials,
+    parent: PathBuf,
+) -> Result<()> {
     let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
-
-    let metadata = replication_buffer::directory_metadata_file(ready.clone());
-
-    // Try to read the metadata JSON, which tells us where to
-    // replicate the chunks and meta files.  If we can't do
-    // that, leave this precious data where it is...
-    //
-    // In particular, if the metadata file is missing, whoever removed
-    // it should have made sure the chunks and meta were already
-    // copied, and the corresponding directories thus empty and deleted.
-    //
-    // If that's not the case, fail by staying stuck: we don't provide
-    // any liveness guarantee on replication, so that's not incorrect.
-    // Even when replication is stuck, the buffering system bounds the
-    // amount of replication data we keep around.
-    let targets: ReplicationTargetList = serde_json::from_slice(&std::fs::read(&metadata)?)?;
 
     {
         let chunks_buckets = targets
@@ -328,11 +316,6 @@ fn handle_ready_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
             ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
         )?;
     }
-
-    // Try to get rid of the metadata file.  If this fails, there's
-    // nothing to do: the ready directory is now empty, or
-    // it's wedged in a bad state.
-    let _ = std::fs::remove_file(&metadata);
 
     // And now try to get rid of the hopefully empty directory.
     let _ = replication_buffer::remove_ready_directory_if_empty(parent);
@@ -373,15 +356,14 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
 ///
 /// This function can only make progress if the caller first
 /// calls `handle_ready_directory`.
-fn handle_staging_directory(creds: Credentials, parent: PathBuf) -> Result<()> {
+fn handle_staging_directory(
+    targets: &ReplicationTargetList,
+    creds: Credentials,
+    parent: PathBuf,
+) -> Result<()> {
     let staging = replication_buffer::mutable_staging_directory(parent.clone());
     let chunks_directory = replication_buffer::directory_chunks(staging.clone());
-    let meta_directory = replication_buffer::directory_meta(staging.clone());
-
-    let targets: ReplicationTargetList = {
-        let metadata = replication_buffer::directory_metadata_file(staging);
-        serde_json::from_slice(&std::fs::read(&metadata)?)?
-    };
+    let meta_directory = replication_buffer::directory_meta(staging);
 
     // It's always safe to publish chunks: they don't have any
     // dependency.
@@ -476,31 +458,45 @@ fn handle_requests(receiver: crossbeam_channel::Receiver<PathBuf>) {
     // This only fails when the channel is closed.
     while let Ok(path) = receiver.recv() {
         if let Ok(creds) = Credentials::default() {
-            // Failures are expected when concurrent processes or copiers
-            // work on the same `path`.  Even when `handle_directory`
-            // fails, we're either making progress, or `path` is in a bad
-            // state and we choose to keep it untouched rather than drop
-            // data that we have failed to copy to the replication targets.
-            let _ = handle_ready_directory(creds.clone(), path.clone());
+            // Try to read the metadata JSON, which tells us where to
+            // replicate the chunks and meta files.  If we can't do
+            // that, leave this precious data where it is...  We don't
+            // provide any hard liveness guarantee on replication, so
+            // that's not incorrect.  Even when replication is stuck,
+            // the buffering system bounds the amount of replication
+            // data we keep around.
+            let targets_or: Result<ReplicationTargetList> = (|| {
+                let metadata = replication_buffer::buffer_metadata_file(path.clone());
+                Ok(serde_json::from_slice(&std::fs::read(&metadata)?)?)
+            })();
 
-            // Opportunistically try to copy from the "staging"
-            // directory.  That's never staler than "ready", so we do
-            // not go backward in our replication.
-            let _ = handle_staging_directory(creds.clone(), path.clone());
+            if let Ok(targets) = targets_or {
+                // Failures are expected when concurrent processes or copiers
+                // work on the same `path`.  Even when `handle_directory`
+                // fails, we're either making progress, or `path` is in a bad
+                // state and we choose to keep it untouched rather than drop
+                // data that we have failed to copy to the replication targets.
+                let _ = handle_ready_directory(&targets, creds.clone(), path.clone());
 
-            // And now see if the ready directory was updated again.
-            // We only upload meta files (directory protos) if we
-            // observed that the "ready" directory was empty while the
-            // meta files had the same value as when we entered
-            // "handle_staging_directory".  Anything we now find in
-            // the "ready" directory must be at least as recent as
-            // what we found in staging, so, again, replication
-            // cannot go backwards.
-            let _ = handle_ready_directory(creds, path);
+                // Opportunistically try to copy from the "staging"
+                // directory.  That's never staler than "ready", so we do
+                // not go backward in our replication.
+                let _ = handle_staging_directory(&targets, creds.clone(), path.clone());
 
-            // When we get here, the remote data should be at least as
-            // fresh as the last staged snapshot when we entered the
-            // loop body.
+                // And now see if the ready directory was updated again.
+                // We only upload meta files (directory protos) if we
+                // observed that the "ready" directory was empty while the
+                // meta files had the same value as when we entered
+                // "handle_staging_directory".  Anything we now find in
+                // the "ready" directory must be at least as recent as
+                // what we found in staging, so, again, replication
+                // cannot go backwards.
+                let _ = handle_ready_directory(&targets, creds, path);
+
+                // When we get here, the remote data should be at least as
+                // fresh as the last staged snapshot when we entered the
+                // loop body.
+            }
         }
     }
 }

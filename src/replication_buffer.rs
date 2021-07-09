@@ -150,7 +150,10 @@ const STAGING: &str = "staging";
 /// logic clears the directory once everything has been copied.
 const READY: &str = "ready";
 
+/// The ".metadata" file, at the toplevel of the buffer directory,
+/// tells copier where to copy ready and staged data.
 const DOT_METADATA: &str = ".metadata";
+
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
 const SCRATCH: &str = "scratch";
@@ -405,9 +408,9 @@ pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
     std::fs::remove_dir(ready)
 }
 
-/// Returns a path for the metadata file in this `parent` directory.
-pub(crate) fn directory_metadata_file(parent: PathBuf) -> PathBuf {
-    let mut metadata = parent;
+/// Returns a path for the metadata file in this buffer directory.
+pub(crate) fn buffer_metadata_file(buffer: PathBuf) -> PathBuf {
+    let mut metadata = buffer;
     metadata.push(DOT_METADATA);
     metadata
 }
@@ -473,7 +476,8 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to create a staging directory for the replication
-    /// buffer.
+    /// buffer.  For the staging directory to be useful, the metadata
+    /// file must exist.  Create it.
     ///
     /// Fails silently: downstream code has to handle all sorts of
     /// concurrent failures anyway.
@@ -488,6 +492,7 @@ impl ReplicationBuffer {
             buf.pop();
         }
 
+        buf.pop();
         // Make sure the metadata file exists.
         buf.push(DOT_METADATA);
         if overwrite_meta || !buf.exists() {
@@ -604,11 +609,7 @@ impl ReplicationBuffer {
     ///
     /// On success, returns the number of chunk files copied, and
     /// the temporary directory.
-    pub fn prepare_ready_buffer(
-        &self,
-        chunks: &[Fingerprint],
-        targets: &ReplicationTargetList,
-    ) -> Result<(usize, TempDir)> {
+    pub fn prepare_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<(usize, TempDir)> {
         use tempfile::Builder;
 
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
@@ -626,17 +627,6 @@ impl ReplicationBuffer {
             .tempdir_in(&target)?;
 
         let mut temp_path = temp.path().to_owned();
-
-        // Publish the replication targets to `.metadata`.
-        {
-            use std::io::Write;
-
-            let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
-
-            temp_path.push(DOT_METADATA);
-            call_with_temp_file(&temp_path, |file| file.write_all(&json_bytes))?;
-            temp_path.pop();
-        }
 
         // hardlink relevant chunk files to `temp_path/chunks`.
         staging.push(CHUNKS);

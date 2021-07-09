@@ -252,7 +252,7 @@ impl Tracker {
         // If the ready directory still isn't up to date, make it so.
         if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
             let (copied, ready) = buf
-                .prepare_ready_buffer(&chunks, &self.replication_targets)
+                .prepare_ready_buffer(&chunks)
                 .map_err(|_| "failed to prepare ready buffer")?;
 
             let published = buf.publish_ready_buffer(ready).is_ok();
