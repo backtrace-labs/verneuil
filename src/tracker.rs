@@ -195,23 +195,9 @@ impl Tracker {
             None
         };
 
-        // When testing the replication VFS, check that the snapshot are valid
-        // when they exist, without comparing with the current DB file.  We
-        // do that in a separate call to `self.compare_snapshot`.
-        #[cfg(feature = "verneuil_test_validate_reads")]
-        let validate_all_snapshots = || {
-            self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
-                .expect("ready snapshot must be valid");
-            self.validate_snapshot(buf, buf.read_staged_directory(&self.path), true)
-                .expect("staged snapshot must be valid");
-        };
-        #[cfg(not(feature = "verneuil_test_validate_reads"))]
-        let validate_all_snapshots = || {};
-
         // If the ready directory is already up to date, there's
         // nothing to do.
         if up_to_date(buf.read_ready_directory(&self.path)).is_some() {
-            validate_all_snapshots();
             return Ok(());
         }
 
@@ -260,7 +246,8 @@ impl Tracker {
 
             let published = buf.publish_ready_buffer(ready).is_ok();
 
-            validate_all_snapshots();
+            #[cfg(feature = "verneuil_test_validate_reads")]
+            self.validate_all_snapshots(buf);
 
             // The buffer is newly ready and updated.  Tell the copier.
             buf.signal_copier(&self.copier);
@@ -329,9 +316,21 @@ impl Tracker {
             .swap(false, Ordering::Relaxed);
 
         if let Some(buffer) = &self.buffer {
+            #[cfg(feature = "verneuil_test_validate_reads")]
+            self.validate_all_snapshots(&buffer);
             self.snapshot_file_contents(&buffer, force)
         } else {
             Ok(())
+        }
+    }
+
+    /// Performs test-only checks before a transaction's initial lock
+    /// acquisition.
+    #[inline]
+    pub fn pre_lock_checks(&self) {
+        #[cfg(feature = "verneuil_test_validate_reads")]
+        if let Some(buffer) = &self.buffer {
+            self.validate_all_snapshots(&buffer);
         }
     }
 }
@@ -458,6 +457,16 @@ impl Tracker {
 
         assert_eq!(len, v1.len);
         Ok(())
+    }
+
+    /// Assert that the contents of ready and staged snapshots make
+    /// sense (if they exist).
+    #[cfg(feature = "verneuil_test_validate_reads")]
+    fn validate_all_snapshots(&self, buf: &ReplicationBuffer) {
+        self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
+            .expect("ready snapshot must be valid");
+        self.validate_snapshot(buf, buf.read_staged_directory(&self.path), true)
+            .expect("staged snapshot must be valid");
     }
 
     /// Attempts to assert that the snapshot's contents match that of

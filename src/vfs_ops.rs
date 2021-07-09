@@ -163,6 +163,14 @@ extern "C" fn verneuil__file_lock(file: &mut LinuxFile, level: LockLevel) -> i32
         return 0;
     }
 
+    // We're upgrading from no lock to some lock.  Kick off the
+    // pre-lock checks.
+    if file.lock_level == LockLevel::None {
+        if let Some(tracker) = file.tracker() {
+            tracker.pre_lock_checks();
+        }
+    }
+
     unsafe { verneuil__file_lock_impl(file, level) }
 }
 
