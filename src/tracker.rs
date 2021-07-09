@@ -90,16 +90,16 @@ impl Tracker {
 
         let buffer = ReplicationBuffer::new(&path, &file)
             .map_err(|_| "failed to create replication buffer")?;
-
+        let replication_targets = crate::replication_target::get_default_replication_targets();
         let copier = Copier::get_global_copier();
 
         // Let the copier pick up any ready snapshot left behind, e.g,
         // by an older crashed process.
         if let Some(buf) = &buffer {
+            // But first, make sure to overwrite the replication config with our own.
+            buf.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
             buf.signal_copier(&copier);
         }
-
-        let replication_targets = crate::replication_target::get_default_replication_targets();
 
         Ok(Tracker {
             file,
@@ -215,7 +215,10 @@ impl Tracker {
             return Ok(());
         }
 
-        buf.ensure_staging_dir(&self.replication_targets, force);
+        // We don't *have* to overwrite the .metadata file, but we
+        // should create it if it's missing: without that file, the
+        // copier can't make progress.
+        buf.ensure_staging_dir(&self.replication_targets, /*overwrite_meta=*/ false);
 
         // Find the list of chunk fingerprints we care about, either
         // by parsing an up-to-date "staged" directory file, or
