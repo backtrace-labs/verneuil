@@ -295,6 +295,12 @@ fn handle_ready_directory(
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
 
+        // If we don't have replication target, best to leave the data
+        // where it is.
+        if chunks_buckets.is_empty() {
+            return Ok(());
+        }
+
         consume_directory(
             replication_buffer::directory_chunks(ready.clone()),
             |name, file| copy_file(name, file, &chunks_buckets),
@@ -309,6 +315,10 @@ fn handle_ready_directory(
             .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
+
+        if meta_buckets.is_empty() {
+            return Ok(());
+        }
 
         consume_directory(
             replication_buffer::directory_meta(ready),
@@ -375,6 +385,12 @@ fn handle_staging_directory(
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
 
+        // If we don't have replication target, best to leave the data
+        // where it is.
+        if chunks_buckets.is_empty() {
+            return Ok(());
+        }
+
         let mut published = 0;
 
         consume_directory(
@@ -433,6 +449,10 @@ fn handle_staging_directory(
             .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
             .flatten() // TODO: how do we want to handle failures here?
             .collect::<Vec<_>>();
+
+        if meta_buckets.is_empty() {
+            return Ok(());
+        }
 
         consume_directory(
             meta_directory,
