@@ -54,18 +54,6 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
     ret
 }
 
-fn rebuild_chunk_fprints(flattened: &[u64]) -> Vec<Fingerprint> {
-    let mut ret = Vec::with_capacity(flattened.len() / 2);
-
-    for i in 0..flattened.len() / 2 {
-        ret.push(Fingerprint {
-            hash: [flattened[2 * i], flattened[2 * i + 1]],
-        });
-    }
-
-    ret
-}
-
 impl Tracker {
     pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker, &'static str> {
         use std::os::unix::io::FromRawFd;
@@ -158,46 +146,31 @@ impl Tracker {
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     ///
-    /// If `force` is true, always go through the whole process,
-    /// without trying to fast-path over redundant work.  This is
-    /// useful after writes: sqlite will sometimes update the data on
-    /// disk in ways that are semantically irrelevant after a rolled
-    /// back write.  When that happens, the header isn't changed, but
-    /// bits on disks differ, and we care about the latter.
+    /// If `after_write` is true, always go through the whole process,
+    /// without trying to fast-path over redundant work.  We know we
+    /// made some changes, so it makes sense to try and publish them.
+    ///
+    /// This is important because our "no op" detection can be lossy:
+    /// sqlite will sometimes update the data on disk in ways that are
+    /// semantically irrelevant, and not update the header.
     fn snapshot_file_contents(
         &self,
         buf: &ReplicationBuffer,
-        force: bool,
+        after_write: bool,
     ) -> Result<(), &'static str> {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
 
-        // Returns the argument's DirectoryV1 if the contents of that
-        // directory proto most likely match that of our sqlite db
-        // file.
-        //
-        // Returns None on mismatch or if the argument is Err: callers
-        // only want to skip work if data is definitely up to date, but
-        // it's never wrong to perform redundant work.
-        let up_to_date = |proto_or: std::io::Result<Directory>| {
-            if force {
-                return None;
-            }
-
-            if let Ok(directory) = proto_or {
-                if let Some(v1) = directory.v1 {
-                    if v1.header_fprint == Some(header_fprint.into()) {
-                        return Some(v1);
-                    }
+        // If we're doing this opportunistically (not after a write)
+        // and the staging directory seems up to date, there's nothing
+        // to do.  We don't even have to update "ready": the `Copier`
+        // reads from quiescent staging directories.
+        if !after_write {
+            if let Ok(directory) = buf.read_staged_directory(&self.path) {
+                if matches!(directory.v1, Some(v1) if v1.header_fprint == Some(header_fprint.into()))
+                {
+                    return Ok(());
                 }
             }
-
-            None
-        };
-
-        // If the ready directory is already up to date, there's
-        // nothing to do.
-        if up_to_date(buf.read_ready_directory(&self.path)).is_some() {
-            return Ok(());
         }
 
         // We don't *have* to overwrite the .metadata file, but we
@@ -205,103 +178,88 @@ impl Tracker {
         // copier can't make progress.
         buf.ensure_staging_dir(&self.replication_targets, /*overwrite_meta=*/ false);
 
-        // Find the list of chunk fingerprints we care about, either
-        // by parsing an up-to-date "staged" directory file, or
-        // creating one.
-        //
-        // The variable `updated` is set to true whenever we
-        // reconstructed a new snapshot, instead of reading it
-        // from the staged file.
-        let (chunks, updated) =
-            if let Some(directory) = up_to_date(buf.read_staged_directory(&self.path)) {
-                (rebuild_chunk_fprints(&directory.chunks), false)
-            } else {
-                let (len, chunks) = self
-                    .snapshot_chunks(&buf)
-                    .map_err(|_| "failed to snapshot chunks")?;
+        // Publish an updated snapshot, and remember the chunks we
+        // care about.
+        let (copied, chunks) = {
+            let (len, chunks) = self
+                .snapshot_chunks(&buf)
+                .map_err(|_| "failed to snapshot chunks")?;
 
-                let flattened = flatten_chunk_fprints(&chunks);
-                let directory_fprint = fingerprint_v1_chunk_list(&flattened);
-                let directory = Directory {
-                    v1: Some(DirectoryV1 {
-                        header_fprint: Some(header_fprint.into()),
-                        contents_fprint: Some(directory_fprint.into()),
-                        chunks: flattened,
-                        len,
-                    }),
-                };
-
-                buf.publish_directory(&self.path, &directory)
-                    .map_err(|_| "failed to publish directory file")?;
-
-                (chunks, true)
+            let flattened = flatten_chunk_fprints(&chunks);
+            let directory_fprint = fingerprint_v1_chunk_list(&flattened);
+            let directory = Directory {
+                v1: Some(DirectoryV1 {
+                    header_fprint: Some(header_fprint.into()),
+                    contents_fprint: Some(directory_fprint.into()),
+                    chunks: flattened,
+                    len,
+                }),
             };
 
-        // If the ready directory still isn't up to date, make it so.
-        if up_to_date(buf.read_ready_directory(&self.path)).is_none() {
-            let (copied, ready) = buf
+            buf.publish_directory(&self.path, &directory)
+                .map_err(|_| "failed to publish directory file")?;
+
+            (chunks.len(), chunks)
+        };
+
+        let mut published = false;
+        // If we can publish a new ready directory, try to do so.
+        if matches!(buf.read_ready_directory(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            let ready = buf
                 .prepare_ready_buffer(&chunks)
                 .map_err(|_| "failed to prepare ready buffer")?;
 
-            let published = buf.publish_ready_buffer(ready).is_ok();
+            published = buf.publish_ready_buffer(ready).is_ok();
+        }
 
-            #[cfg(feature = "verneuil_test_validate_reads")]
-            self.validate_all_snapshots(buf);
+        #[cfg(feature = "verneuil_test_validate_reads")]
+        self.validate_all_snapshots(buf);
 
-            // The buffer is newly ready and updated.  Tell the copier.
-            buf.signal_copier(&self.copier);
+        // We did something.  Tell the copier.
+        buf.signal_copier(&self.copier);
 
-            // GC is opportunistic, failure is OK.  It's important to
-            // the copier that we only remove chunks after attempting
-            // to publish the ready buffer.
-            if published {
-                // If we just published our snapshot to the ready
-                // buffer, we can delete all chunks.
-                let _ = buf.gc_chunks(&[]);
-            } else {
-                use rand::Rng;
+        // GC is opportunistic, failure is OK.  It's important to
+        // the copier that we only remove chunks after attempting
+        // to publish the ready buffer.
+        if published {
+            // If we just published our snapshot to the ready
+            // buffer, we can delete all chunks.
+            let _ = buf.gc_chunks(&[]);
+        } else {
+            use rand::Rng;
 
-                let mut rng = rand::thread_rng();
+            let mut rng = rand::thread_rng();
 
-                // If the ready buffer is stale, we can only remove
-                // now-useless chunks, with probability slightly
-                // greater than copied / chunks.len(): a GC wastes
-                // time linear in `chunks.len()` (the time it takes to
-                // scan chunks we don't want to delete), so we
-                // amortise that with randomised counting.
-                //
-                // We trigger a gc with low probability even when
-                // `copied == 0` to help eventually clear up unused
-                // chunks.  The probability is low enough that we can
-                // amortise the wasted work as constant overhead for
-                // each call to `snapshot_file_contents`.
-                if copied >= rng.gen_range(0..=chunks.len()) {
-                    let _ = buf.gc_chunks(&chunks);
-                }
-            }
-
-            // There is no further work to do while the sqlite read
-            // lock is held; any temporary file or directory that's
-            // still in flight either was left behind by a crashed
-            // process, or belongs to a thread that will soon discover
-            // it has no work to do.
+            // If the ready buffer is stale, we can only remove
+            // now-useless chunks, with probability slightly
+            // greater than copied / chunks.len(): a GC wastes
+            // time linear in `chunks.len()` (the time it takes to
+            // scan chunks we don't want to delete), so we
+            // amortise that with randomised counting.
             //
-            // Either way, we can delete everything; clean up is
-            // also opportunistic, so failure is OK.
-            let _ = buf.cleanup_scratch_directory();
+            // We trigger a gc with low probability even when
+            // `copied == 0` to help eventually clear up unused
+            // chunks.  The probability is low enough that we can
+            // amortise the wasted work as constant overhead for
+            // each call to `snapshot_file_contents`.
+            if copied >= rng.gen_range(0..=chunks.len()) {
+                let _ = buf.gc_chunks(&chunks);
+            }
         }
 
-        // It's possible for readers to observe a database file where
-        // some of the contents have changed, but not the header (not
-        // yet).  For example, this happens in sqlite's `cacheflush`
-        // tests.  That's why we can only expect the snapshot to be
-        // bitwise identical to the DB state when we know we just
-        // reconstructed a fresh snapshot.
-        if updated {
-            #[cfg(feature = "verneuil_test_validate_writes")]
-            self.compare_snapshot(&buf).expect("snapshots must match");
-        }
+        // There is no further work to do while the sqlite read
+        // lock is held; any temporary file or directory that's
+        // still in flight either was left behind by a crashed
+        // process, or belongs to a thread that will soon discover
+        // it has no work to do.
+        //
+        // Either way, we can delete everything; clean up is
+        // also opportunistic, so failure is OK.
+        let _ = buf.cleanup_scratch_directory();
 
+        #[cfg(feature = "verneuil_test_validate_writes")]
+        self.compare_snapshot(&buf).expect("snapshots must match");
         Ok(())
     }
 
@@ -310,16 +268,20 @@ impl Tracker {
     ///
     /// Must be called with a read lock held on the underlying file.
     pub fn snapshot(&mut self) -> Result<(), &'static str> {
-        let force = self.backing_file_state != MutationState::Clean;
+        let old_state = self.backing_file_state;
 
         self.backing_file_state = MutationState::Clean;
         if let Some(buffer) = &self.buffer {
             #[cfg(feature = "verneuil_test_validate_reads")]
             self.validate_all_snapshots(&buffer);
-            self.snapshot_file_contents(&buffer, force)
-        } else {
-            Ok(())
+            // Nothing to do if we know we're clean.
+            if old_state != MutationState::Clean {
+                // And we're snapshotting after a write if the file was dirty.
+                return self.snapshot_file_contents(&buffer, old_state == MutationState::Dirty);
+            }
         }
+
+        Ok(())
     }
 
     /// Performs test-only checks before a transaction's initial lock
