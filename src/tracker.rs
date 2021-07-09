@@ -49,6 +49,10 @@ pub(crate) struct Tracker {
     // Do we think the backing (replication source) file is clean or
     // dirty, or do we just not know?
     backing_file_state: MutationState,
+
+    // The version id we observed at the beginning of the write
+    // transaction, if any.
+    previous_version_id: Vec<u8>,
 }
 
 fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
@@ -104,7 +108,23 @@ impl Tracker {
             cached_uuid: Some(Uuid::new_v4()),
             replication_targets,
             backing_file_state: MutationState::Unknown,
+            previous_version_id: Vec::new(),
         })
+    }
+
+    /// Remembers the file's state.  This function is called
+    /// immediately after acquiring an exclusive lock on the tracked
+    /// file, and lets us remember the file's version before we change
+    /// it.
+    pub fn note_exclusive_lock(&mut self) {
+        if !self.previous_version_id.is_empty() {
+            return;
+        }
+
+        // Read into `self.previous_version_id` in place.
+        let mut buf = Vec::new();
+        std::mem::swap(&mut buf, &mut self.previous_version_id);
+        self.previous_version_id = extract_version_id(&self.file, None, buf);
     }
 
     /// Notes that we are about to update the tracked file.
@@ -292,6 +312,7 @@ impl Tracker {
 
         self.backing_file_state = MutationState::Clean;
         self.cached_uuid.get_or_insert_with(Uuid::new_v4);
+        self.previous_version_id.clear();
         if let Some(buffer) = &self.buffer {
             #[cfg(feature = "verneuil_test_validate_reads")]
             self.validate_all_snapshots(&buffer);

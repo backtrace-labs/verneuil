@@ -171,7 +171,14 @@ extern "C" fn verneuil__file_lock(file: &mut LinuxFile, level: LockLevel) -> i32
         }
     }
 
-    unsafe { verneuil__file_lock_impl(file, level) }
+    let ret = unsafe { verneuil__file_lock_impl(file, level) };
+    if file.lock_level == LockLevel::Exclusive {
+        if let Some(tracker) = file.tracker() {
+            tracker.note_exclusive_lock();
+        }
+    }
+
+    ret
 }
 
 #[no_mangle]

@@ -146,16 +146,16 @@ pub(crate) fn extract_version_id(
     buf.resize(ret.max(0) as usize, 0u8);
 
     if fprint_or.is_none() {
-	fprint_or = fingerprint_sqlite_header(file);
+        fprint_or = fingerprint_sqlite_header(file);
 
-	// If we don't have an xattr and we also don't have a header
-	// fprint, we don't want to *only* rely on ctime: it's too
-	// lossy.  Instead return an empty version id, which will
-	// be treated as different from every version id, including
-	// other empty ones.
-	if buf.is_empty() && fprint_or.is_none() {
-	    return buf;
-	}
+        // If we don't have an xattr and we also don't have a header
+        // fprint, we don't want to *only* rely on ctime: it's too
+        // lossy.  Instead return an empty version id, which will
+        // be treated as different from every version id, including
+        // other empty ones.
+        if buf.is_empty() && fprint_or.is_none() {
+            return buf;
+        }
     }
 
     // Add a high resolution ctime if we can find it.  Unfortunately,
