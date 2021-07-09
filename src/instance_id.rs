@@ -76,6 +76,19 @@ pub(crate) fn hostname() -> &'static str {
     &*NAME
 }
 
+/// Returns a high-entropy short string hash of the hostname.
+pub(crate) fn hostname_hash() -> &'static str {
+    lazy_static::lazy_static! {
+        static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil hostname params");
+        static ref HASH: String = {
+            let hash = umash::full_str(&PARAMS, 0, 0, hostname());
+            format!("{:04x}", hash % (1 << (4 * 4)))
+        };
+    }
+
+    &HASH
+}
+
 /// Returns the verneuil instance id for this incarnation of the
 /// current machine: the first component is the boot timestamp, to
 /// help operations, and the second is the boot UUID, which is
@@ -108,5 +121,5 @@ fn print_instance_id() {
 #[test]
 fn print_hostname() {
     assert_ne!(hostname(), DEFAULT_HOSTNAME);
-    println!("hostname = '{}'", hostname());
+    println!("hostname = '{}', hash = '{}'", hostname(), hostname_hash());
 }

@@ -215,7 +215,12 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
         .to_str()
         .ok_or_else(|| Error::new(ErrorKind::Other, "unable to convert path to string"))?;
 
-    let name = format!("verneuil:{}/{}", instance_id::hostname(), string);
+    let name = format!(
+        "{}-verneuil:{}/{}",
+        instance_id::hostname_hash(),
+        instance_id::hostname(),
+        string
+    );
     Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
 }
 
