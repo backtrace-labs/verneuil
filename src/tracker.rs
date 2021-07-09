@@ -180,8 +180,11 @@ impl Tracker {
     fn snapshot_chunks(
         &self,
         repl: &ReplicationBuffer,
-        base: Option<Vec<Fingerprint>>,
+        mut base: Option<Vec<Fingerprint>>,
     ) -> std::io::Result<(u64, Vec<Fingerprint>, usize)> {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
         let len = self.file.metadata()?.len();
         let num_chunks = len / SNAPSHOT_GRANULARITY
             + (if (len % SNAPSHOT_GRANULARITY) > 0 {
@@ -191,7 +194,23 @@ impl Tracker {
             });
         // Always copy everything in [backfill_begin, num_chunks),
         // in addition to any known dirty chunk.
-        let backfill_begin: u64;
+        let mut backfill_begin: u64;
+
+        // We expect to copy ~2 chunks per offset in
+        // `self.dirty_chunks`.  Pseudorandomly compute a full
+        // snapshot with probability `self.dirty_chunks.len() /
+        // num_chunks`; that still averages to a constant number of
+        // copies per dirty chunks.
+        //
+        // Computing a full snapshot from time to time helps us
+        // recover from silent desynchronisation.  That's good for
+        // robustness in production, but we should disable that in
+        // tests to catch logic bugs.
+        if cfg!(not(feature = "verneuil_test_vfs"))
+            && (self.dirty_chunks.len() as u64) >= rng.gen_range(0..=num_chunks / 2)
+        {
+            base = None;
+        }
 
         // Setup the initial chunk fingerprint vector.
         let mut chunk_fprints = if let Some(fprints) = base {
@@ -231,7 +250,7 @@ impl Tracker {
         let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);
 
         let mut num_snapshotted: usize = 0;
-        let update = &mut |chunk_index| -> std::io::Result<()> {
+        let update = &mut |chunk_index| -> std::io::Result<bool> {
             num_snapshotted += 1;
 
             let begin = chunk_index * SNAPSHOT_GRANULARITY;
@@ -247,8 +266,10 @@ impl Tracker {
             let fprint = fingerprint_file_chunk(slice);
 
             repl.stage_chunk(fprint, slice)?;
+            let ret = fprint != chunk_fprints[chunk_index as usize];
+
             chunk_fprints[chunk_index as usize] = fprint;
-            Ok(())
+            Ok(ret)
         };
 
         for base in &self.dirty_chunks {
@@ -257,8 +278,34 @@ impl Tracker {
             // Everything greater than or equal to `backfill_begin`
             // will be handled by the loop below.  This avoids
             // snapshotting chunks twice after growing a db file.
-            if chunk_index < backfill_begin {
-                update(chunk_index)?;
+            if chunk_index >= backfill_begin {
+                // Dirty chunks is a sorted map.  We're not going
+                // to do anything with the remaining entries.
+                break;
+            }
+
+            update(chunk_index)?;
+
+            // Now do the same for a random chunk index, as a
+            // background scan for any desynchronisation we might
+            // have missed.
+            //
+            // This is optional, so don't do it in tests: we don't
+            // want to randomly paper over test failures.
+            let random_index = rng.gen_range(0..backfill_begin);
+            if cfg!(not(feature = "verneuil_test_vfs"))
+                && !self
+                    .dirty_chunks
+                    .contains(&(random_index * SNAPSHOT_GRANULARITY))
+            {
+                // We don't *have* to get these additional chunks, so
+                // we don't want to bubble up errors.
+                //
+                // However, if we successfully find out that the new
+                // chunk is actually dirty, force a full scan.
+                if let Ok(true) = update(random_index) {
+                    backfill_begin = 0;
+                }
             }
         }
 
