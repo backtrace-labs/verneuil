@@ -618,34 +618,49 @@ impl CopierBackend {
             })();
 
             if let Ok(targets) = targets_or {
-                // Failures are expected when concurrent processes or copiers
-                // work on the same `path`.  Even when `handle_directory`
-                // fails, we're either making progress, or `path` is in a bad
-                // state and we choose to keep it untouched rather than drop
-                // data that we have failed to copy to the replication targets.
-                let _ = self.handle_ready_directory(&targets, creds.clone(), spool.clone());
+                let ready = replication_buffer::mutable_ready_directory(spool.clone());
+                if matches!(directory_is_empty_or_absent(&ready), Ok(true)) {
+                    // It's not an error if this fails: we expect
+                    // failures when `ready` becomes non-empty, and
+                    // we never lose data.
+                    let _ = std::fs::remove_dir(&ready);
+                } else {
+                    // Failures are expected when concurrent processes
+                    // or copiers work on the same `path`.  Even when
+                    // `handle_directory` fails, we're either making
+                    // progress, or `path` is in a bad state and we
+                    // choose to keep it untouched rather than drop
+                    // data that we have failed to copy to the
+                    // replication targets.
+                    let _ = self.handle_ready_directory(&targets, creds.clone(), spool.clone());
 
-                // See if we have enough quota left to do extra work.
-                if self.governor.check().is_ok() {
-                    // Opportunistically try to copy from the "staging"
-                    // directory.  That's never staler than "ready", so we do
-                    // not go backward in our replication.
-                    let _ = self.handle_staging_directory(&targets, creds.clone(), spool.clone());
-
-                    // And now see if the ready directory was updated again.
-                    // We only upload meta files (directory protos) if we
-                    // observed that the "ready" directory was empty while the
-                    // meta files had the same value as when we entered
-                    // "handle_staging_directory".  Anything we now find in
-                    // the "ready" directory must be at least as recent as
-                    // what we found in staging, so, again, replication
-                    // cannot go backwards.
-                    let _ = self.handle_ready_directory(&targets, creds, spool);
-
-                    // When we get here, the remote data should be at least as
-                    // fresh as the last staged snapshot when we entered the
-                    // loop body.
+                    // We've done some work here (handled a non-empty
+                    // "ready" directory).  If the governor isn't
+                    // immediately ready for us, bail and let another
+                    // directory make progress.
+                    if self.governor.check().is_err() {
+                        return;
+                    }
                 }
+
+                // Opportunistically try to copy from the "staging"
+                // directory.  That's never staler than "ready", so we do
+                // not go backward in our replication.
+                let _ = self.handle_staging_directory(&targets, creds.clone(), spool.clone());
+
+                // And now see if the ready directory was updated again.
+                // We only upload meta files (directory protos) if we
+                // observed that the "ready" directory was empty while the
+                // meta files had the same value as when we entered
+                // "handle_staging_directory".  Anything we now find in
+                // the "ready" directory must be at least as recent as
+                // what we found in staging, so, again, replication
+                // cannot go backwards.
+                let _ = self.handle_ready_directory(&targets, creds, spool);
+
+                // When we get here, the remote data should be at least as
+                // fresh as the last staged snapshot when we entered the
+                // loop body.
             }
         }
     }
