@@ -1,7 +1,7 @@
 //! A `Tracker` is responsible for determining the byte ranges that
 //! should be synchronised for a given file.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs::File;
 use std::mem::ManuallyDrop;
@@ -48,9 +48,14 @@ pub(crate) struct Tracker {
     // `update_version_id`.
     cached_uuid: Option<Uuid>,
 
-    // The base offset for all chunks that we know have been mutated
-    // since the last snapshot.
-    dirty_chunks: BTreeSet<u64>,
+    // Set of "base" (SNAPSHOT_GRANULARITY-aligned) offsets for all
+    // chunks that that we know have been mutated since the last
+    // snapshot.
+    //
+    // If we have already staged a file for that chunk, the value is
+    // that chunk's fingerprint.  If `None`, we have yet to stage a
+    // file for that dirty chunk.
+    dirty_chunks: BTreeMap<u64, Option<Fingerprint>>,
 
     // Do we think the backing (replication source) file is clean or
     // dirty, or do we just not know?
@@ -129,7 +134,7 @@ impl Tracker {
             copier,
             cached_uuid: Some(Uuid::new_v4()),
             replication_targets,
-            dirty_chunks: BTreeSet::new(),
+            dirty_chunks: BTreeMap::new(),
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
         })
@@ -169,7 +174,8 @@ impl Tracker {
             let max = offset.saturating_add(count - 1) / SNAPSHOT_GRANULARITY;
 
             for chunk_index in min..=max {
-                self.dirty_chunks.insert(SNAPSHOT_GRANULARITY * chunk_index);
+                self.dirty_chunks
+                    .insert(SNAPSHOT_GRANULARITY * chunk_index, None);
             }
         }
     }
@@ -250,8 +256,23 @@ impl Tracker {
         let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);
 
         let mut num_snapshotted: usize = 0;
-        let update = &mut |chunk_index| -> std::io::Result<bool> {
+
+        // Updates the snapshot to take into account the data in chunk
+        // `chunk_index`.
+        //
+        // Returns true if the new chunk fprint differs from the old one.
+        let update = &mut |chunk_index, expected_fprint| -> std::io::Result<bool> {
             num_snapshotted += 1;
+
+            // Fast-path in non-test mode.  In test mode, we always
+            // go through every step to confirm that the expected
+            // fingerprint matches the actual chunk fingerprint.
+            #[cfg(not(feature = "verneuil_test_validate_writes"))]
+            if let Some(fprint) = expected_fprint {
+                let ret = fprint != chunk_fprints[chunk_index as usize];
+                chunk_fprints[chunk_index as usize] = fprint;
+                return Ok(ret);
+            }
 
             let begin = chunk_index * SNAPSHOT_GRANULARITY;
             let end = if (len - begin) > SNAPSHOT_GRANULARITY {
@@ -265,17 +286,22 @@ impl Tracker {
 
             let fprint = fingerprint_file_chunk(slice);
 
+            #[cfg(feature = "verneuil_test_validate_writes")]
+            if let Some(expected) = expected_fprint {
+                assert_eq!(fprint, expected);
+            }
+
             match repl.stage_chunk(fprint, slice) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 x => x,
             }?;
-            let ret = fprint != chunk_fprints[chunk_index as usize];
 
+            let ret = fprint != chunk_fprints[chunk_index as usize];
             chunk_fprints[chunk_index as usize] = fprint;
             Ok(ret)
         };
 
-        for base in &self.dirty_chunks {
+        for (base, expected_fprint) in &self.dirty_chunks {
             let chunk_index = base / SNAPSHOT_GRANULARITY;
 
             // Everything greater than or equal to `backfill_begin`
@@ -287,7 +313,7 @@ impl Tracker {
                 break;
             }
 
-            update(chunk_index)?;
+            update(chunk_index, *expected_fprint)?;
 
             // Now do the same for a random chunk index, as a
             // background scan for any desynchronisation we might
@@ -299,21 +325,21 @@ impl Tracker {
             if cfg!(not(feature = "verneuil_test_vfs"))
                 && !self
                     .dirty_chunks
-                    .contains(&(random_index * SNAPSHOT_GRANULARITY))
+                    .contains_key(&(random_index * SNAPSHOT_GRANULARITY))
             {
                 // We don't *have* to get these additional chunks, so
                 // we don't want to bubble up errors.
                 //
                 // However, if we successfully find out that the new
                 // chunk is actually dirty, force a full scan.
-                if let Ok(true) = update(random_index) {
+                if let Ok(true) = update(random_index, None) {
                     backfill_begin = 0;
                 }
             }
         }
 
         for chunk_index in backfill_begin..num_chunks {
-            update(chunk_index)?;
+            update(chunk_index, None)?;
         }
 
         Ok((len, chunk_fprints, num_snapshotted))
