@@ -124,7 +124,7 @@ extern "C" fn verneuil__file_write(
     // lock on the file.
 
     if let Some(tracker) = file.tracker() {
-        tracker.flag_write(offset as u64, n as u64);
+        tracker.flag_write(src as *const u8, offset as u64, n as u64);
     }
 
     unsafe { verneuil__file_write_impl(file, src, n, offset) }
@@ -147,7 +147,7 @@ extern "C" fn verneuil__file_truncate(file: &LinuxFile, size: i64) -> i32 {
         let min = size.min(current_size);
         let max = size.max(current_size);
         if min >= 0 && max >= 0 {
-            tracker.flag_write(min as u64, (max - min) as u64);
+            tracker.flag_write(std::ptr::null(), min as u64, (max - min) as u64);
         }
     }
 
@@ -158,7 +158,7 @@ extern "C" fn verneuil__file_truncate(file: &LinuxFile, size: i64) -> i32 {
 extern "C" fn verneuil__file_sync(file: &mut LinuxFile, flags: i32) -> i32 {
     // If there's something to sync, there was a write.
     if let Some(tracker) = file.tracker() {
-        tracker.flag_write(0, 0);
+        tracker.flag_write(std::ptr::null(), 0, 0);
     }
 
     unsafe { verneuil__file_sync_impl(file, flags) }

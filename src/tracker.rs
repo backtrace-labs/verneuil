@@ -158,7 +158,7 @@ impl Tracker {
     /// Notes that we are about to update the tracked file, and
     /// that bytes in [offset, offset + count) are about to change.
     #[inline]
-    pub fn flag_write(&mut self, offset: u64, count: u64) {
+    pub fn flag_write(&mut self, buf: *const u8, offset: u64, count: u64) {
         // Attempt to update the version id xattr if this is the
         // first write since our last snapshot.
         if self.backing_file_state != MutationState::Dirty {
@@ -169,7 +169,27 @@ impl Tracker {
 
         self.backing_file_state = MutationState::Dirty;
 
-        if count > 0 {
+        if !buf.is_null() && count == SNAPSHOT_GRANULARITY && (offset % SNAPSHOT_GRANULARITY) == 0 {
+            // When sqlite fires off a writes that's exactly
+            // chunk-aligned, stage it directly for replication.  We
+            // expect this to happen most of the time, when the DB is
+            // configured with 64 KB pages.
+            let slice = unsafe { std::slice::from_raw_parts(buf, count as usize) };
+            let value = if let Some(repl) = &self.buffer {
+                let fprint = fingerprint_file_chunk(&slice);
+
+                // Remember the chunk's fingerprint if it's now staged.
+                match repl.stage_chunk(fprint, slice) {
+                    Ok(_) => Some(fprint),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Some(fprint),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            self.dirty_chunks.insert(offset, value);
+        } else if count > 0 {
             let min = offset / SNAPSHOT_GRANULARITY;
             let max = offset.saturating_add(count - 1) / SNAPSHOT_GRANULARITY;
 
@@ -269,6 +289,13 @@ impl Tracker {
             // fingerprint matches the actual chunk fingerprint.
             #[cfg(not(feature = "verneuil_test_validate_writes"))]
             if let Some(fprint) = expected_fprint {
+                // We had the write lock when we preemptively wrote the
+                // chunk file.  No other process could have GCed chunks
+                // until we released the write lock... at which time the
+                // chunk was clearly useful.
+                //
+                // The chunk file might be missing, but, if so, that's
+                // because the copier has already uploaded it.
                 let ret = fprint != chunk_fprints[chunk_index as usize];
                 chunk_fprints[chunk_index as usize] = fprint;
                 return Ok(ret);
