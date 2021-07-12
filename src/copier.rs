@@ -7,6 +7,7 @@ use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
 use crate::replication_target::S3ReplicationTarget;
 
+use core::num::NonZeroU32;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use std::collections::HashMap;
@@ -20,6 +21,19 @@ use std::path::PathBuf;
 
 const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
+/// Rate limit for individual blob uploads.
+///
+/// We want to guarantee a low average rate (e.g., 2 per second)
+/// to bound our costs, but also avoid slowing down replication in
+/// the common case, when write transactions are rare.
+const COPY_RATE_QUOTA: governor::Quota =
+    governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(2) })
+        .allow_burst(unsafe { NonZeroU32::new_unchecked(100) });
+
+/// Whenever we are rate-limited, add up to this fraction of the base
+/// delay to our sleep duration.
+const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
+
 /// A `Copier` is only a message-passing handle to a background worker
 /// thread.
 ///
@@ -32,6 +46,11 @@ pub(crate) struct Copier {
 
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<PathBuf>,
+    governor: governor::RateLimiter<
+        governor::state::direct::NotKeyed,
+        governor::state::InMemoryState,
+        governor::clock::MonotonicClock,
+    >,
 }
 
 impl Copier {
@@ -56,6 +75,10 @@ impl Copier {
         let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
         let backend = CopierBackend {
             ready_buffers: receiver,
+            governor: governor::RateLimiter::direct_with_clock(
+                COPY_RATE_QUOTA,
+                &Default::default(),
+            ),
         };
         std::thread::spawn(move || backend.handle_requests());
 
@@ -312,6 +335,22 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
 }
 
 impl CopierBackend {
+    /// Sleeps until the governor lets us fire the next set of API calls.
+    fn pace(&self) {
+        use rand::Rng;
+
+        match self.governor.check() {
+            Ok(_) => {}
+            Err(delay) => {
+                let mut rng = rand::thread_rng();
+                let wait_time = delay.wait_time_from(std::time::Instant::now());
+                let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+
+                std::thread::sleep(wait_time.mul_f64(jitter_scale));
+            }
+        }
+    }
+
     /// Handles one "ready" directory: copy the contents, and delete
     /// the corresponding files and directory as we go.  Once *everything*
     /// has been copied, the directory will be empty, which will
@@ -340,7 +379,10 @@ impl CopierBackend {
 
             consume_directory(
                 replication_buffer::directory_chunks(ready.clone()),
-                |name, file| copy_file(name, file, &chunks_buckets),
+                |name, file| {
+                    self.pace();
+                    copy_file(name, file, &chunks_buckets)
+                },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
         }
@@ -359,7 +401,10 @@ impl CopierBackend {
 
             consume_directory(
                 replication_buffer::directory_meta(ready),
-                |name, file| copy_file(name, file, &meta_buckets),
+                |name, file| {
+                    self.pace();
+                    copy_file(name, file, &meta_buckets)
+                },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
         }
@@ -406,6 +451,7 @@ impl CopierBackend {
             consume_directory(
                 chunks_directory.clone(),
                 &mut |name: &OsStr, file| {
+                    self.pace();
                     copy_file(name, file, &chunks_buckets)?;
                     published += 1;
                     Ok(())
@@ -468,6 +514,7 @@ impl CopierBackend {
                 meta_directory,
                 &mut |name: &OsStr, file| {
                     if initial_meta.get(name) == Some(&file_identifier(&file)?) {
+                        self.pace();
                         copy_file(name, file, &meta_buckets)
                     } else {
                         Ok(())
@@ -509,24 +556,28 @@ impl CopierBackend {
                     // data that we have failed to copy to the replication targets.
                     let _ = self.handle_ready_directory(&targets, creds.clone(), path.clone());
 
-                    // Opportunistically try to copy from the "staging"
-                    // directory.  That's never staler than "ready", so we do
-                    // not go backward in our replication.
-                    let _ = self.handle_staging_directory(&targets, creds.clone(), path.clone());
+                    // See if we have enough quota left to do extra work.
+                    if self.governor.check().is_ok() {
+                        // Opportunistically try to copy from the "staging"
+                        // directory.  That's never staler than "ready", so we do
+                        // not go backward in our replication.
+                        let _ =
+                            self.handle_staging_directory(&targets, creds.clone(), path.clone());
 
-                    // And now see if the ready directory was updated again.
-                    // We only upload meta files (directory protos) if we
-                    // observed that the "ready" directory was empty while the
-                    // meta files had the same value as when we entered
-                    // "handle_staging_directory".  Anything we now find in
-                    // the "ready" directory must be at least as recent as
-                    // what we found in staging, so, again, replication
-                    // cannot go backwards.
-                    let _ = self.handle_ready_directory(&targets, creds, path);
+                        // And now see if the ready directory was updated again.
+                        // We only upload meta files (directory protos) if we
+                        // observed that the "ready" directory was empty while the
+                        // meta files had the same value as when we entered
+                        // "handle_staging_directory".  Anything we now find in
+                        // the "ready" directory must be at least as recent as
+                        // what we found in staging, so, again, replication
+                        // cannot go backwards.
+                        let _ = self.handle_ready_directory(&targets, creds, path);
 
-                    // When we get here, the remote data should be at least as
-                    // fresh as the last staged snapshot when we entered the
-                    // loop body.
+                        // When we get here, the remote data should be at least as
+                        // fresh as the last staged snapshot when we entered the
+                        // loop body.
+                    }
                 }
             }
         }
