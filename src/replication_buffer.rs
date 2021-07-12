@@ -252,6 +252,8 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
 
 /// Creates a temporary file, populates it with `worker`, and
 /// publishes it to `target` on success.
+///
+/// Fails with `AlreadyExists` if the target file exists.
 fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>) -> Result<T> {
     use std::os::unix::io::FromRawFd;
 
@@ -259,6 +261,13 @@ fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>
     extern "C" {
         fn verneuil__open_temp_file(directory: *const c_char, mode: i32) -> i32;
         fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
+    }
+
+    if target.exists() {
+        return Err(Error::new(
+            ErrorKind::AlreadyExists,
+            "target already exists",
+        ));
     }
 
     let parent = target

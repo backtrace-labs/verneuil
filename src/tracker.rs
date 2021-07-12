@@ -265,7 +265,10 @@ impl Tracker {
 
             let fprint = fingerprint_file_chunk(slice);
 
-            repl.stage_chunk(fprint, slice)?;
+            match repl.stage_chunk(fprint, slice) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                x => x,
+            }?;
             let ret = fprint != chunk_fprints[chunk_index as usize];
 
             chunk_fprints[chunk_index as usize] = fprint;
