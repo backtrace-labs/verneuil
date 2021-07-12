@@ -40,6 +40,10 @@ const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
+/// We aim for ~2 requests / second.  We shouldn't need more than two
+/// worker threads to achieve that.
+const WORKER_COUNT: usize = 2;
+
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
 /// copiers for the same directory, so we must refcount them.
@@ -69,7 +73,7 @@ type Governor = governor::RateLimiter<
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<PathBuf>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
-    governor: Arc<Governor>,
+    workers: crossbeam_channel::Sender<PathBuf>,
     // Map from PathBuf for spool directories to refcount.
     active_spool_paths: HashMap<PathBuf, usize>,
 }
@@ -138,7 +142,8 @@ impl Copier {
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
     pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
-        let (mut backend, buf_send, maintenance_send) = CopierBackend::new(channel_capacity);
+        let (mut backend, buf_send, maintenance_send) =
+            CopierBackend::new(WORKER_COUNT, channel_capacity);
         std::thread::spawn(move || backend.handle_requests());
 
         let ret = Copier {
@@ -400,30 +405,12 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
     ))
 }
 
-impl CopierBackend {
-    fn new(
-        channel_capacity: usize,
-    ) -> (
-        Self,
-        crossbeam_channel::Sender<PathBuf>,
-        crossbeam_channel::Sender<ActiveSetMaintenance>,
-    ) {
-        let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);
-        let (maintenance_send, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
+struct CopierWorker {
+    work: crossbeam_channel::Receiver<PathBuf>,
+    governor: Arc<Governor>,
+}
 
-        let backend = CopierBackend {
-            ready_buffers: buf_recv,
-            maintenance: maintenance_recv,
-            governor: Arc::new(governor::RateLimiter::direct_with_clock(
-                COPY_RATE_QUOTA,
-                &Default::default(),
-            )),
-            active_spool_paths: HashMap::new(),
-        };
-
-        (backend, buf_send, maintenance_send)
-    }
-
+impl CopierWorker {
     /// Sleeps until the governor lets us fire the next set of API calls.
     fn pace(&self) {
         use rand::Rng;
@@ -680,6 +667,62 @@ impl CopierBackend {
         }
     }
 
+    fn worker_loop(&self) {
+        while let Ok(path) = self.work.recv() {
+            self.handle_spooling_directory(path);
+        }
+    }
+}
+
+impl CopierBackend {
+    fn new(
+        worker_count: usize,
+        channel_capacity: usize,
+    ) -> (
+        Self,
+        crossbeam_channel::Sender<PathBuf>,
+        crossbeam_channel::Sender<ActiveSetMaintenance>,
+    ) {
+        let governor = Arc::new(governor::RateLimiter::direct_with_clock(
+            COPY_RATE_QUOTA,
+            &Default::default(),
+        ));
+
+        let (worker_send, worker_recv) = crossbeam_channel::bounded(channel_capacity);
+        for _ in 0..worker_count.max(1) {
+            let worker = CopierWorker {
+                work: worker_recv.clone(),
+                governor: governor.clone(),
+            };
+
+            std::thread::spawn(move || worker.worker_loop());
+        }
+
+        let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (maintenance_send, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
+
+        let backend = CopierBackend {
+            ready_buffers: buf_recv,
+            maintenance: maintenance_recv,
+            workers: worker_send,
+            active_spool_paths: HashMap::new(),
+        };
+
+        (backend, buf_send, maintenance_send)
+    }
+
+    /// Attempts to send `work` to the spool directory replication workers.
+    /// Returns None on success, `work` if the channel is full, and
+    /// panics if the workers disconnected.
+    fn send_work(&self, work: PathBuf) -> Option<PathBuf> {
+        use crossbeam_channel::TrySendError::*;
+        match self.workers.try_send(work) {
+            Ok(_) => None,
+            Err(Full(work)) => Some(work),
+            Err(Disconnected(_)) => panic!("workers disconnected"),
+        }
+    }
+
     /// Handles the next request from our channels.  Returns true on
     /// success, false if the worker thread should abort.
     fn handle_one_request(&mut self, timeout: Duration) -> bool {
@@ -687,7 +730,11 @@ impl CopierBackend {
 
         crossbeam_channel::select! {
             recv(self.ready_buffers) -> ready => match ready {
-                Ok(ready) => self.handle_spooling_directory(ready),
+                Ok(ready) => {
+                    // Data in `ready_buffer` is only advisory, it's
+                    // never incorrect to drop the work unit.
+                    self.send_work(ready);
+                },
                 // Errors only happen when there is no more sender.
                 // That means the worker should shut down.
                 Err(_) => return false,
@@ -742,27 +789,31 @@ impl CopierBackend {
             }
 
             if let Some(path) = active_set.pop() {
-                if self.active_spool_paths.contains_key(&path) {
-                    self.handle_spooling_directory(path);
+                if let Some(path) = self.send_work(path) {
+                    // Push pack to the `active_set` on failure.
+                    active_set.push(path);
                 }
             } else {
                 active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
             }
         }
 
-        // Handle all ready buffers before leaving.
+        // Try to handle all ready buffers before leaving.  Don't do
+        // anything if the work channel is full: we're probably
+        // shutting down, and it's unlikely that we'll complete all
+        // that work.
         while let Ok(ready) = self.ready_buffers.try_recv() {
             // Remove from the set of active paths: we want to skip
             // anything that's not active anymore, and we don't want
             // to scan directories twice during shutdown.
             if self.active_spool_paths.remove(&ready).is_some() {
-                self.handle_spooling_directory(ready);
+                self.send_work(ready);
             }
         }
 
         // One final pass through all remaining spooling directories.
         for path in shuffle_active_set(&self.active_spool_paths, &mut rng) {
-            self.handle_spooling_directory(path);
+            self.send_work(path);
         }
     }
 }
