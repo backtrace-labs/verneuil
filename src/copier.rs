@@ -34,24 +34,54 @@ const COPY_RATE_QUOTA: governor::Quota =
 /// delay to our sleep duration.
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 
+/// Messages to maintain the set of active spooling directory: `Join`
+/// adds a new directory, `Leave` removes it.  There may be multiple
+/// copiers for the same directory, so we must refcount them.
+enum ActiveSetMaintenance {
+    Join(PathBuf),
+    Leave(PathBuf),
+}
+
 /// A `Copier` is only a message-passing handle to a background worker
 /// thread.
 ///
 /// When all the underlying `Sender` have been dropped, the thread
 /// will be notified and commence shutdown.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Copier {
     ready_buffers: crossbeam_channel::Sender<PathBuf>,
+    maintenance: crossbeam_channel::Sender<ActiveSetMaintenance>,
     spool_path: Option<PathBuf>,
 }
 
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<PathBuf>,
+    maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
     governor: governor::RateLimiter<
         governor::state::direct::NotKeyed,
         governor::state::InMemoryState,
         governor::clock::MonotonicClock,
     >,
+    // Map from PathBuf for spool directories to refcount.
+    active_spool_paths: HashMap<PathBuf, usize>,
+}
+
+impl Clone for Copier {
+    fn clone(&self) -> Self {
+        self.incref();
+
+        Copier {
+            ready_buffers: self.ready_buffers.clone(),
+            maintenance: self.maintenance.clone(),
+            spool_path: self.spool_path.clone(),
+        }
+    }
+}
+
+impl Drop for Copier {
+    fn drop(&mut self) {
+        self.delref();
+    }
 }
 
 impl Copier {
@@ -66,35 +96,62 @@ impl Copier {
 
     /// Returns a handle for a fresh Copier.
     pub fn new(spool_path: Option<PathBuf>) -> Copier {
-        Copier::new_with_capacity(spool_path, 1000)
+        Copier::new_with_capacity(spool_path, 100)
+    }
+
+    /// Increments the refcount for the current spool path, if any.
+    fn incref(&self) {
+        if let Some(path) = &self.spool_path {
+            self.maintenance
+                .send(ActiveSetMaintenance::Join(path.clone()))
+                .expect("channel should not disconnect");
+        }
+    }
+
+    /// Decrements the refcount for the current spool path, if any.
+    fn delref(&self) {
+        if let Some(path) = &self.spool_path {
+            self.maintenance
+                .send(ActiveSetMaintenance::Leave(path.clone()))
+                .expect("channel should not disconnect");
+        }
     }
 
     pub fn with_spool_path(&self, spool_path: Option<PathBuf>) -> Copier {
-        Copier {
-            spool_path,
-            ..self.clone()
-        }
+        let mut copy = self.clone();
+
+        copy.delref();
+        copy.spool_path = spool_path;
+        copy.incref();
+        copy
     }
 
     /// Returns a handle for a fresh Copier that allows for
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
     pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
-        let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
+        let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (maintenance_send, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
 
-        let backend = CopierBackend {
-            ready_buffers: receiver,
+        let mut backend = CopierBackend {
+            ready_buffers: buf_recv,
+            maintenance: maintenance_recv,
             governor: governor::RateLimiter::direct_with_clock(
                 COPY_RATE_QUOTA,
                 &Default::default(),
             ),
+            active_spool_paths: HashMap::new(),
         };
         std::thread::spawn(move || backend.handle_requests());
 
-        Copier {
-            ready_buffers: sender,
+        let ret = Copier {
+            ready_buffers: buf_send,
+            maintenance: maintenance_send,
             spool_path,
-        }
+        };
+
+        ret.incref();
+        ret
     }
 
     /// Attempts to signal that the "ready" buffer subdirectory in
@@ -588,15 +645,49 @@ impl CopierBackend {
         }
     }
 
+    /// Handles the next request from our channels.  Returns true on
+    /// success, false if the worker thread should abort.
+    fn handle_one_request(&mut self) -> bool {
+        use ActiveSetMaintenance::*;
+
+        crossbeam_channel::select! {
+            recv(self.ready_buffers) -> ready => match ready {
+                Ok(ready) => self.handle_spooling_directory(ready),
+                // Errors only happen when there is no more sender.
+                // That means the worker should shut down.
+                Err(_) => return false,
+            },
+            recv(self.maintenance) -> maintenance => match maintenance {
+                Ok(Join(path)) => {
+                    *self.active_spool_paths.entry(path).or_insert(0) += 1;
+                },
+                Ok(Leave(path)) => {
+                    if let Some(v) = self.active_spool_paths.get_mut(&path) {
+                        if *v > 1 {
+                            *v -= 1;
+                        } else {
+                            self.active_spool_paths.remove(&path);
+                        }
+                    }
+                },
+                Err(_) => return false,
+            }
+        }
+
+        true
+    }
+
     /// Process directories that should be ready for replication, one
     /// at a time.
     ///
     /// When the write ends of the channel are all gone, stop pulling
     /// work.
-    fn handle_requests(&self) {
-        // This only fails when the channel is closed.
-        while let Ok(path) = self.ready_buffers.recv() {
-            self.handle_spooling_directory(path);
+    fn handle_requests(&mut self) {
+        while self.handle_one_request() {}
+
+        // Handle all ready buffers before leaving.
+        while let Ok(ready) = self.ready_buffers.try_recv() {
+            self.handle_spooling_directory(ready);
         }
     }
 }
