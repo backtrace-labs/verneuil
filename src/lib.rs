@@ -29,6 +29,11 @@ pub struct Options {
     /// subdirectories of that staging directory.
     pub replication_staging_dir: Option<String>,
 
+    /// Unix permissions for the staging dir if we must create it.
+    ///
+    /// ORed with 0o700.
+    pub replication_staging_dir_permissions: Option<u32>,
+
     /// List of default replication targets.
     #[serde(default)]
     pub replication_targets: Vec<replication_target::ReplicationTarget>,
@@ -39,6 +44,7 @@ pub struct ForeignOptions {
     pub make_default: bool,
     pub tempdir: *const c_char,
     pub replication_staging_dir: *const c_char,
+    pub replication_staging_dir_permissions: u32,
     pub json_options: *const c_char,
 }
 
@@ -57,6 +63,7 @@ pub fn configure(options: Options) -> Result<(), i32> {
         make_default: options.make_default,
         tempdir: std::ptr::null(),
         replication_staging_dir: std::ptr::null(),
+        replication_staging_dir_permissions: 0,
         json_options: std::ptr::null(),
     };
 
@@ -72,8 +79,13 @@ pub fn configure(options: Options) -> Result<(), i32> {
     }
 
     if let Some(staging_dir) = options.replication_staging_dir {
-        replication_buffer::set_default_staging_directory(Path::new(&staging_dir))
-            .map_err(|_| -1)?;
+        let mode = options.replication_staging_dir_permissions.unwrap_or(0) | 0o700;
+
+        replication_buffer::set_default_staging_directory(
+            Path::new(&staging_dir),
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )
+        .map_err(|_| -1)?;
     }
 
     replication_target::set_default_replication_targets(options.replication_targets);
@@ -118,6 +130,11 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
 
         if let Some(dir) = cstr_to_string(foreign_options.replication_staging_dir) {
             options.replication_staging_dir = Some(dir);
+        }
+
+        if foreign_options.replication_staging_dir_permissions != 0 {
+            options.replication_staging_dir_permissions =
+                Some(foreign_options.replication_staging_dir_permissions);
         }
     }
 

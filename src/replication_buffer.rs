@@ -168,7 +168,10 @@ pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
 
 /// Sets the default staging directory for replication subdirectories,
 /// if it isn't already set.
-pub(crate) fn set_default_staging_directory(path: &Path) -> Result<()> {
+pub(crate) fn set_default_staging_directory(
+    path: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<()> {
     let mut default = DEFAULT_STAGING_DIRECTORY.write().unwrap();
 
     if let Some(old_path) = &*default {
@@ -185,7 +188,11 @@ pub(crate) fn set_default_staging_directory(path: &Path) -> Result<()> {
     // We perform this I/O with a lock held, but we expect
     // `set_default_staging_directory` to be called early enough that
     // there is no contention.
-    std::fs::create_dir_all(path)?;
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+        std::fs::set_permissions(path, permissions)?;
+    }
+
     *default = Some(path.into());
     Ok(())
 }

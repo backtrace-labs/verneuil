@@ -1,6 +1,7 @@
 #pragma once
 #include <sqlite3ext.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 struct verneuil_options {
         bool make_default;
@@ -17,6 +18,14 @@ struct verneuil_options {
          * subdirectories of that staging directory.
          */
         const char *replication_staging_dir;
+
+        /*
+         * If non-zero, the permission mask for the replication
+         * directory if it must be created.
+         *
+         * Zero defaults to 0700.
+         */
+        uint32_t replication_staging_dir_permissions;
 
         /*
          * Optional JSON-encoded options.  The fields directly in
