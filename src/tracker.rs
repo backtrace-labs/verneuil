@@ -117,14 +117,17 @@ impl Tracker {
         let buffer = ReplicationBuffer::new(&path, &file)
             .map_err(|_| "failed to create replication buffer")?;
         let replication_targets = crate::replication_target::get_default_replication_targets();
-        let copier = Copier::get_global_copier();
+        let copier;
 
         // Let the copier pick up any ready snapshot left behind, e.g,
         // by an older crashed process.
         if let Some(buf) = &buffer {
             // But first, make sure to overwrite the replication config with our own.
             buf.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
-            buf.signal_copier(&copier);
+            copier = Copier::get_global_copier(Some(buf.spooling_directory().to_owned()));
+            copier.signal_ready_buffer();
+        } else {
+            copier = Copier::get_global_copier(None)
         }
 
         Ok(Tracker {
@@ -511,7 +514,7 @@ impl Tracker {
         self.validate_all_snapshots(buf);
 
         // We did something.  Tell the copier.
-        buf.signal_copier(&self.copier);
+        self.copier.signal_ready_buffer();
 
         // GC is opportunistic, failure is OK.  It's important to
         // the copier that we only remove chunks after attempting

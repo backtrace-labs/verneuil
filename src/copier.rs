@@ -42,6 +42,7 @@ const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 #[derive(Clone, Debug)]
 pub(crate) struct Copier {
     ready_buffers: crossbeam_channel::Sender<PathBuf>,
+    spool_path: Option<PathBuf>,
 }
 
 struct CopierBackend {
@@ -55,24 +56,32 @@ struct CopierBackend {
 
 impl Copier {
     /// Returns a handle for the global `Copier` worker.
-    pub fn get_global_copier() -> Copier {
+    pub fn get_global_copier(spool_path: Option<PathBuf>) -> Copier {
         lazy_static::lazy_static! {
-            static ref GLOBAL_COPIER: Copier = Copier::new();
+            static ref GLOBAL_COPIER: Copier = Copier::new(None);
         }
 
-        GLOBAL_COPIER.clone()
+        GLOBAL_COPIER.with_spool_path(spool_path)
     }
 
     /// Returns a handle for a fresh Copier.
-    pub fn new() -> Copier {
-        Copier::new_with_capacity(1000)
+    pub fn new(spool_path: Option<PathBuf>) -> Copier {
+        Copier::new_with_capacity(spool_path, 1000)
+    }
+
+    pub fn with_spool_path(&self, spool_path: Option<PathBuf>) -> Copier {
+        Copier {
+            spool_path,
+            ..self.clone()
+        }
     }
 
     /// Returns a handle for a fresh Copier that allows for
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
-    pub fn new_with_capacity(channel_capacity: usize) -> Copier {
+    pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
         let (sender, receiver) = crossbeam_channel::bounded(channel_capacity);
+
         let backend = CopierBackend {
             ready_buffers: receiver,
             governor: governor::RateLimiter::direct_with_clock(
@@ -84,16 +93,19 @@ impl Copier {
 
         Copier {
             ready_buffers: sender,
+            spool_path,
         }
     }
 
     /// Attempts to signal that the "ready" buffer subdirectory in
     /// `parent_directory` is available for copying.
-    pub fn signal_ready_buffer(&self, parent_directory: PathBuf) {
+    pub fn signal_ready_buffer(&self) {
         // Eat the failure for now.  We may fail to replicate a write
         // transaction when the copier is falling behind; this delays
         // replication until the next write, but isn't incorrect.
-        let _ = self.ready_buffers.try_send(parent_directory);
+        if let Some(parent_directory) = &self.spool_path {
+            let _ = self.ready_buffers.try_send(parent_directory.clone());
+        }
     }
 }
 

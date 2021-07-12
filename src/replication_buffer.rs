@@ -714,9 +714,9 @@ impl ReplicationBuffer {
         std::fs::rename(ready.path(), &target)
     }
 
-    /// Attempts to signal this new `ready` subdirectory to the `copier`.
-    pub fn signal_copier(&self, copier: &crate::copier::Copier) {
-        copier.signal_ready_buffer(self.spooling_directory.clone());
+    /// Returns the spooling directory path for this buffer.
+    pub fn spooling_directory(&self) -> &Path {
+        &self.spooling_directory
     }
 
     /// Attempts to clean up any chunk file that's not referred by the
