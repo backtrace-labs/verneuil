@@ -2,8 +2,8 @@
 //! ensures that consistent snapshots are regularly propagated to
 //! remote object storage.
 //!
-//! Each buffer is a directory that includes a "staging" directory,
-//! and a "ready" directory.
+//! Each spooling buffer is a directory that includes a "staging"
+//! directory, and a "ready" directory.
 //!
 //! The staging directory has a "chunks" subdirectory, and a "meta"
 //! subdirectory.  The chunks directory contains content-addressed
@@ -135,11 +135,11 @@ use umash::Fingerprint;
 
 #[derive(Debug)]
 pub(crate) struct ReplicationBuffer {
-    buffer_directory: PathBuf,
+    spooling_directory: PathBuf,
 }
 
 lazy_static::lazy_static! {
-    static ref DEFAULT_STAGING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
+    static ref DEFAULT_SPOOLING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
 
 /// The "staging" subdirectory is updated in-place to match the db.
@@ -166,13 +166,13 @@ const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
 /// invertible, so only enabled for sqlite tests.
 pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
 
-/// Sets the default staging directory for replication subdirectories,
+/// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
-pub(crate) fn set_default_staging_directory(
+pub(crate) fn set_default_spooling_directory(
     path: &Path,
     permissions: std::fs::Permissions,
 ) -> Result<()> {
-    let mut default = DEFAULT_STAGING_DIRECTORY.write().unwrap();
+    let mut default = DEFAULT_SPOOLING_DIRECTORY.write().unwrap();
 
     if let Some(old_path) = &*default {
         if old_path == path {
@@ -181,12 +181,12 @@ pub(crate) fn set_default_staging_directory(
 
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "default staging directory already set",
+            "default spooling directory already set",
         ));
     }
 
     // We perform this I/O with a lock held, but we expect
-    // `set_default_staging_directory` to be called early enough that
+    // `set_default_spooling_directory` to be called early enough that
     // there is no contention.
     if !path.exists() {
         std::fs::create_dir_all(path)?;
@@ -447,27 +447,27 @@ impl ReplicationBuffer {
     /// `db_path`.
     ///
     /// That buffer is a directory,
-    /// `$STAGING_DIRECTORY/$INSTANCE_ID/$MANGLED_DB_PATH@$DEVICE.$INODE`.
+    /// `$SPOOLING_DIRECTORY/$INSTANCE_ID/$MANGLED_DB_PATH@$DEVICE.$INODE`.
     /// The instance id subdirectory means we don't have to worry about
     /// seeing partial data left behind by prior OS crashes, and also
     /// makes it easy to clean up old directories.
     ///
-    /// Returns `None` if the staging directory is not set.
+    /// Returns `None` if the spooling directory is not set.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the replication buffer directory could not be
     /// created.
     pub fn new(db_path: &Path, fd: &File) -> Result<Option<ReplicationBuffer>> {
-        if let Some(mut staging) = DEFAULT_STAGING_DIRECTORY.read().unwrap().clone() {
+        if let Some(mut spooling) = DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
             // Add an instance id.
-            staging.push(format!(
+            spooling.push(format!(
                 "verneuil-{}",
                 replace_slashes(instance_id::instance_id())
             ));
             // And now add the unique local key for the db file.
-            staging.push(mangle_path(db_path)?);
-            staging.push(db_file_key(fd)?);
+            spooling.push(mangle_path(db_path)?);
+            spooling.push(db_file_key(fd)?);
 
             // Attempt to delete directories that refer to the same
             // path, but different inode.  This will do weird things
@@ -476,12 +476,12 @@ impl ReplicationBuffer {
             // for sqlite tests, which create a lot of dbs, none of
             // which have colliding names.
             if ENABLE_AUTO_CLEANUP.load(Ordering::Relaxed) {
-                let _ = delete_stale_directories(&staging);
+                let _ = delete_stale_directories(&spooling);
             }
 
-            std::fs::create_dir_all(&staging)?;
+            std::fs::create_dir_all(&spooling)?;
             Ok(Some(ReplicationBuffer {
-                buffer_directory: staging,
+                spooling_directory: spooling,
             }))
         } else {
             Ok(None)
@@ -495,7 +495,7 @@ impl ReplicationBuffer {
     /// Fails silently: downstream code has to handle all sorts of
     /// concurrent failures anyway.
     pub fn ensure_staging_dir(&self, targets: &ReplicationTargetList, overwrite_meta: bool) {
-        let mut buf = self.buffer_directory.clone();
+        let mut buf = self.spooling_directory.clone();
         buf.push(STAGING);
 
         let _ = std::fs::create_dir_all(&buf);
@@ -523,7 +523,7 @@ impl ReplicationBuffer {
 
         let chunk_name = fingerprint_chunk_name(&fprint);
 
-        let mut target = self.buffer_directory.clone();
+        let mut target = self.spooling_directory.clone();
         target.push(STAGING);
         target.push(CHUNKS);
         target.push(&chunk_name);
@@ -546,7 +546,7 @@ impl ReplicationBuffer {
             .encode(&mut encoded)
             .map_err(|_| Error::new(ErrorKind::Other, "failed to serialise directory proto"))?;
 
-        let mut target = self.buffer_directory.clone();
+        let mut target = self.spooling_directory.clone();
         target.push(STAGING);
         target.push(SCRATCH);
 
@@ -568,7 +568,7 @@ impl ReplicationBuffer {
     /// Returns whether the "ready" subdirectory definitely exists.
     #[allow(dead_code)]
     pub fn ready_directory_present(&self) -> bool {
-        let mut probe = self.buffer_directory.clone();
+        let mut probe = self.spooling_directory.clone();
         probe.push(READY);
 
         probe.exists()
@@ -576,7 +576,7 @@ impl ReplicationBuffer {
 
     /// Attempts to parse the current ready directory file.
     pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
-        let mut src = self.buffer_directory.clone();
+        let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
@@ -585,7 +585,7 @@ impl ReplicationBuffer {
 
     /// Attempts to parse the current staged directory file.
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
-        let mut src = self.buffer_directory.clone();
+        let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
@@ -595,7 +595,7 @@ impl ReplicationBuffer {
     /// Attempts to parse the current staged directory file.
     #[allow(dead_code)]
     pub fn read_staged_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
-        let mut src = self.buffer_directory.clone();
+        let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(CHUNKS);
         src.push(&fingerprint_chunk_name(fprint));
@@ -606,7 +606,7 @@ impl ReplicationBuffer {
     /// Attempts to parse the current staged directory file.
     #[allow(dead_code)]
     pub fn read_ready_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
-        let mut src = self.buffer_directory.clone();
+        let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(CHUNKS);
         src.push(&fingerprint_chunk_name(fprint));
@@ -627,10 +627,10 @@ impl ReplicationBuffer {
 
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
 
-        let mut staging = self.buffer_directory.clone();
+        let mut staging = self.spooling_directory.clone();
         staging.push(STAGING);
 
-        let mut target = self.buffer_directory.clone();
+        let mut target = self.spooling_directory.clone();
         target.push(STAGING);
         target.push(SCRATCH);
 
@@ -702,7 +702,7 @@ impl ReplicationBuffer {
     ///
     /// Returns `None` on success, the temporary buffer on failure.
     pub fn publish_ready_buffer(&self, ready: TempDir) -> Result<()> {
-        let mut target = self.buffer_directory.clone();
+        let mut target = self.spooling_directory.clone();
         target.push(READY);
 
         std::fs::rename(ready.path(), &target)
@@ -710,7 +710,7 @@ impl ReplicationBuffer {
 
     /// Attempts to signal this new `ready` subdirectory to the `copier`.
     pub fn signal_copier(&self, copier: &crate::copier::Copier) {
-        copier.signal_ready_buffer(self.buffer_directory.clone());
+        copier.signal_ready_buffer(self.spooling_directory.clone());
     }
 
     /// Attempts to clean up any chunk file that's not referred by the
@@ -718,7 +718,7 @@ impl ReplicationBuffer {
     pub fn gc_chunks(&self, chunks: &[Fingerprint]) -> Result<()> {
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
 
-        let mut chunks = self.buffer_directory.clone();
+        let mut chunks = self.spooling_directory.clone();
         chunks.push(STAGING);
         chunks.push(CHUNKS);
 
@@ -743,7 +743,7 @@ impl ReplicationBuffer {
 
     /// Attempts to delete all temporary files and directory from "staging/scratch."
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
-        let mut scratch = self.buffer_directory.clone();
+        let mut scratch = self.spooling_directory.clone();
         scratch.push(STAGING);
         scratch.push(SCRATCH);
 

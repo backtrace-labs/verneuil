@@ -26,13 +26,13 @@ pub struct Options {
     pub tempdir: Option<String>,
 
     /// If provided, temporary replication data will live in
-    /// subdirectories of that staging directory.
-    pub replication_staging_dir: Option<String>,
+    /// subdirectories of that spooling directory.
+    pub replication_spooling_dir: Option<String>,
 
-    /// Unix permissions for the staging dir if we must create it.
+    /// Unix permissions for the spooling dir if we must create it.
     ///
     /// ORed with 0o700.
-    pub replication_staging_dir_permissions: Option<u32>,
+    pub replication_spooling_dir_permissions: Option<u32>,
 
     /// List of default replication targets.
     #[serde(default)]
@@ -43,8 +43,8 @@ pub struct Options {
 pub struct ForeignOptions {
     pub make_default: bool,
     pub tempdir: *const c_char,
-    pub replication_staging_dir: *const c_char,
-    pub replication_staging_dir_permissions: u32,
+    pub replication_spooling_dir: *const c_char,
+    pub replication_spooling_dir_permissions: u32,
     pub json_options: *const c_char,
 }
 
@@ -62,8 +62,8 @@ pub fn configure(options: Options) -> Result<(), i32> {
     let mut foreign_options = ForeignOptions {
         make_default: options.make_default,
         tempdir: std::ptr::null(),
-        replication_staging_dir: std::ptr::null(),
-        replication_staging_dir_permissions: 0,
+        replication_spooling_dir: std::ptr::null(),
+        replication_spooling_dir_permissions: 0,
         json_options: std::ptr::null(),
     };
 
@@ -78,11 +78,11 @@ pub fn configure(options: Options) -> Result<(), i32> {
         return Err(ret);
     }
 
-    if let Some(staging_dir) = options.replication_staging_dir {
-        let mode = options.replication_staging_dir_permissions.unwrap_or(0) | 0o700;
+    if let Some(spooling_dir) = options.replication_spooling_dir {
+        let mode = options.replication_spooling_dir_permissions.unwrap_or(0) | 0o700;
 
-        replication_buffer::set_default_staging_directory(
-            Path::new(&staging_dir),
+        replication_buffer::set_default_spooling_directory(
+            Path::new(&spooling_dir),
             std::os::unix::fs::PermissionsExt::from_mode(mode),
         )
         .map_err(|_| -1)?;
@@ -128,13 +128,13 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
             options.tempdir = Some(dir);
         }
 
-        if let Some(dir) = cstr_to_string(foreign_options.replication_staging_dir) {
-            options.replication_staging_dir = Some(dir);
+        if let Some(dir) = cstr_to_string(foreign_options.replication_spooling_dir) {
+            options.replication_spooling_dir = Some(dir);
         }
 
-        if foreign_options.replication_staging_dir_permissions != 0 {
-            options.replication_staging_dir_permissions =
-                Some(foreign_options.replication_staging_dir_permissions);
+        if foreign_options.replication_spooling_dir_permissions != 0 {
+            options.replication_spooling_dir_permissions =
+                Some(foreign_options.replication_spooling_dir_permissions);
         }
     }
 
@@ -182,7 +182,8 @@ pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -
     if let Err(code) = configure(Options {
         make_default: true,
         tempdir: None,
-        replication_staging_dir: Some("/tmp".into()),
+        replication_spooling_dir: Some("/tmp".into()),
+        replication_spooling_dir_permissions: None,
         replication_targets: vec![
             #[cfg(feature = "verneuil_test_minio")]
             ReplicationTarget::S3(S3ReplicationTarget {

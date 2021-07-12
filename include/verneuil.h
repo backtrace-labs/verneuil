@@ -17,7 +17,7 @@ struct verneuil_options {
          * enables it by default; all replication buffers will live in
          * subdirectories of that staging directory.
          */
-        const char *replication_staging_dir;
+        const char *replication_spooling_dir;
 
         /*
          * If non-zero, the permission mask for the replication
@@ -25,7 +25,7 @@ struct verneuil_options {
          *
          * Zero defaults to 0700.
          */
-        uint32_t replication_staging_dir_permissions;
+        uint32_t replication_spooling_dir_permissions;
 
         /*
          * Optional JSON-encoded options.  The fields directly in
