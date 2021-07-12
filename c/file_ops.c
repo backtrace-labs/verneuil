@@ -52,18 +52,6 @@ verneuil__link_temp_file(int fd, const char *target)
 }
 
 int
-verneuil__exchange_paths(const char *x, const char *y)
-{
-        int r;
-
-        do {
-                r = renameat2_compat(AT_FDCWD, x, AT_FDCWD, y, RENAME_EXCHANGE);
-        } while (r < 0 && errno == EINTR);
-
-        return r;
-}
-
-int
 verneuil__open_directory(const char *path)
 {
         int r;
