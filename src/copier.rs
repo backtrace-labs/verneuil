@@ -18,6 +18,7 @@ use std::io::ErrorKind;
 use std::io::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -33,6 +34,10 @@ const COPY_RATE_QUOTA: governor::Quota =
 /// Whenever we are rate-limited, add up to this fraction of the base
 /// delay to our sleep duration.
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
+
+/// Perform background work for one spooling directory approximately
+/// once per BACKGROUND_SCAN_PERIOD.
+const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
@@ -647,7 +652,7 @@ impl CopierBackend {
 
     /// Handles the next request from our channels.  Returns true on
     /// success, false if the worker thread should abort.
-    fn handle_one_request(&mut self) -> bool {
+    fn handle_one_request(&mut self, timeout: Duration) -> bool {
         use ActiveSetMaintenance::*;
 
         crossbeam_channel::select! {
@@ -671,7 +676,8 @@ impl CopierBackend {
                     }
                 },
                 Err(_) => return false,
-            }
+            },
+            default(timeout) => {},
         }
 
         true
@@ -683,11 +689,50 @@ impl CopierBackend {
     /// When the write ends of the channel are all gone, stop pulling
     /// work.
     fn handle_requests(&mut self) {
-        while self.handle_one_request() {}
+        use rand::seq::SliceRandom;
+        use rand::Rng;
+
+        fn shuffle_active_set(
+            active: &HashMap<PathBuf, usize>,
+            rng: &mut impl rand::Rng,
+        ) -> Vec<PathBuf> {
+            let mut keys: Vec<_> = active.keys().cloned().collect();
+
+            keys.shuffle(rng);
+            keys
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
+
+        loop {
+            let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+            if !self.handle_one_request(BACKGROUND_SCAN_PERIOD.mul_f64(jitter_scale)) {
+                break;
+            }
+
+            if let Some(path) = active_set.pop() {
+                if self.active_spool_paths.contains_key(&path) {
+                    self.handle_spooling_directory(path);
+                }
+            } else {
+                active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
+            }
+        }
 
         // Handle all ready buffers before leaving.
         while let Ok(ready) = self.ready_buffers.try_recv() {
-            self.handle_spooling_directory(ready);
+            // Remove from the set of active paths: we want to skip
+            // anything that's not active anymore, and we don't want
+            // to scan directories twice during shutdown.
+            if self.active_spool_paths.remove(&ready).is_some() {
+                self.handle_spooling_directory(ready);
+            }
+        }
+
+        // One final pass through all remaining spooling directories.
+        for path in shuffle_active_set(&self.active_spool_paths, &mut rng) {
+            self.handle_spooling_directory(path);
         }
     }
 }
