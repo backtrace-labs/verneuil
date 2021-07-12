@@ -18,6 +18,7 @@ use std::io::ErrorKind;
 use std::io::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
@@ -59,14 +60,16 @@ pub(crate) struct Copier {
     spool_path: Option<PathBuf>,
 }
 
+type Governor = governor::RateLimiter<
+    governor::state::direct::NotKeyed,
+    governor::state::InMemoryState,
+    governor::clock::MonotonicClock,
+>;
+
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<PathBuf>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
-    governor: governor::RateLimiter<
-        governor::state::direct::NotKeyed,
-        governor::state::InMemoryState,
-        governor::clock::MonotonicClock,
-    >,
+    governor: Arc<Governor>,
     // Map from PathBuf for spool directories to refcount.
     active_spool_paths: HashMap<PathBuf, usize>,
 }
@@ -141,10 +144,10 @@ impl Copier {
         let mut backend = CopierBackend {
             ready_buffers: buf_recv,
             maintenance: maintenance_recv,
-            governor: governor::RateLimiter::direct_with_clock(
+            governor: Arc::new(governor::RateLimiter::direct_with_clock(
                 COPY_RATE_QUOTA,
                 &Default::default(),
-            ),
+            )),
             active_spool_paths: HashMap::new(),
         };
         std::thread::spawn(move || backend.handle_requests());
