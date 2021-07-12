@@ -36,6 +36,16 @@ const COPY_RATE_QUOTA: governor::Quota =
 /// delay to our sleep duration.
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 
+/// How many times do we retry on transient errors?
+const COPY_RETRY_LIMIT: i32 = 2;
+
+/// Initial back-off delay (+/- jitter).
+const COPY_RETRY_BASE_WAIT: Duration = Duration::from_secs(1);
+
+/// Grow the back-off delay by `COPY_RETRY_MULTIPLIER` after
+/// consecutive failures.
+const COPY_RETRY_MULTIPLIER: f64 = 10.0;
+
 /// Perform background work for one spooling directory approximately
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
@@ -333,7 +343,10 @@ fn create_target(
 
 /// Attempts to publish the `contents` to `name` in all `targets`.
 fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()> {
+    use rand::Rng;
     use std::io::Read;
+
+    let mut rng = rand::thread_rng();
 
     let blob_name = name
         .to_str()
@@ -344,17 +357,26 @@ fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()>
     contents.read_to_end(&mut bytes)?;
 
     for target in targets {
-        match target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE) {
-            Ok((_, code)) if (200..300).contains(&code) => {
-                // Success!
-            }
-            Ok((_, code)) if code < 500 => {
-                // Permanent failure.
-                return Err(Error::new(ErrorKind::Other, "failed to post chunk"));
-            }
-            _ => {
-                // Should retry here.
-                return Err(Error::new(ErrorKind::Other, "transient failure"));
+        for i in 0..=COPY_RETRY_LIMIT {
+            match target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE) {
+                Ok((_, code)) if (200..300).contains(&code) => {
+                    break;
+                }
+                Ok((_, code)) if code < 500 => {
+                    // Permanent failure.  In theory, we should maybe
+                    // retry on 400: RequestTimeout, but we'll catch
+                    // it in the next background scan.
+                    return Err(Error::new(ErrorKind::Other, "failed to post chunk"));
+                }
+                _ => {
+                    if i == COPY_RETRY_LIMIT {
+                        return Err(Error::new(ErrorKind::Other, "transient failure"));
+                    }
+
+                    let sleep = COPY_RETRY_BASE_WAIT.mul_f64(COPY_RETRY_MULTIPLIER.powi(i));
+                    let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+                    std::thread::sleep(sleep.mul_f64(jitter_scale));
+                }
             }
         }
     }
