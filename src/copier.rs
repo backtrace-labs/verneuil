@@ -539,6 +539,55 @@ impl CopierBackend {
         Ok(())
     }
 
+    /// Processes one spooling directory that should be ready for
+    /// replication.
+    fn handle_spooling_directory(&self, spool: PathBuf) {
+        if let Ok(creds) = Credentials::default() {
+            // Try to read the metadata JSON, which tells us where to
+            // replicate the chunks and meta files.  If we can't do
+            // that, leave this precious data where it is...  We don't
+            // provide any hard liveness guarantee on replication, so
+            // that's not incorrect.  Even when replication is stuck,
+            // the buffering system bounds the amount of replication
+            // data we keep around.
+            let targets_or: Result<ReplicationTargetList> = (|| {
+                let metadata = replication_buffer::buffer_metadata_file(spool.clone());
+                Ok(serde_json::from_slice(&std::fs::read(&metadata)?)?)
+            })();
+
+            if let Ok(targets) = targets_or {
+                // Failures are expected when concurrent processes or copiers
+                // work on the same `path`.  Even when `handle_directory`
+                // fails, we're either making progress, or `path` is in a bad
+                // state and we choose to keep it untouched rather than drop
+                // data that we have failed to copy to the replication targets.
+                let _ = self.handle_ready_directory(&targets, creds.clone(), spool.clone());
+
+                // See if we have enough quota left to do extra work.
+                if self.governor.check().is_ok() {
+                    // Opportunistically try to copy from the "staging"
+                    // directory.  That's never staler than "ready", so we do
+                    // not go backward in our replication.
+                    let _ = self.handle_staging_directory(&targets, creds.clone(), spool.clone());
+
+                    // And now see if the ready directory was updated again.
+                    // We only upload meta files (directory protos) if we
+                    // observed that the "ready" directory was empty while the
+                    // meta files had the same value as when we entered
+                    // "handle_staging_directory".  Anything we now find in
+                    // the "ready" directory must be at least as recent as
+                    // what we found in staging, so, again, replication
+                    // cannot go backwards.
+                    let _ = self.handle_ready_directory(&targets, creds, spool);
+
+                    // When we get here, the remote data should be at least as
+                    // fresh as the last staged snapshot when we entered the
+                    // loop body.
+                }
+            }
+        }
+    }
+
     /// Process directories that should be ready for replication, one
     /// at a time.
     ///
@@ -547,51 +596,7 @@ impl CopierBackend {
     fn handle_requests(&self) {
         // This only fails when the channel is closed.
         while let Ok(path) = self.ready_buffers.recv() {
-            if let Ok(creds) = Credentials::default() {
-                // Try to read the metadata JSON, which tells us where to
-                // replicate the chunks and meta files.  If we can't do
-                // that, leave this precious data where it is...  We don't
-                // provide any hard liveness guarantee on replication, so
-                // that's not incorrect.  Even when replication is stuck,
-                // the buffering system bounds the amount of replication
-                // data we keep around.
-                let targets_or: Result<ReplicationTargetList> = (|| {
-                    let metadata = replication_buffer::buffer_metadata_file(path.clone());
-                    Ok(serde_json::from_slice(&std::fs::read(&metadata)?)?)
-                })();
-
-                if let Ok(targets) = targets_or {
-                    // Failures are expected when concurrent processes or copiers
-                    // work on the same `path`.  Even when `handle_directory`
-                    // fails, we're either making progress, or `path` is in a bad
-                    // state and we choose to keep it untouched rather than drop
-                    // data that we have failed to copy to the replication targets.
-                    let _ = self.handle_ready_directory(&targets, creds.clone(), path.clone());
-
-                    // See if we have enough quota left to do extra work.
-                    if self.governor.check().is_ok() {
-                        // Opportunistically try to copy from the "staging"
-                        // directory.  That's never staler than "ready", so we do
-                        // not go backward in our replication.
-                        let _ =
-                            self.handle_staging_directory(&targets, creds.clone(), path.clone());
-
-                        // And now see if the ready directory was updated again.
-                        // We only upload meta files (directory protos) if we
-                        // observed that the "ready" directory was empty while the
-                        // meta files had the same value as when we entered
-                        // "handle_staging_directory".  Anything we now find in
-                        // the "ready" directory must be at least as recent as
-                        // what we found in staging, so, again, replication
-                        // cannot go backwards.
-                        let _ = self.handle_ready_directory(&targets, creds, path);
-
-                        // When we get here, the remote data should be at least as
-                        // fresh as the last staged snapshot when we entered the
-                        // loop body.
-                    }
-                }
-            }
+            self.handle_spooling_directory(path);
         }
     }
 }
