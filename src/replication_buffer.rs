@@ -305,15 +305,21 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
         .remove(b'(')
         .remove(b')');
 
+    lazy_static::lazy_static! {
+        static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil path params");
+    }
+
     let string = path
         .as_os_str()
         .to_str()
         .ok_or_else(|| Error::new(ErrorKind::Other, "unable to convert path to string"))?;
+    let path_hash = umash::full_str(&PARAMS, 0, 0, &string);
 
     let name = format!(
-        "{}-verneuil:{}/{}",
+        "{}-verneuil:{}:{:04x}/{}",
         instance_id::hostname_hash(),
         instance_id::hostname(),
+        path_hash % (1 << (4 * 4)),
         string
     );
     Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
@@ -783,7 +789,8 @@ fn percent_encode_sample() {
         percent_encode_path_uri(Path::new(SAMPLE_PATH)).expect("should convert"),
         // We assume the test host's name doesn't need escaping.
         format!(
-            "verneuil%3A{}%2F%2Fa%40%3C%3Csd!%25-_%2F.asd%2F*\'fdg(g%2F)%5C%7E).db",
+            "{}-verneuil%3A{}%3A634c%2F%2Fa%40%3C%3Csd!%25-_%2F.asd%2F*\'fdg(g%2F)%5C%7E).db",
+            instance_id::hostname_hash(),
             instance_id::hostname()
         )
     );
