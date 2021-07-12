@@ -138,18 +138,7 @@ impl Copier {
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
     pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
-        let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);
-        let (maintenance_send, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
-
-        let mut backend = CopierBackend {
-            ready_buffers: buf_recv,
-            maintenance: maintenance_recv,
-            governor: Arc::new(governor::RateLimiter::direct_with_clock(
-                COPY_RATE_QUOTA,
-                &Default::default(),
-            )),
-            active_spool_paths: HashMap::new(),
-        };
+        let (mut backend, buf_send, maintenance_send) = CopierBackend::new(channel_capacity);
         std::thread::spawn(move || backend.handle_requests());
 
         let ret = Copier {
@@ -412,6 +401,29 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
 }
 
 impl CopierBackend {
+    fn new(
+        channel_capacity: usize,
+    ) -> (
+        Self,
+        crossbeam_channel::Sender<PathBuf>,
+        crossbeam_channel::Sender<ActiveSetMaintenance>,
+    ) {
+        let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (maintenance_send, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
+
+        let backend = CopierBackend {
+            ready_buffers: buf_recv,
+            maintenance: maintenance_recv,
+            governor: Arc::new(governor::RateLimiter::direct_with_clock(
+                COPY_RATE_QUOTA,
+                &Default::default(),
+            )),
+            active_spool_paths: HashMap::new(),
+        };
+
+        (backend, buf_send, maintenance_send)
+    }
+
     /// Sleeps until the governor lets us fire the next set of API calls.
     fn pace(&self) {
         use rand::Rng;
