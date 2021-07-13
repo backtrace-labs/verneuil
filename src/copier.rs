@@ -2,24 +2,36 @@
 //! asynchronously acquiring the current "ready" buffer in any number
 //! of replication directories, and sending the ready snapshot to
 //! object stores like S3.
-use crate::replication_buffer;
-use crate::replication_target::ReplicationTarget;
-use crate::replication_target::ReplicationTargetList;
-use crate::replication_target::S3ReplicationTarget;
-
 use core::num::NonZeroU32;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Error;
 use std::io::ErrorKind;
-use std::io::Result;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::debug_span;
+use tracing::info_span;
+use tracing::instrument;
+use tracing::Level;
+
+use crate::chain_debug;
+use crate::chain_error;
+use crate::chain_info;
+use crate::chain_warn;
+use crate::drop_result;
+use crate::filtered_io_error;
+use crate::fresh_error;
+use crate::fresh_info;
+use crate::fresh_warn;
+use crate::replication_buffer;
+use crate::replication_target::ReplicationTarget;
+use crate::replication_target::ReplicationTargetList;
+use crate::replication_target::S3ReplicationTarget;
+use crate::result::Result;
 
 const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -80,6 +92,7 @@ type Governor = governor::RateLimiter<
     governor::clock::MonotonicClock,
 >;
 
+#[derive(Debug)]
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<PathBuf>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
@@ -108,6 +121,7 @@ impl Drop for Copier {
 
 impl Copier {
     /// Returns a handle for the global `Copier` worker.
+    #[instrument(level = "debug")]
     pub fn get_global_copier(spool_path: Option<PathBuf>) -> Copier {
         lazy_static::lazy_static! {
             static ref GLOBAL_COPIER: Copier = Copier::new(None);
@@ -117,11 +131,13 @@ impl Copier {
     }
 
     /// Returns a handle for a fresh Copier.
+    #[instrument(level = "debug")]
     pub fn new(spool_path: Option<PathBuf>) -> Copier {
         Copier::new_with_capacity(spool_path, 100)
     }
 
     /// Increments the refcount for the current spool path, if any.
+    #[instrument(level = "debug")]
     fn incref(&self) {
         if let Some(path) = &self.spool_path {
             self.maintenance
@@ -131,6 +147,7 @@ impl Copier {
     }
 
     /// Decrements the refcount for the current spool path, if any.
+    #[instrument(level = "debug")]
     fn delref(&self) {
         if let Some(path) = &self.spool_path {
             self.maintenance
@@ -139,6 +156,8 @@ impl Copier {
         }
     }
 
+    /// Returns a copy of `self` with an updated `spool_path`.
+    #[instrument(level = "debug")]
     pub fn with_spool_path(&self, spool_path: Option<PathBuf>) -> Copier {
         let mut copy = self.clone();
 
@@ -151,6 +170,7 @@ impl Copier {
     /// Returns a handle for a fresh Copier that allows for
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
+    #[instrument(level = "debug")]
     pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
         let (mut backend, buf_send, maintenance_send) =
             CopierBackend::new(WORKER_COUNT, channel_capacity);
@@ -168,12 +188,15 @@ impl Copier {
 
     /// Attempts to signal that the "ready" buffer subdirectory in
     /// `parent_directory` is available for copying.
+    #[instrument(level = "debug")]
     pub fn signal_ready_buffer(&self) {
         // Eat the failure for now.  We may fail to replicate a write
         // transaction when the copier is falling behind; this delays
         // replication until the next write, but isn't incorrect.
         if let Some(parent_directory) = &self.spool_path {
-            let _ = self.ready_buffers.try_send(parent_directory.clone());
+            drop_result!(self.ready_buffers.try_send(parent_directory.clone()),
+                         e => chain_info!(e, "failed to signal ready buffer",
+                                          path=?parent_directory));
         }
     }
 }
@@ -196,15 +219,16 @@ pub(crate) fn fetch_chunk_from_targets(
 /// Ensures the directory at `target` does not exist.
 ///
 /// Returns Ok if this was achieved, and Err otherwise.
+#[instrument(level = "debug")]
 fn ensure_directory_removed(target: &Path) -> Result<()> {
     match std::fs::remove_dir(&target) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        ret => ret,
+        Err(e) => Err(chain_error!(e, "failed to remove directory", ?target)),
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum ConsumeDirectoryPolicy {
     /// If we remove nothing, we just iterate over the files...
     /// "scan" directory might be a more appropriate name.
@@ -231,6 +255,8 @@ fn consume_directory(
 ) -> Result<()> {
     use ConsumeDirectoryPolicy::*;
 
+    let _span = debug_span!("consume_directory", ?to_consume, ?policy);
+
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
     match std::fs::read_dir(&to_consume) {
         Ok(dirents) => {
@@ -238,13 +264,25 @@ fn consume_directory(
                 let name = file.file_name();
 
                 to_consume.push(&name);
-                if let Ok(contents) = File::open(&to_consume) {
-                    if consumer(&name, contents).is_ok() && delete_file {
+                let file_or = File::open(&to_consume).map_err(|e| {
+                    filtered_io_error!(e,
+                                       ErrorKind::NotFound => Level::DEBUG,
+                                       "failed to open file to copy", path=?to_consume)
+                });
+                if let Ok(contents) = file_or {
+                    if consumer(&name, contents)
+                        .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
+                        .is_ok()
+                        && delete_file
+                    {
                         // Attempt to remove the file.  It's ok if
                         // this fails: either someone else removed
                         // the file, or `ensure_directory_removed`
                         // will fail, correctly signaling failure.
-                        let _ = std::fs::remove_file(&to_consume);
+                        drop_result!(std::fs::remove_file(&to_consume),
+                                     e => filtered_io_error!(
+                                         e, ErrorKind::NotFound => Level::DEBUG,
+                                         "failed to remove consumed file", path=?to_consume));
                     }
                 }
 
@@ -263,13 +301,22 @@ fn consume_directory(
 
         // It's OK if the directory is already gone (and thus empty).
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+        Err(err) => Err(chain_error!(err, "failed to list directory", path=?to_consume)),
     }
 }
 
 /// Creates `bucket` if it does not already exists.
+#[instrument(level = "debug")]
 fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
-    if matches!(bucket.location(), Ok((_, 200))) {
+    let bucket_location = bucket.location().map_err(|e| {
+        chain_debug!(
+            e,
+            "failed to get buccket location",
+            name=%bucket.name(),
+            region=?bucket.region()
+        )
+    });
+    if matches!(bucket_location, Ok((_, 200))) {
         return Ok(());
     }
 
@@ -292,10 +339,11 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
         {
             Ok(())
         }
-        _ => Err(Error::new(
-            ErrorKind::Other,
-            "failed to create bucket in S3",
-        )),
+        Ok(response) => Err(fresh_warn!("failed to create bucket in S3",
+                                        response=?(response.response_code, response.response_text),
+                                        name=?bucket.name(), region=?bucket.region())),
+        Err(e) => Err(chain_warn!(e, "failed to create bucket in S3",
+                        name=?bucket.name(), region=?bucket.region())),
     }
 }
 
@@ -309,6 +357,8 @@ fn create_target(
 ) -> Result<Bucket> {
     use ReplicationTarget::*;
 
+    let _span = debug_span!("create_target", ?target);
+
     match target {
         S3(s3) => {
             let region = if let Some(endpoint) = &s3.endpoint {
@@ -319,12 +369,12 @@ fn create_target(
             } else {
                 s3.region
                     .parse()
-                    .map_err(|_| Error::new(ErrorKind::Other, "failed to parse region"))?
+                    .map_err(|e| chain_error!(e, "failed to parse S3 region", ?s3))?
             };
 
             let bucket_name = bucket_extractor(&s3);
             let mut bucket = Bucket::new(bucket_name, region, creds)
-                .map_err(|_| Error::new(ErrorKind::Other, "failed to create bucket object"))?;
+                .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
 
             if s3.domain_addressing {
                 bucket.set_subdomain_style();
@@ -342,6 +392,7 @@ fn create_target(
 }
 
 /// Attempts to publish the `contents` to `name` in all `targets`.
+#[instrument(level = "debug")]
 fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
@@ -350,11 +401,13 @@ fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()>
 
     let blob_name = name
         .to_str()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "invalid name"))?;
+        .ok_or_else(|| fresh_error!("invalid name", ?name))?;
 
     let mut bytes = Vec::new();
     // TODO: check that chunk fingerprints match, check that directories checksum?
-    contents.read_to_end(&mut bytes)?;
+    contents
+        .read_to_end(&mut bytes)
+        .map_err(|e| chain_error!(e, "failed to read file contents", ?blob_name))?;
 
     for target in targets {
         for i in 0..=COPY_RETRY_LIMIT {
@@ -362,20 +415,40 @@ fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()>
                 Ok((_, code)) if (200..300).contains(&code) => {
                     break;
                 }
-                Ok((_, code)) if code < 500 => {
+                Ok((body, code)) if code < 500 => {
                     // Permanent failure.  In theory, we should maybe
                     // retry on 400: RequestTimeout, but we'll catch
                     // it in the next background scan.
-                    return Err(Error::new(ErrorKind::Other, "failed to post chunk"));
+                    return Err(chain_error!(
+                        (body, code),
+                        "failed to post chunk",
+                        ?blob_name,
+                        len = bytes.len()
+                    ));
                 }
-                _ => {
+                err => {
                     if i == COPY_RETRY_LIMIT {
-                        return Err(Error::new(ErrorKind::Other, "transient failure"));
+                        return Err(chain_warn!(
+                            err,
+                            "reached retry limit",
+                            ?blob_name,
+                            COPY_RETRY_LIMIT,
+                            len = bytes.len()
+                        ));
                     }
 
                     let sleep = COPY_RETRY_BASE_WAIT.mul_f64(COPY_RETRY_MULTIPLIER.powi(i));
                     let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
-                    std::thread::sleep(sleep.mul_f64(jitter_scale));
+                    let backoff = sleep.mul_f64(jitter_scale);
+
+                    tracing::info!(
+                        ?err,
+                        ?backoff,
+                        ?blob_name,
+                        len = bytes.len(),
+                        "backing off after a failed PUT."
+                    );
+                    std::thread::sleep(backoff);
                 }
             }
         }
@@ -387,38 +460,45 @@ fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()>
 /// Fetches the contents of blob `name` in `target`'s chunk bucket.
 #[cfg(feature = "verneuil_test_vfs")]
 fn fetch_chunk_from_one_target(target: &ReplicationTarget, name: &str) -> Result<Option<Vec<u8>>> {
-    let creds = Credentials::default()
-        .map_err(|_| Error::new(ErrorKind::Other, "failed to get credentials"))?;
+    let creds = Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
     let bucket = create_target(target, |s3| &s3.chunk_bucket, creds)?;
 
     match bucket.get_object(name) {
         Ok((payload, 200)) => Ok(Some(payload)),
         Ok((_, 404)) => Ok(None),
-        Ok(_) => Err(Error::new(ErrorKind::Other, "failed to get chunk")),
-        _ => Err(Error::new(ErrorKind::Other, "failed to connect")),
+        ret => Err(chain_error!(ret, "failed to get chunk")),
     }
 }
 
 /// Returns whether the directory at `path` is empty or just does
 /// not exist at all.
+#[instrument(level = "debug")]
 fn directory_is_empty_or_absent(path: &Path) -> Result<bool> {
     match std::fs::read_dir(path) {
         Ok(mut dirents) => Ok(dirents.next().is_none()),
         // It's OK if the directory is already gone (and thus empty).
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(err),
+        Err(err) => Err(chain_error!(
+            err,
+            "failed to list directory contents",
+            ?path
+        )),
     }
 }
 
 /// Returns a tuple that identifies a given file; if a given path has
 /// the same identifier, it is the same (unless someone is maliciously
 /// tampering with it).
+#[instrument(level = "debug")]
 fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64, i64, i64)> {
     use std::os::unix::fs::MetadataExt;
 
-    let meta = file.metadata()?;
+    let meta = file
+        .metadata()
+        .map_err(|e| chain_error!(e, "failed to stat file"))?;
     Ok((
-        meta.created()?,
+        meta.created()
+            .map_err(|e| chain_error!(e, "failed to compute file creation time", ?meta))?,
         meta.len(),
         meta.dev(),
         meta.ino(),
@@ -427,6 +507,7 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
     ))
 }
 
+#[derive(Debug)]
 struct CopierWorker {
     work: crossbeam_channel::Receiver<PathBuf>,
     governor: Arc<Governor>,
@@ -434,6 +515,7 @@ struct CopierWorker {
 
 impl CopierWorker {
     /// Sleeps until the governor lets us fire the next set of API calls.
+    #[instrument(level = "debug")]
     fn pace(&self) {
         use rand::Rng;
 
@@ -459,8 +541,9 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<()> {
-        let (ready, _file) =
-            replication_buffer::snapshot_ready_directory(parent.clone()).map_err(|e| e.to_io())?;
+        let _span = info_span!("handle_ready_directory", ?targets, ?parent);
+
+        let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
 
         {
             let chunks_buckets = targets
@@ -509,7 +592,8 @@ impl CopierWorker {
         }
 
         // And now try to get rid of the hopefully empty directory.
-        let _ = replication_buffer::remove_ready_directory_if_empty(parent);
+        drop_result!(replication_buffer::remove_ready_directory_if_empty(parent),
+                     e => chain_info!(e, "failed to clean up ready directory"));
 
         Ok(())
     }
@@ -525,6 +609,8 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<()> {
+        let _span = info_span!("handle_staging_directory", ?targets, ?parent);
+
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
         let chunks_directory = replication_buffer::directory_chunks(staging.clone());
         let meta_directory = replication_buffer::directory_meta(staging);
@@ -579,9 +665,9 @@ impl CopierWorker {
         // We must now make sure that we have published all the chunks
         // before publishing the meta files.
         if !directory_is_empty_or_absent(&chunks_directory)? {
-            return Err(Error::new(
-                ErrorKind::Other,
+            return Err(fresh_info!(
                 "unpublished staged chunks remain",
+                ?chunks_directory
             ));
         }
 
@@ -593,8 +679,11 @@ impl CopierWorker {
         // exist, either that didn't happen, or another copier already
         // replicated its contents.  Either way, it's safe to copy the
         // meta files (unless they have changed).
-        if !directory_is_empty_or_absent(&replication_buffer::mutable_ready_directory(parent))? {
-            return Err(Error::new(ErrorKind::Other, "ready directory exists"));
+        {
+            let ready_directory = replication_buffer::mutable_ready_directory(parent);
+            if !directory_is_empty_or_absent(&ready_directory)? {
+                return Err(fresh_info!("ready directory exists", ?ready_directory));
+            }
         }
 
         {
@@ -628,8 +717,11 @@ impl CopierWorker {
 
     /// Processes one spooling directory that should be ready for
     /// replication.
+    #[instrument]
     fn handle_spooling_directory(&self, spool: PathBuf) {
-        if let Ok(creds) = Credentials::default() {
+        let creds_or =
+            Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"));
+        if let Ok(creds) = creds_or {
             // Try to read the metadata JSON, which tells us where to
             // replicate the chunks and meta files.  If we can't do
             // that, leave this precious data where it is...  We don't
@@ -639,16 +731,26 @@ impl CopierWorker {
             // data we keep around.
             let targets_or: Result<ReplicationTargetList> = (|| {
                 let metadata = replication_buffer::buffer_metadata_file(spool.clone());
-                Ok(serde_json::from_slice(&std::fs::read(&metadata)?)?)
+                let contents = std::fs::read(&*metadata)
+                    .map_err(|e| chain_error!(e, "failed to read .metadata file", ?metadata))?;
+                let parsed = serde_json::from_slice(&contents).map_err(|e| {
+                    chain_error!(e, "failed to parse .metadata file", ?metadata, ?contents)
+                })?;
+
+                Ok(parsed)
             })();
 
             if let Ok(targets) = targets_or {
                 let ready = replication_buffer::mutable_ready_directory(spool.clone());
-                if matches!(directory_is_empty_or_absent(&ready), Ok(true)) {
+                let is_empty = directory_is_empty_or_absent(&ready)
+                    .map_err(|e| chain_debug!(e, "failed to list directory", ?ready));
+                if matches!(is_empty, Ok(true)) {
                     // It's not an error if this fails: we expect
                     // failures when `ready` becomes non-empty, and
                     // we never lose data.
-                    let _ = std::fs::remove_dir(&ready);
+                    drop_result!(std::fs::remove_dir(&ready),
+                                 e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+                                                         "failed to remove ready directory", ?ready));
                 } else {
                     // Failures are expected when concurrent processes
                     // or copiers work on the same `path`.  Even when
@@ -657,7 +759,8 @@ impl CopierWorker {
                     // choose to keep it untouched rather than drop
                     // data that we have failed to copy to the
                     // replication targets.
-                    let _ = self.handle_ready_directory(&targets, creds.clone(), spool.clone());
+                    drop_result!(self.handle_ready_directory(&targets, creds.clone(), spool.clone()),
+                                 e => chain_info!(e, "failed to handle ready directory", ?spool));
 
                     // We've done some work here (handled a non-empty
                     // "ready" directory).  If the governor isn't
@@ -671,7 +774,8 @@ impl CopierWorker {
                 // Opportunistically try to copy from the "staging"
                 // directory.  That's never staler than "ready", so we do
                 // not go backward in our replication.
-                let _ = self.handle_staging_directory(&targets, creds.clone(), spool.clone());
+                drop_result!(self.handle_staging_directory(&targets, creds.clone(), spool.clone()),
+                             e => chain_info!(e, "failed to handle staging directory", ?spool));
 
                 // And now see if the ready directory was updated again.
                 // We only upload meta files (directory protos) if we
@@ -681,7 +785,8 @@ impl CopierWorker {
                 // the "ready" directory must be at least as recent as
                 // what we found in staging, so, again, replication
                 // cannot go backwards.
-                let _ = self.handle_ready_directory(&targets, creds, spool);
+                drop_result!(self.handle_ready_directory(&targets, creds, spool.clone()),
+                             e => chain_info!(e, "failed to rehandle ready directory", ?spool));
 
                 // When we get here, the remote data should be at least as
                 // fresh as the last staged snapshot when we entered the
@@ -737,6 +842,7 @@ impl CopierBackend {
     /// Attempts to send `work` to the spool directory replication workers.
     /// Returns None on success, `work` if the channel is full, and
     /// panics if the workers disconnected.
+    #[instrument]
     fn send_work(&self, work: PathBuf) -> Option<PathBuf> {
         use crossbeam_channel::TrySendError::*;
         match self.workers.try_send(work) {
@@ -748,6 +854,7 @@ impl CopierBackend {
 
     /// Handles the next request from our channels.  Returns true on
     /// success, false if the worker thread should abort.
+    #[instrument(level = "debug")]
     fn handle_one_request(&mut self, timeout: Duration) -> bool {
         use ActiveSetMaintenance::*;
 
@@ -806,6 +913,12 @@ impl CopierBackend {
         let mut active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
 
         loop {
+            let _span = info_span!(
+                "handle_requests",
+                num_active = self.active_spool_paths.len(),
+                num_bg_scan = active_set.len()
+            );
+
             let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
             if !self.handle_one_request(BACKGROUND_SCAN_PERIOD.mul_f64(jitter_scale)) {
                 break;
@@ -821,11 +934,18 @@ impl CopierBackend {
             }
         }
 
+        let _span = info_span!(
+            "handle_requests_shutdown",
+            num_active = self.active_spool_paths.len(),
+            num_bg_scan = active_set.len()
+        );
+
         // Try to handle all ready buffers before leaving.  Don't do
         // anything if the work channel is full: we're probably
         // shutting down, and it's unlikely that we'll complete all
         // that work.
         while let Ok(ready) = self.ready_buffers.try_recv() {
+            let _span = info_span!("handle_requests_shutdown_ready_buffers", ?ready);
             // Remove from the set of active paths: we want to skip
             // anything that's not active anymore, and we don't want
             // to scan directories twice during shutdown.
@@ -836,6 +956,7 @@ impl CopierBackend {
 
         // One final pass through all remaining spooling directories.
         for path in shuffle_active_set(&self.active_spool_paths, &mut rng) {
+            let _span = info_span!("handle_requests_shutdown_bg_scan", ?path);
             self.send_work(path);
         }
     }
