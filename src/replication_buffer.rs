@@ -253,8 +253,8 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
 /// Creates a temporary file, populates it with `worker`, and
 /// publishes it to `target` on success.
 ///
-/// Fails with `AlreadyExists` if the target file exists.
-fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>) -> Result<T> {
+/// Returns Ok(()) if the target file exists.
+fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) -> Result<()> {
     use std::os::unix::io::FromRawFd;
 
     // See c/file_ops.h
@@ -264,10 +264,7 @@ fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>
     }
 
     if target.exists() {
-        return Err(Error::new(
-            ErrorKind::AlreadyExists,
-            "target already exists",
-        ));
+        return Ok(());
     }
 
     let parent = target
@@ -285,7 +282,12 @@ fn call_with_temp_file<T>(target: &Path, worker: impl Fn(&mut File) -> Result<T>
     let result = worker(&mut file)?;
 
     if unsafe { verneuil__link_temp_file(fd, target_str.as_ptr()) } < 0 {
-        return Err(Error::last_os_error());
+        let error = Error::last_os_error();
+        if error.kind() == ErrorKind::AlreadyExists {
+            return Ok(());
+        }
+
+        return Err(error);
     }
 
     Ok(result)
@@ -536,10 +538,6 @@ impl ReplicationBuffer {
         target.push(STAGING);
         target.push(CHUNKS);
         target.push(&chunk_name);
-
-        if target.exists() {
-            return Ok(());
-        }
 
         call_with_temp_file(&target, |dst| dst.write_all(data))
     }

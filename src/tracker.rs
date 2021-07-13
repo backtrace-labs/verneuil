@@ -184,7 +184,6 @@ impl Tracker {
                 // Remember the chunk's fingerprint if it's now staged.
                 match repl.stage_chunk(fprint, slice) {
                     Ok(_) => Some(fprint),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Some(fprint),
                     Err(_) => None,
                 }
             } else {
@@ -321,11 +320,7 @@ impl Tracker {
                 assert_eq!(fprint, expected);
             }
 
-            match repl.stage_chunk(fprint, slice) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                x => x,
-            }?;
-
+            repl.stage_chunk(fprint, slice)?;
             let ret = fprint != chunk_fprints[chunk_index as usize];
             chunk_fprints[chunk_index as usize] = fprint;
             Ok(ret)
