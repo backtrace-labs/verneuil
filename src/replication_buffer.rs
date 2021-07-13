@@ -522,8 +522,20 @@ impl ReplicationBuffer {
         if overwrite_meta || !buf.exists() {
             use std::io::Write;
 
+            let mut scratch = self.spooling_directory.clone();
+            scratch.push(STAGING);
+            scratch.push(SCRATCH);
+
             let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
-            let _ = call_with_temp_file(&buf, |file| file.write_all(&json_bytes));
+
+            if let Ok(temp) = tempfile::Builder::new()
+                .prefix(&(process_id() + "."))
+                .suffix(".tmp")
+                .tempfile_in(&scratch) {
+                    if let Ok(()) = temp.as_file().write_all(&json_bytes) {
+                        let _ = temp.persist(&buf);
+                }
+            }
         }
     }
 
