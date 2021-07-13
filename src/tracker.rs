@@ -8,9 +8,13 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use tracing::instrument;
 use umash::Fingerprint;
 use uuid::Uuid;
 
+use crate::chain_error;
+use crate::chain_info;
+use crate::chain_warn;
 use crate::copier::Copier;
 use crate::directory_schema::clear_version_id;
 use crate::directory_schema::extract_version_id;
@@ -20,8 +24,12 @@ use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::update_version_id;
 use crate::directory_schema::Directory;
 use crate::directory_schema::DirectoryV1;
+use crate::drop_result;
+use crate::fresh_error;
+use crate::fresh_warn;
 use crate::replication_buffer::ReplicationBuffer;
 use crate::replication_target::ReplicationTargetList;
+use crate::result::Result;
 
 /// We snapshot db files in 64KB content-addressed chunks.
 const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
@@ -93,20 +101,22 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
 }
 
 impl Tracker {
-    pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker, &'static str> {
+    #[instrument]
+    pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker> {
         use std::os::unix::io::FromRawFd;
 
         if fd < 0 {
-            return Err("received negative fd");
+            return Err(fresh_error!("received negative fd", fd));
         }
 
         let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
         let string = unsafe { CStr::from_ptr(c_path) }
             .to_str()
-            .map_err(|_| "path is not valid utf-8")?
+            .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let path = std::fs::canonicalize(string).map_err(|_| "failed to canonicalize path")?;
+        let path = std::fs::canonicalize(&string)
+            .map_err(|e| chain_error!(e, "failed to canonicalize path", %string))?;
 
         assert_ne!(
             path.as_os_str().to_str(),
@@ -115,7 +125,7 @@ impl Tracker {
         );
 
         let buffer = ReplicationBuffer::new(&path, &file)
-            .map_err(|_| "failed to create replication buffer")?;
+            .map_err(|e| chain_error!(e, "failed to create replication buffer", ?path))?;
         let replication_targets = crate::replication_target::get_default_replication_targets();
         let copier;
 
@@ -147,6 +157,7 @@ impl Tracker {
     /// immediately after acquiring an exclusive lock on the tracked
     /// file, and lets us remember the file's version before we change
     /// it.
+    #[instrument]
     pub fn note_exclusive_lock(&mut self) {
         if !self.previous_version_id.is_empty() {
             return;
@@ -160,14 +171,15 @@ impl Tracker {
 
     /// Notes that we are about to update the tracked file, and
     /// that bytes in [offset, offset + count) are about to change.
-    #[inline]
+    #[instrument(level = "trace")]
     pub fn flag_write(&mut self, buf: *const u8, offset: u64, count: u64) {
         // Attempt to update the version id xattr if this is the
         // first write since our last snapshot.
         if self.backing_file_state != MutationState::Dirty {
             // Any error isn't fatal: we can still use the header
             // fingerprint.
-            let _ = update_version_id(&self.file, self.cached_uuid.take());
+            drop_result!(update_version_id(&self.file, self.cached_uuid.take()),
+                         e => chain_warn!(e, "failed to update version id", path=?self.path));
         }
 
         self.backing_file_state = MutationState::Dirty;
@@ -184,7 +196,11 @@ impl Tracker {
                 // Remember the chunk's fingerprint if it's now staged.
                 match repl.stage_chunk(fprint, slice) {
                     Ok(_) => Some(fprint),
-                    Err(_) => None,
+                    Err(e) => {
+                        let _ = chain_warn!(e, "failed to stage chunk preemptively",
+                                            path=?self.path, count, offset, ?fprint);
+                        None
+                    }
                 }
             } else {
                 None
@@ -205,15 +221,20 @@ impl Tracker {
     /// Snapshots all the 64KB chunks in the tracked file, and returns
     /// the file's size as well, a list of chunk fingerprints, and the
     /// number of chunks that were actually snapshotted.
+    #[instrument]
     fn snapshot_chunks(
         &self,
         repl: &ReplicationBuffer,
         mut base: Option<Vec<Fingerprint>>,
-    ) -> std::io::Result<(u64, Vec<Fingerprint>, usize)> {
+    ) -> Result<(u64, Vec<Fingerprint>, usize)> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        let len = self.file.metadata()?.len();
+        let len = self
+            .file
+            .metadata()
+            .map_err(|e| chain_error!(e, "failed to stat file", ?self.path))?
+            .len();
         let num_chunks = len / SNAPSHOT_GRANULARITY
             + (if (len % SNAPSHOT_GRANULARITY) > 0 {
                 1
@@ -283,7 +304,7 @@ impl Tracker {
         // `chunk_index`.
         //
         // Returns true if the new chunk fprint differs from the old one.
-        let update = &mut |chunk_index, expected_fprint| -> std::io::Result<bool> {
+        let update = &mut |chunk_index, expected_fprint| -> Result<bool> {
             num_snapshotted += 1;
 
             // Fast-path in non-test mode.  In test mode, we always
@@ -311,7 +332,9 @@ impl Tracker {
             };
 
             let slice = &mut buf[0..(end - begin) as usize];
-            self.file.read_exact_at(slice, begin)?;
+            self.file.read_exact_at(slice, begin).map_err(
+                |e| chain_error!(e, "failed to read chunk", path=?self.path, begin, end),
+            )?;
 
             let fprint = fingerprint_file_chunk(slice);
 
@@ -320,7 +343,7 @@ impl Tracker {
                 assert_eq!(fprint, expected);
             }
 
-            repl.stage_chunk(fprint, slice).map_err(|e| e.to_io())?;
+            repl.stage_chunk(fprint, slice)?;
             let ret = fprint != chunk_fprints[chunk_index as usize];
             chunk_fprints[chunk_index as usize] = fprint;
             Ok(ret)
@@ -355,9 +378,13 @@ impl Tracker {
                 // We don't *have* to get these additional chunks, so
                 // we don't want to bubble up errors.
                 //
-                // However, if we successfully find out that the new
-                // chunk is actually dirty, force a full scan.
-                if let Ok(true) = update(random_index, None) {
+                // However, if we can't confirm that the chunk is
+                // clean, force a full scan.
+                let result = update(random_index, None)
+                    .map_err(|e| chain_error!(e, "failed to scrub random clean chunk", path=?self.path, random_index));
+                if !matches!(result, Ok(false)) {
+                    tracing::error!(path=?self.path, random_index, ?result,
+                                    "forcing resynchronisation scan");
                     backfill_begin = 0;
                 }
             }
@@ -374,12 +401,17 @@ impl Tracker {
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
-    fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<(), &'static str> {
-        let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
+    #[instrument]
+    fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<()> {
+        let header_fprint = fingerprint_sqlite_header(&self.file)
+            .ok_or_else(|| fresh_warn!("invalid db file", path=?self.path))?;
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
 
-        let mut current_directory: Option<Directory> =
-            buf.read_staged_directory(&self.path).ok().flatten();
+        let mut current_directory: Option<Directory> = buf
+            .read_staged_directory(&self.path)
+            .map_err(|e| chain_info!(e, "failed to read staged directory file"))
+            .ok()
+            .flatten();
 
         // If we're snapshotting after a write, we always want to go
         // through the whole process.  We made some changes, let's
@@ -429,7 +461,9 @@ impl Tracker {
                 || self.previous_version_id == version_id
                 || self.dirty_chunks.is_empty()
             {
-                // TODO: log here.
+                tracing::info!(path=?self.path, ?self.previous_version_id,
+                               ?version_id, num_dirty=self.dirty_chunks.len(),
+                               "forcing a full snapshot due to invalid version ids");
                 up_to_date = false;
             }
 
@@ -473,9 +507,7 @@ impl Tracker {
         }
 
         let (copied, chunks) = {
-            let (len, chunks, copied) = self
-                .snapshot_chunks(&buf, base_fprints)
-                .map_err(|_| "failed to snapshot chunks")?;
+            let (len, chunks, copied) = self.snapshot_chunks(&buf, base_fprints)?;
 
             let flattened = flatten_chunk_fprints(&chunks);
             let directory_fprint = fingerprint_v1_chunk_list(&flattened);
@@ -489,20 +521,24 @@ impl Tracker {
                 }),
             };
 
-            buf.publish_directory(&self.path, &directory)
-                .map_err(|_| "failed to publish directory file")?;
+            buf.publish_directory(&self.path, &directory)?;
 
             (copied, chunks)
         };
 
         let mut published = false;
         // If we can publish a new ready directory, try to do so.
-        if matches!(buf.read_ready_directory(&self.path), Ok(None)) {
-            let ready = buf
-                .prepare_ready_buffer(&chunks)
-                .map_err(|_| "failed to prepare ready buffer")?;
+        if matches!(
+            buf.read_ready_directory(&self.path)
+                .map_err(|e| chain_info!(e, "failed to read ready directory", path=?self.path)),
+            Ok(None)
+        ) {
+            let ready = buf.prepare_ready_buffer(&chunks)?;
 
-            published = buf.publish_ready_buffer(ready).is_ok();
+            published = buf
+                .publish_ready_buffer(ready)
+                .map_err(|e| chain_info!(e, "failed to publish ready buffer", path=?self.path))
+                .is_ok();
         }
 
         #[cfg(feature = "verneuil_test_validate_reads")]
@@ -517,7 +553,8 @@ impl Tracker {
         if published {
             // If we just published our snapshot to the ready
             // buffer, we can delete all chunks.
-            let _ = buf.gc_chunks(&[]);
+            drop_result!(buf.gc_chunks(&[]),
+                        e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
         } else {
             use rand::Rng;
 
@@ -536,7 +573,8 @@ impl Tracker {
             // amortise the wasted work as constant overhead for
             // each call to `snapshot_file_contents`.
             if copied >= rng.gen_range(0..=chunks.len()) {
-                let _ = buf.gc_chunks(&chunks);
+                drop_result!(buf.gc_chunks(&chunks),
+                            e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
             }
         }
 
@@ -548,7 +586,8 @@ impl Tracker {
         //
         // Either way, we can delete everything; clean up is
         // also opportunistic, so failure is OK.
-        let _ = buf.cleanup_scratch_directory();
+        drop_result!(buf.cleanup_scratch_directory(),
+                     e => chain_info!(e, "failed to clear scratch directory", path=?self.path));
 
         #[cfg(feature = "verneuil_test_validate_writes")]
         self.compare_snapshot(&buf).expect("snapshots must match");
@@ -559,7 +598,8 @@ impl Tracker {
     /// it exists.
     ///
     /// Must be called with a read lock held on the underlying file.
-    pub fn snapshot(&mut self) -> Result<(), &'static str> {
+    #[instrument]
+    pub fn snapshot(&mut self) -> Result<()> {
         let ret = (|| {
             if let Some(buffer) = &self.buffer {
                 #[cfg(feature = "verneuil_test_validate_reads")]
@@ -583,7 +623,9 @@ impl Tracker {
         // state from scratch: we *know* the current replication data
         // is currently out of sync.
         if ret.is_err() {
-            let _ = clear_version_id(&self.file);
+            drop_result!(clear_version_id(&self.file),
+                         e => chain_error!(e, "failed to clear version xattr after failed snapshot",
+                                           snapshot_err=?ret));
         }
 
         ret
@@ -592,6 +634,7 @@ impl Tracker {
     /// Performs test-only checks before a transaction's initial lock
     /// acquisition.
     #[inline]
+    #[instrument]
     pub fn pre_lock_checks(&self) {
         #[cfg(feature = "verneuil_test_validate_reads")]
         if let Some(buffer) = &self.buffer {
@@ -737,7 +780,7 @@ impl Tracker {
 
     /// Attempts to assert that the snapshot's contents match that of
     /// our db file, and that the ready snapshot is valid.
-    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> std::io::Result<()> {
+    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> Result<()> {
         use blake2b_simd::Params;
         use std::os::unix::io::AsRawFd;
 
@@ -751,7 +794,8 @@ impl Tracker {
             Err(_) => return Ok(()),
             Ok(mut file) => {
                 let mut hasher = Params::new().hash_length(32).to_state();
-                std::io::copy(&mut file, &mut hasher)?;
+                std::io::copy(&mut file, &mut hasher)
+                    .map_err(|e| chain_error!(e, "failed to hash base file", path=?self.path))?;
                 hasher.finalize()
             }
         };
