@@ -363,10 +363,15 @@ pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
 }
 
 /// Attempts to read a valid Directory message from `file_path`.
-fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
+/// Returns Ok(None) if the file does not exist.
+fn read_directory_at_path(file_path: &Path) -> Result<Option<Directory>> {
     use prost::Message;
 
-    let directory = Directory::decode(&*std::fs::read(file_path)?)
+    let contents = match std::fs::read(file_path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        x => x?,
+    };
+    let directory = Directory::decode(&*contents)
         .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))?;
 
     match &directory.v1 {
@@ -376,7 +381,7 @@ fn read_directory_at_path(file_path: &Path) -> Result<Directory> {
             if Some(fingerprint_v1_chunk_list(&v1.chunks).into()) == v1.contents_fprint
                 && (v1.chunks.len() % 2) == 0 =>
         {
-            Ok(directory)
+            Ok(Some(directory))
         },
         Some(_) => Err(Error::new(ErrorKind::Other, "invalid chunk list")),
         None => Err(Error::new(ErrorKind::Other, "v1 format not found")),
@@ -594,7 +599,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current ready directory file.
-    pub fn read_ready_directory(&self, db_path: &Path) -> Result<Directory> {
+    pub fn read_ready_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(META);
@@ -603,7 +608,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current staged directory file.
-    pub fn read_staged_directory(&self, db_path: &Path) -> Result<Directory> {
+    pub fn read_staged_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);

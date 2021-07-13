@@ -378,7 +378,8 @@ impl Tracker {
         let header_fprint = fingerprint_sqlite_header(&self.file).ok_or("invalid db file")?;
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
 
-        let mut current_directory: Option<Directory> = buf.read_staged_directory(&self.path).ok();
+        let mut current_directory: Option<Directory> =
+            buf.read_staged_directory(&self.path).ok().flatten();
 
         // If we're snapshotting after a write, we always want to go
         // through the whole process.  We made some changes, let's
@@ -496,8 +497,7 @@ impl Tracker {
 
         let mut published = false;
         // If we can publish a new ready directory, try to do so.
-        if matches!(buf.read_ready_directory(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-        {
+        if matches!(buf.read_ready_directory(&self.path), Ok(None)) {
             let ready = buf
                 .prepare_ready_buffer(&chunks)
                 .map_err(|_| "failed to prepare ready buffer")?;
@@ -688,14 +688,15 @@ impl Tracker {
     fn validate_snapshot(
         &self,
         buf: &ReplicationBuffer,
-        directory_or: std::io::Result<Directory>,
+        directory_or: std::io::Result<Option<Directory>>,
         from_staging: bool,
     ) -> std::io::Result<()> {
         let directory = match directory_or {
             // If the directory file can't be found, assume it was
             // replicated correctly, and checked earlier.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            result => result?,
+            Ok(None) => return Ok(()),
+            Ok(Some(directory)) => directory,
+            Err(err) => return Err(err),
         };
 
         let zero_fprint = fingerprint_for_zero_filled_chunk();
@@ -759,6 +760,7 @@ impl Tracker {
         let directory = buf
             .read_staged_directory(&self.path)
             .expect("directory must parse")
+            .expect("directory must exist")
             .v1
             .expect("v1 component must be populated.");
 
