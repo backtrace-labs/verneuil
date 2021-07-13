@@ -176,6 +176,11 @@ pub unsafe extern "C" fn sqlite3_verneuil_init(
 pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -> i32 {
     use replication_target::*;
 
+    // Send tracing calls to stdout, and converts any log! call to
+    // traces.
+    let _ = tracing_subscriber::fmt::try_init();
+    tracing::info!("tracing initialized");
+
     crate::replication_buffer::ENABLE_AUTO_CLEANUP
         .store(true, std::sync::atomic::Ordering::Relaxed);
 

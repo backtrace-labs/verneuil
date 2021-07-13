@@ -82,4 +82,5 @@ sleep 5;
 #  valgrindtest
 export AWS_ACCESS_KEY_ID=VERNEUIL_TEST_ACCOUNT
 export AWS_SECRET_ACCESS_KEY=VERNEUIL_TEST_KEY
+export RUST_LOG=off  # Disable logging by default: some sqlite tests take over stdin/stdout.
 make "OPTS=$OPTS" "CFLAGS=$CFLAGS" "LIBS=release/libverneuil.a -lpthread -lm -ldl" test "$@"

@@ -14,7 +14,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 default = ["verneuil_vendor_sqlite"]
 verneuil_vendor_sqlite = []
 verneuil_compat_no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
-verneuil_test_vfs = ["blake2b_simd"]  # Build an archive for sqlite3 tests.
+verneuil_test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
 verneuil_test_minio = []  # Publish data to 127.0.0.1:7777
 verneuil_test_validate_writes = ["verneuil_test_vfs"]  # Validate snapshots after writes
 verneuil_test_validate_reads = ["verneuil_test_vfs"]  # Validate snapshots after reads as well (extra slow)
@@ -35,6 +35,8 @@ rust-s3 = { version = "0.27.0-rc4", default-features = false, features = ["sync-
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.2", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 umash = "0.1.2"
 uuid = { version = "0.8", features = ["v4"] }
 
