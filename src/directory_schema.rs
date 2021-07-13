@@ -1,8 +1,11 @@
 //! Replicated sqlite DBs are represented as protobuf "directory"
 //! metadata that refer to content-addressed chunks by fingerprint.
-
+use tracing::instrument;
 use umash::Fingerprint;
 use uuid::Uuid;
+
+use crate::result::Result;
+use crate::warn_from_os;
 
 /// A umash fingerprint.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -77,6 +80,7 @@ pub(crate) struct Directory {
 /// as part of every transaction commit . Fingerprinting the first 100 bytes
 /// of a sqlite database should thus give us something that reliably changes
 /// whenever the file's contents are modified.
+#[instrument]
 pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerprint> {
     use std::os::unix::fs::FileExt;
 
@@ -88,7 +92,10 @@ pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerpr
 
     let mut buf = [0u8; HEADER_SIZE];
     match file.read_exact_at(&mut buf, 0) {
-        Err(_) => None,
+        Err(error) => {
+            tracing::info!(%error, "failed to read sqlite header");
+            None
+        }
         Ok(_) => Some(Fingerprint::generate(&HEADER_PARAMS, 0, &buf)),
     }
 }
@@ -108,6 +115,7 @@ const XATTR_MAX_VALUE_SIZE: usize = 128;
 ///
 /// An empty return value means we failed to extract a version id, and
 /// must assume nothing matches.
+#[instrument]
 pub(crate) fn extract_version_id(
     file: &std::fs::File,
     mut fprint_or: Option<Fingerprint>,
@@ -138,6 +146,10 @@ pub(crate) fn extract_version_id(
 
     // xattrs work, but we can't get one.  Assume the worst.
     if ret == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(?error, "failed to read version xattr");
+        }
         buf.clear();
         return buf;
     }
@@ -161,9 +173,12 @@ pub(crate) fn extract_version_id(
     // Add a high resolution ctime if we can find it.  Unfortunately,
     // while the interface goes down to nanoseconds, reality is much
     // coarser, so the ctime by itself cannot suffice.
-    if let Ok(meta) = file.metadata() {
-        buf.extend(&meta.ctime().to_le_bytes());
-        buf.extend(&meta.ctime_nsec().to_le_bytes());
+    match file.metadata() {
+        Ok(meta) => {
+            buf.extend(&meta.ctime().to_le_bytes());
+            buf.extend(&meta.ctime_nsec().to_le_bytes());
+        }
+        Err(error) => tracing::error!(%error, "failed to read file metadata"),
     }
 
     // Finally, always append the sqlite fingerprint.  This way we
@@ -187,10 +202,8 @@ pub(crate) fn extract_version_id(
 /// that reads the version id always combines it with the file's ctime
 /// and sqlite header, which can mostly be trusted to change whenever
 /// sqlite writes to the file.
-pub(crate) fn update_version_id(
-    file: &std::fs::File,
-    cached_uuid: Option<Uuid>,
-) -> std::io::Result<()> {
+#[instrument]
+pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use uuid::adapter::Hyphenated;
 
@@ -226,13 +239,14 @@ pub(crate) fn update_version_id(
     if ret >= 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        Err(warn_from_os!("failed to update version xattr"))
     }
 }
 
 /// Erases the version id on `file`.  Change `Tracker`s will have to
 /// rebuild the replication state from scratch.
-pub(crate) fn clear_version_id(file: &std::fs::File) -> std::io::Result<()> {
+#[instrument]
+pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     extern "C" {
@@ -244,7 +258,7 @@ pub(crate) fn clear_version_id(file: &std::fs::File) -> std::io::Result<()> {
     if ret >= 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        Err(warn_from_os!("failed to clear version xattr"))
     }
 }
 

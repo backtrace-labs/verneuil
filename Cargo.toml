@@ -21,6 +21,7 @@ verneuil_test_validate_reads = ["verneuil_test_vfs"]  # Validate snapshots after
 verneuil_test_validate_all = ["verneuil_test_validate_writes", "verneuil_test_validate_reads"]
 
 [dependencies]
+backtrace = "0.3"
 # We use blake2b to compare the actual db file and our replicated snapshot,
 # but only during tests.
 blake2b_simd = { version = "0.5", optional = true }

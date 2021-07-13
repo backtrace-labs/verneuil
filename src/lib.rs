@@ -4,6 +4,7 @@ mod instance_id;
 mod process_id;
 mod replication_buffer;
 mod replication_target;
+mod result;
 mod sqlite_code;
 mod tracker;
 mod vfs_ops;
