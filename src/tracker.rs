@@ -320,7 +320,7 @@ impl Tracker {
                 assert_eq!(fprint, expected);
             }
 
-            repl.stage_chunk(fprint, slice)?;
+            repl.stage_chunk(fprint, slice).map_err(|e| e.to_io())?;
             let ret = fprint != chunk_fprints[chunk_index as usize];
             chunk_fprints[chunk_index as usize] = fprint;
             Ok(ret)
@@ -688,9 +688,9 @@ impl Tracker {
     fn validate_snapshot(
         &self,
         buf: &ReplicationBuffer,
-        directory_or: std::io::Result<Option<Directory>>,
+        directory_or: crate::result::Result<Option<Directory>>,
         from_staging: bool,
-    ) -> std::io::Result<()> {
+    ) -> crate::result::Result<()> {
         let directory = match directory_or {
             // If the directory file can't be found, assume it was
             // replicated correctly, and checked earlier.

@@ -109,19 +109,12 @@
 //! Combined with the RCU approach for the "ready" directory, we can
 //! guarantee progress both when `Tracker`s are idle, and when they're
 //! constantly churning.
-use crate::directory_schema::fingerprint_v1_chunk_list;
-use crate::directory_schema::Directory;
-use crate::instance_id;
-use crate::process_id::process_id;
-use crate::replication_target::ReplicationTargetList;
-
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io::Error;
 use std::io::ErrorKind;
-use std::io::Result;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -131,7 +124,24 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use tempfile::TempDir;
+use tracing::instrument;
+use tracing::Level;
 use umash::Fingerprint;
+
+use crate::chain_error;
+use crate::chain_info;
+use crate::directory_schema::fingerprint_v1_chunk_list;
+use crate::directory_schema::Directory;
+use crate::drop_result;
+use crate::error_from_os;
+use crate::filtered_io_error;
+use crate::filtered_os_error;
+use crate::fresh_error;
+use crate::fresh_info;
+use crate::instance_id;
+use crate::process_id::process_id;
+use crate::replication_target::ReplicationTargetList;
+use crate::result::Result;
 
 #[derive(Debug)]
 pub(crate) struct ReplicationBuffer {
@@ -168,6 +178,7 @@ pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
 
 /// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
+#[instrument]
 pub(crate) fn set_default_spooling_directory(
     path: &Path,
     permissions: std::fs::Permissions,
@@ -179,9 +190,10 @@ pub(crate) fn set_default_spooling_directory(
             return Ok(());
         }
 
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
+        return Err(fresh_info!(
             "default spooling directory already set",
+            ?old_path,
+            ?path
         ));
     }
 
@@ -189,8 +201,10 @@ pub(crate) fn set_default_spooling_directory(
     // `set_default_spooling_directory` to be called early enough that
     // there is no contention.
     if !path.exists() {
-        std::fs::create_dir_all(path)?;
-        std::fs::set_permissions(path, permissions)?;
+        std::fs::create_dir_all(path)
+            .map_err(|e| chain_error!(e, "failed to create directory", ?path))?;
+        std::fs::set_permissions(path, permissions.clone())
+            .map_err(|e| chain_error!(e, "failed to update permissions", ?path, ?permissions))?;
     }
 
     *default = Some(path.into());
@@ -209,13 +223,12 @@ fn replace_slashes(input: &str) -> String {
 /// ambiguous, but this mangled path will be combined with device and
 /// inode ids.
 fn mangle_path(path: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(path)?;
-    let string = canonical.as_os_str().to_str().ok_or_else(|| {
-        Error::new(
-            ErrorKind::Other,
-            "unable to convert canonical path to string",
-        )
-    })?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| chain_error!(e, "failed to canonicalize path", ?path))?;
+    let string = canonical
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| fresh_error!("unable to convert canonical path to string", ?canonical))?;
 
     Ok(replace_slashes(string))
 }
@@ -225,12 +238,15 @@ fn mangle_path(path: &Path) -> Result<String> {
 fn db_file_key(fd: &File) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let meta = fd.metadata()?;
+    let meta = fd
+        .metadata()
+        .map_err(|e| chain_error!(e, "failed to stat file", ?fd))?;
     Ok(format!("{}.{}", meta.dev(), meta.ino()))
 }
 
 /// Attempts to delete all directories in the parent of `goal_path`
 /// except `goal_path`.
+#[instrument]
 fn delete_stale_directories(goal_path: &Path) -> Result<()> {
     let mut parent = goal_path.to_owned();
     if !parent.pop() {
@@ -239,10 +255,17 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
 
     let goal_filename = goal_path.file_name();
 
-    for subdir in std::fs::read_dir(&parent)?.flatten() {
+    for subdir in std::fs::read_dir(&parent)
+        .map_err(|e| chain_info!(e, "failed to list parent directory", path=?goal_path, ?parent))?
+        .flatten()
+    {
         if Some(subdir.file_name().as_os_str()) != goal_filename {
             parent.push(subdir.file_name());
-            let _ = std::fs::remove_dir_all(&parent);
+            if let Err(error) = std::fs::remove_dir_all(&parent) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::info!(?parent, %error, "failed to remove sibling");
+                }
+            }
             parent.pop();
         }
     }
@@ -263,19 +286,20 @@ fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) 
         fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
     }
 
+    let _span = tracing::info_span!("call_with_temp_file", ?target);
     if target.exists() {
         return Ok(());
     }
 
-    let parent = target
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "no parent directory"))?;
-    let parent_str = CString::new(parent.as_os_str().as_bytes())?;
-    let target_str = CString::new(target.as_os_str().as_bytes())?;
+    let parent = target.parent().expect("parent directory must exist");
+    let parent_str = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|e| chain_error!(e, "unable to convert parent path to C string", ?parent))?;
+    let target_str = CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| chain_error!(e, "unable to convert target path to C string", ?target))?;
 
     let fd = unsafe { verneuil__open_temp_file(parent_str.as_ptr(), 0o444) };
     if fd < 0 {
-        return Err(Error::last_os_error());
+        return Err(error_from_os!("failed to open temporary file", ?parent_str));
     }
 
     let mut file = unsafe { File::from_raw_fd(fd) };
@@ -287,7 +311,11 @@ fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) 
             return Ok(());
         }
 
-        return Err(error);
+        return Err(chain_error!(
+            error,
+            "failed to publish temporary file",
+            ?target_str
+        ));
     }
 
     Ok(result)
@@ -330,7 +358,7 @@ fn percent_encode_path_uri(path: &Path) -> Result<String> {
     let string = path
         .as_os_str()
         .to_str()
-        .ok_or_else(|| Error::new(ErrorKind::Other, "unable to convert path to string"))?;
+        .ok_or_else(|| fresh_error!("failed to convert path to string", ?path))?;
     let path_hash = umash::full_str(&PARAMS, 0, 0, &string);
 
     let name = format!(
@@ -364,15 +392,17 @@ pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
 
 /// Attempts to read a valid Directory message from `file_path`.
 /// Returns Ok(None) if the file does not exist.
+#[instrument(level = "trace")]
 fn read_directory_at_path(file_path: &Path) -> Result<Option<Directory>> {
     use prost::Message;
 
     let contents = match std::fs::read(file_path) {
+        Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        x => x?,
+        Err(e) => return Err(chain_error!(e, "failed to read directory", ?file_path)),
     };
     let directory = Directory::decode(&*contents)
-        .map_err(|_| Error::new(ErrorKind::Other, "failed to parse proto directory"))?;
+        .map_err(|e| chain_error!(e, "failed to parse proto directory", ?file_path))?;
 
     match &directory.v1 {
         Some(v1)
@@ -383,8 +413,8 @@ fn read_directory_at_path(file_path: &Path) -> Result<Option<Directory>> {
         {
             Ok(Some(directory))
         },
-        Some(_) => Err(Error::new(ErrorKind::Other, "invalid chunk list")),
-        None => Err(Error::new(ErrorKind::Other, "v1 format not found")),
+        Some(_) => Err(fresh_error!("invalid chunk list", ?directory)),
+        None => Err(fresh_error!("v1 format not found", ?directory)),
     }
 }
 
@@ -409,6 +439,7 @@ pub(crate) fn mutable_ready_directory(parent: PathBuf) -> PathBuf {
 ///
 /// On success, returns a process-local path to that subdirectory, and
 /// a file object that must be kept alive to ensure the path is valid.
+#[instrument(level = "trace")]
 pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File)> {
     use std::os::unix::io::FromRawFd;
 
@@ -418,10 +449,15 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File
     }
 
     let ready = mutable_ready_directory(parent);
-    let ready_str = CString::new(ready.as_os_str().as_bytes())?;
+    let ready_str = CString::new(ready.as_os_str().as_bytes())
+        .map_err(|e| chain_error!(e, "failed to convert path to C string", ?ready))?;
     let fd = unsafe { verneuil__open_directory(ready_str.as_ptr()) };
     if fd < 0 {
-        return Err(Error::last_os_error());
+        return Err(filtered_os_error!(
+            ErrorKind::NotFound => Level::DEBUG,
+            "failed to open ready directory",
+            ?ready
+        ));
     }
 
     let file = unsafe { File::from_raw_fd(fd) };
@@ -430,11 +466,16 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File
 
 /// Attempts to remove the "ready" subdirectory of `parent`, if it is
 /// empty.
+#[instrument(level = "trace")]
 pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
     let mut ready = parent;
     ready.push(READY);
 
-    std::fs::remove_dir(ready)
+    match std::fs::remove_dir(&ready) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(chain_error!(e, "failed to remove ready directory", ?ready)),
+    }
 }
 
 /// Returns a path for the metadata file in this buffer directory.
@@ -474,6 +515,7 @@ impl ReplicationBuffer {
     ///
     /// Returns `Err` if the replication buffer directory could not be
     /// created.
+    #[instrument]
     pub fn new(db_path: &Path, fd: &File) -> Result<Option<ReplicationBuffer>> {
         if let Some(mut spooling) = DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
             // Add an instance id.
@@ -492,10 +534,18 @@ impl ReplicationBuffer {
             // for sqlite tests, which create a lot of dbs, none of
             // which have colliding names.
             if ENABLE_AUTO_CLEANUP.load(Ordering::Relaxed) {
-                let _ = delete_stale_directories(&spooling);
+                drop_result!(delete_stale_directories(&spooling),
+                             e => chain_info!(e, "failed to delete stale directories"));
             }
 
-            std::fs::create_dir_all(&spooling)?;
+            std::fs::create_dir_all(&spooling).map_err(|e| {
+                chain_error!(
+                    e,
+                    "failed to create spooling directory",
+                    ?db_path,
+                    ?spooling
+                )
+            })?;
             Ok(Some(ReplicationBuffer {
                 spooling_directory: spooling,
             }))
@@ -510,14 +560,21 @@ impl ReplicationBuffer {
     ///
     /// Fails silently: downstream code has to handle all sorts of
     /// concurrent failures anyway.
+    #[instrument]
     pub fn ensure_staging_dir(&self, targets: &ReplicationTargetList, overwrite_meta: bool) {
         let mut buf = self.spooling_directory.clone();
         buf.push(STAGING);
 
-        let _ = std::fs::create_dir_all(&buf);
+        drop_result!(
+            std::fs::create_dir_all(&buf),
+            e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG, "failed to create staging dir", dir=?buf)
+        );
         for subdir in &SUBDIRS {
             buf.push(subdir);
-            let _ = std::fs::create_dir_all(&buf);
+            drop_result!(
+                std::fs::create_dir_all(&buf),
+                e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG, "failed to create staging subdir", subdir, dir=?buf)
+            );
             buf.pop();
         }
 
@@ -532,13 +589,24 @@ impl ReplicationBuffer {
             scratch.push(SCRATCH);
 
             let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
-
-            if let Ok(temp) = tempfile::Builder::new()
+            let temp_or = tempfile::Builder::new()
                 .prefix(&(process_id() + "."))
                 .suffix(".tmp")
-                .tempfile_in(&scratch) {
-                    if let Ok(()) = temp.as_file().write_all(&json_bytes) {
-                        let _ = temp.persist(&buf);
+                .tempfile_in(&scratch)
+                .map_err(|e| chain_error!(e, "failed to create temporary file"));
+            if let Ok(temp) = temp_or {
+                let written = temp.as_file().write_all(&json_bytes).map_err(|e| {
+                    chain_error!(
+                        e,
+                        "failed to populate temporary file",
+                        len = json_bytes.len()
+                    )
+                });
+                if let Ok(()) = written {
+                    drop_result!(
+                        temp.persist(&buf),
+                        e => chain_error!(e, "failed to publish .metadata", dst=?buf)
+                    );
                 }
             }
         }
@@ -546,6 +614,7 @@ impl ReplicationBuffer {
 
     /// Attempts to publish a chunk of data for `fprint`.  This file
     /// might already exist, in which case we don't have to do anything.
+    #[instrument(level = "trace")]
     pub fn stage_chunk(&self, fprint: Fingerprint, data: &[u8]) -> Result<()> {
         use std::io::Write;
 
@@ -556,10 +625,14 @@ impl ReplicationBuffer {
         target.push(CHUNKS);
         target.push(&chunk_name);
 
-        call_with_temp_file(&target, |dst| dst.write_all(data))
+        call_with_temp_file(&target, |dst| {
+            dst.write_all(data)
+                .map_err(|e| chain_error!(e, "failed to write chunk", ?target, len = data.len()))
+        })
     }
 
     /// Attempts to overwrite the directory file for the replicated file.
+    #[instrument]
     pub fn publish_directory(&self, db_path: &Path, directory: &Directory) -> Result<()> {
         use prost::Message;
         use std::io::Write;
@@ -568,7 +641,7 @@ impl ReplicationBuffer {
         let mut encoded = Vec::<u8>::new();
         directory
             .encode(&mut encoded)
-            .map_err(|_| Error::new(ErrorKind::Other, "failed to serialise directory proto"))?;
+            .map_err(|e| chain_error!(e, "failed to serialize directory proto", ?directory))?;
 
         let mut target = self.spooling_directory.clone();
         target.push(STAGING);
@@ -577,15 +650,28 @@ impl ReplicationBuffer {
         let temp = Builder::new()
             .prefix(&(process_id() + "."))
             .suffix(".tmp")
-            .tempfile_in(&target)?;
+            .tempfile_in(&target)
+            .map_err(|e| chain_error!(e, "failed to create temporary file", ?target))?;
         temp.as_file()
-            .set_permissions(Permissions::from_mode(0o444))?;
-        temp.as_file().write_all(&encoded)?;
+            .set_permissions(Permissions::from_mode(0o444))
+            .map_err(|e| chain_error!(e, "failed to set file read-only", ?temp))?;
+        temp.as_file().write_all(&encoded).map_err(|e| {
+            chain_error!(
+                e,
+                "failed to write to temporary file",
+                ?temp,
+                len = encoded.len()
+            )
+        })?;
 
         target.pop();
         target.push(META);
-        target.push(&percent_encode_path_uri(db_path)?);
-        temp.persist(&target)?;
+        target.push(
+            &percent_encode_path_uri(db_path)
+                .map_err(|e| chain_error!(e, "invalid directory name", ?db_path))?,
+        );
+        temp.persist(&target)
+            .map_err(|e| chain_error!(e, "failed to publish directory", ?target))?;
         Ok(())
     }
 
@@ -599,6 +685,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current ready directory file.
+    #[instrument(level = "trace")]
     pub fn read_ready_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
@@ -608,6 +695,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current staged directory file.
+    #[instrument(level = "trace")]
     pub fn read_staged_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
@@ -618,24 +706,28 @@ impl ReplicationBuffer {
 
     /// Attempts to parse the current staged directory file.
     #[allow(dead_code)]
+    #[instrument(level = "trace")]
     pub fn read_staged_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(CHUNKS);
         src.push(&fingerprint_chunk_name(fprint));
 
-        std::fs::read(src)
+        std::fs::read(&src)
+            .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to read staged chunk file", ?src))
     }
 
     /// Attempts to parse the current staged directory file.
     #[allow(dead_code)]
+    #[instrument(level = "trace")]
     pub fn read_ready_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(CHUNKS);
         src.push(&fingerprint_chunk_name(fprint));
 
-        std::fs::read(src)
+        std::fs::read(&src)
+            .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to read ready chunk file", ?src))
     }
 
     /// Attempts to copy the current "staging" buffer to a temporary
@@ -645,6 +737,7 @@ impl ReplicationBuffer {
     /// spuriously and retry than to publish a partial buffer.
     ///
     /// On success, returns the temporary directory.
+    #[instrument]
     pub fn prepare_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<TempDir> {
         use tempfile::Builder;
 
@@ -660,17 +753,31 @@ impl ReplicationBuffer {
         let temp = Builder::new()
             .prefix(&(process_id() + "."))
             .suffix(".tmp")
-            .tempdir_in(&target)?;
+            .tempdir_in(&target)
+            .map_err(|e| chain_error!(e, "failed to create temporary directory", ?target))?;
 
         let mut temp_path = temp.path().to_owned();
 
         // hardlink relevant chunk files to `temp_path/chunks`.
         staging.push(CHUNKS);
         temp_path.push(CHUNKS);
-        std::fs::create_dir(&temp_path)?;
+        std::fs::create_dir(&temp_path).map_err(|e| {
+            filtered_io_error!(
+                e,
+                ErrorKind::NotFound => Level::DEBUG,
+                "failed to create temporary chunks directory",
+                ?temp_path
+            )
+        })?;
 
-        for file in std::fs::read_dir(&staging)? {
-            if let Some(name) = file?.file_name().to_str() {
+        for file in std::fs::read_dir(&staging)
+            .map_err(|e| chain_error!(e, "failed to list staged chunks", ?staging))?
+        {
+            if let Some(name) = file
+                .map_err(|e| chain_error!(e, "failed to read chunk direntry"))?
+                .file_name()
+                .to_str()
+            {
                 if live.contains(name) {
                     staging.push(name);
                     temp_path.push(name);
@@ -687,7 +794,7 @@ impl ReplicationBuffer {
                     match std::fs::hard_link(&staging, &temp_path) {
                         Ok(_) => {}
                         Err(error) if error.kind() == ErrorKind::NotFound => {}
-                        err => err?,
+                        Err(err) => return Err(chain_error!(err, "failed to link ready chunk")),
                     }
 
                     temp_path.pop();
@@ -702,14 +809,33 @@ impl ReplicationBuffer {
         // hardlink all meta files to `temp_path/meta`.
         staging.push(META);
         temp_path.push(META);
-        std::fs::create_dir(&temp_path)?;
+        std::fs::create_dir(&temp_path).map_err(|e| {
+            filtered_io_error!(
+                e,
+                ErrorKind::NotFound => Level::DEBUG,
+                "failed to create temporary meta directory",
+                ?temp_path
+            )
+        })?;
 
-        for file_or in std::fs::read_dir(&staging)? {
-            let file = file_or?;
+        for file_or in std::fs::read_dir(&staging)
+            .map_err(|e| chain_error!(e, "failed to list staged meta", ?staging))?
+        {
+            let file = file_or.map_err(|e| chain_error!(e, "failed to read meta direntry"))?;
             staging.push(file.file_name());
             temp_path.push(file.file_name());
 
-            std::fs::hard_link(&staging, &temp_path)?;
+            // This *can* be expected if another process finished the
+            // snapshot and cleaned up the scratch directory.
+            std::fs::hard_link(&staging, &temp_path).map_err(|e| {
+                filtered_io_error!(
+                    e,
+                    ErrorKind::NotFound => Level::DEBUG,
+                    "failed to link ready directory",
+                    ?staging,
+                    ?temp_path
+                )
+            })?;
 
             temp_path.pop();
             staging.pop();
@@ -720,13 +846,20 @@ impl ReplicationBuffer {
 
     /// Attempts to publish a temporary buffer directory to an empty
     /// or missing "ready" buffer.
-    ///
-    /// Returns `None` on success, the temporary buffer on failure.
+    #[instrument]
     pub fn publish_ready_buffer(&self, ready: TempDir) -> Result<()> {
         let mut target = self.spooling_directory.clone();
         target.push(READY);
 
-        std::fs::rename(ready.path(), &target)
+        std::fs::rename(ready.path(), &target).map_err(|e| {
+            filtered_io_error!(
+                e,
+                ErrorKind::AlreadyExists | ErrorKind::NotFound => Level::DEBUG,
+                "failed to publish ready buffer",
+                ?target,
+                ?ready
+            )
+        })
     }
 
     /// Returns the spooling directory path for this buffer.
@@ -736,6 +869,7 @@ impl ReplicationBuffer {
 
     /// Attempts to clean up any chunk file that's not referred by the
     /// `chunks` list.
+    #[instrument]
     pub fn gc_chunks(&self, chunks: &[Fingerprint]) -> Result<()> {
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
 
@@ -743,7 +877,10 @@ impl ReplicationBuffer {
         chunks.push(STAGING);
         chunks.push(CHUNKS);
 
-        for file in std::fs::read_dir(&chunks)?.flatten() {
+        for file in std::fs::read_dir(&chunks)
+            .map_err(|e| chain_error!(e, "failed to list staged chunks", ?chunks))?
+            .flatten()
+        {
             if let Some(name) = file.file_name().to_str() {
                 if live.contains(name) {
                     continue;
@@ -755,7 +892,13 @@ impl ReplicationBuffer {
             // so eat failures, which could happen, e.g., with
             // concurrent GCs.
             chunks.push(file.file_name());
-            let _ = std::fs::remove_file(&chunks);
+            match std::fs::remove_file(&chunks) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(%error, ?chunks, "failed to clean up stale chunk file")
+                }
+            }
             chunks.pop();
         }
 
@@ -763,15 +906,22 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to delete all temporary files and directory from "staging/scratch."
+    #[instrument]
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
         let mut scratch = self.spooling_directory.clone();
         scratch.push(STAGING);
         scratch.push(SCRATCH);
 
-        for entry in std::fs::read_dir(&scratch)?.flatten() {
+        for entry in std::fs::read_dir(&scratch)
+            .map_err(|e| chain_error!(e, "failed to list scratch directory", ?scratch))?
+            .flatten()
+        {
             let is_dir = match entry.file_type() {
                 Ok(file_type) => file_type.is_dir(),
-                Err(_) => false,
+                Err(error) => {
+                    tracing::info!(%error, ?entry, "failed to read scratch dentry");
+                    false
+                }
             };
 
             if !is_dir {
@@ -780,7 +930,14 @@ impl ReplicationBuffer {
                 // we simply want to remove as many now-useless files
                 // as possible.
                 scratch.push(entry.file_name());
-                let _ = std::fs::remove_file(&scratch);
+                match std::fs::remove_file(&scratch) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::error!(%error, ?scratch, "failed to remove stale scratch file")
+                    }
+                }
+
                 scratch.pop();
                 continue;
             }
@@ -794,7 +951,13 @@ impl ReplicationBuffer {
                 let old_path = scratch.clone();
 
                 scratch.set_extension(".del");
-                let _ = std::fs::rename(old_path, &scratch);
+                match std::fs::rename(&old_path, &scratch) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::error!(%error, ?old_path, ?scratch, "failed to rename scratch subdirectory")
+                    }
+                };
             }
 
             // We know `path` is marked for deletion with a ".del"
@@ -802,7 +965,13 @@ impl ReplicationBuffer {
             // to do if that fails... it's probably a concurrent
             // deletion, and that we care about is that this
             // subdirectory eventually goes away, if possible.
-            let _ = std::fs::remove_dir_all(&scratch);
+            match std::fs::remove_dir_all(&scratch) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(%error, ?scratch, "failed to remove scratch subdirectory")
+                }
+            };
             scratch.pop();
         }
 

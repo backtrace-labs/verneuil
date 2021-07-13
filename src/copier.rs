@@ -459,7 +459,8 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<()> {
-        let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
+        let (ready, _file) =
+            replication_buffer::snapshot_ready_directory(parent.clone()).map_err(|e| e.to_io())?;
 
         {
             let chunks_buckets = targets
