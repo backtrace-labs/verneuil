@@ -2,6 +2,8 @@ use std::boxed::Box;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+use crate::chain_warn;
+use crate::drop_result;
 use crate::sqlite_code::SqliteCode;
 use crate::tracker::Tracker;
 
@@ -218,7 +220,8 @@ extern "C" fn verneuil__file_unlock(file: &mut LinuxFile, level: LockLevel) -> i
     if file.lock_level == LockLevel::Shared {
         if let Some(tracker) = file.tracker() {
             // TODO: consider logging snapshot failures here.
-            let _ = tracker.snapshot();
+            drop_result!(tracker.snapshot(),
+                         e => chain_warn!(e, "failed to snapshot db file", ?tracker));
         }
     }
 
