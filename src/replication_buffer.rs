@@ -123,6 +123,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+use std::time::Duration;
 use tempfile::TempDir;
 use tracing::instrument;
 use tracing::Level;
@@ -130,6 +131,7 @@ use umash::Fingerprint;
 
 use crate::chain_error;
 use crate::chain_info;
+use crate::chain_warn;
 use crate::directory_schema::fingerprint_v1_chunk_list;
 use crate::directory_schema::Directory;
 use crate::drop_result;
@@ -175,6 +177,10 @@ const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
 /// This is potentially lossy, since our path-mangling scheme isn't
 /// invertible, so only enabled for sqlite tests.
 pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
+
+/// Only delete scratch files when they're older than this grace
+/// period.
+const SCRATCH_FILE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
@@ -909,6 +915,32 @@ impl ReplicationBuffer {
     /// Attempts to delete all temporary files and directory from "staging/scratch."
     #[instrument]
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
+        fn file_is_stale(path: &Path) -> Result<bool> {
+            let meta = std::fs::metadata(path)
+                .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to stat file", ?path))?;
+            let modified = meta
+                .modified()
+                .map_err(|e| chain_error!(e, "failed to fetch mtime", ?path))?;
+            let elapsed = modified
+                .elapsed()
+                .map_err(|e| chain_warn!(e, "time went backward", ?path))?;
+            Ok(elapsed >= SCRATCH_FILE_GRACE_PERIOD)
+        }
+
+        fn remove_file_if_stale(path: &Path) {
+            if matches!(file_is_stale(path), Ok(false)) {
+                return;
+            }
+
+            match std::fs::remove_file(path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(%error, ?path, "failed to remove stale scratch file")
+                }
+            }
+        }
+
         let mut scratch = self.spooling_directory.clone();
         scratch.push(STAGING);
         scratch.push(SCRATCH);
@@ -931,14 +963,7 @@ impl ReplicationBuffer {
                 // we simply want to remove as many now-useless files
                 // as possible.
                 scratch.push(entry.file_name());
-                match std::fs::remove_file(&scratch) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        tracing::error!(%error, ?scratch, "failed to remove stale scratch file")
-                    }
-                }
-
+                remove_file_if_stale(&scratch);
                 scratch.pop();
                 continue;
             }
