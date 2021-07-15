@@ -211,6 +211,28 @@ pub(crate) fn set_default_spooling_directory(
     Ok(())
 }
 
+/// Creates a new read-only named temporary file in `spool_dir`'s
+/// scratch directory.
+///
+/// On success, returns the temporary file and the scratch directory's path.
+#[instrument(level = "debug")]
+fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, PathBuf)> {
+    let mut scratch = spool_dir;
+    scratch.push(STAGING);
+    scratch.push(SCRATCH);
+
+    let temp = tempfile::Builder::new()
+        .prefix(&(process_id() + "."))
+        .suffix(".tmp")
+        .tempfile_in(&scratch)
+        .map_err(|e| chain_error!(e, "failed to create temporary file", ?scratch))?;
+
+    temp.as_file()
+        .set_permissions(Permissions::from_mode(0o444))
+        .map_err(|e| chain_error!(e, "failed to set file read-only", ?temp))?;
+    Ok((temp, scratch))
+}
+
 /// Removes directory separators from the input, and replaces them
 /// with `#`. Either the input is not expected to ever include
 /// slashes, or the result is allowed to collide for different inputs.
@@ -584,17 +606,8 @@ impl ReplicationBuffer {
         if overwrite_meta || !buf.exists() {
             use std::io::Write;
 
-            let mut scratch = self.spooling_directory.clone();
-            scratch.push(STAGING);
-            scratch.push(SCRATCH);
-
             let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
-            let temp_or = tempfile::Builder::new()
-                .prefix(&(process_id() + "."))
-                .suffix(".tmp")
-                .tempfile_in(&scratch)
-                .map_err(|e| chain_error!(e, "failed to create temporary file"));
-            if let Ok(temp) = temp_or {
+            if let Ok((temp, _)) = create_scratch_file(self.spooling_directory.clone()) {
                 let written = temp.as_file().write_all(&json_bytes).map_err(|e| {
                     chain_error!(
                         e,
@@ -636,25 +649,13 @@ impl ReplicationBuffer {
     pub fn publish_directory(&self, db_path: &Path, directory: &Directory) -> Result<()> {
         use prost::Message;
         use std::io::Write;
-        use tempfile::Builder;
 
         let mut encoded = Vec::<u8>::new();
         directory
             .encode(&mut encoded)
             .map_err(|e| chain_error!(e, "failed to serialize directory proto", ?directory))?;
 
-        let mut target = self.spooling_directory.clone();
-        target.push(STAGING);
-        target.push(SCRATCH);
-
-        let temp = Builder::new()
-            .prefix(&(process_id() + "."))
-            .suffix(".tmp")
-            .tempfile_in(&target)
-            .map_err(|e| chain_error!(e, "failed to create temporary file", ?target))?;
-        temp.as_file()
-            .set_permissions(Permissions::from_mode(0o444))
-            .map_err(|e| chain_error!(e, "failed to set file read-only", ?temp))?;
+        let (temp, mut target) = create_scratch_file(self.spooling_directory.clone())?;
         temp.as_file().write_all(&encoded).map_err(|e| {
             chain_error!(
                 e,
