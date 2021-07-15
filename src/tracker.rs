@@ -403,6 +403,8 @@ impl Tracker {
     /// a sqlite read lock on the db file.
     #[instrument]
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
         let header_fprint = fingerprint_sqlite_header(&self.file)
             .ok_or_else(|| fresh_warn!("invalid db file", path=?self.path))?;
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
@@ -509,6 +511,14 @@ impl Tracker {
         let (copied, chunks) = {
             let (len, chunks, copied) = self.snapshot_chunks(&buf, base_fprints)?;
 
+            let (ctime, ctime_ns) = match self.file.metadata() {
+                Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
+                Err(e) => {
+                    let _ = chain_warn!(e, "failed to fetch file metadata", ?self.path);
+                    (0, 0)
+                }
+            };
+
             let flattened = flatten_chunk_fprints(&chunks);
             let directory_fprint = fingerprint_v1_chunk_list(&flattened);
             let directory = Directory {
@@ -516,8 +526,10 @@ impl Tracker {
                     header_fprint: Some(header_fprint.into()),
                     version_id,
                     contents_fprint: Some(directory_fprint.into()),
-                    chunks: flattened,
                     len,
+                    ctime,
+                    ctime_ns,
+                    chunks: flattened,
                 }),
             };
 

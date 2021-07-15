@@ -57,15 +57,25 @@ pub(crate) struct DirectoryV1 {
     #[prost(message, tag = "3")]
     pub contents_fprint: Option<Fprint>,
 
-    // The fingerprints for each chunk as pairs of u64.  The first
-    // chunk has fingerprint `chunks[0], chunks[1]`, the second
-    // `chunks[2], chunks[3]`, etc.
-    #[prost(fixed64, repeated, tag = "4")]
-    pub chunks: Vec<u64>,
-
     // The total length of the file, in bytes.
     #[prost(uint64, tag = "5")]
     pub len: u64,
+
+    // The ctime of the file.  This information is advisory;
+    // in particular, there is no guarantee that the field
+    // is populated (non-zero) nor that it grows monotonically.
+    #[prost(int64, tag = "6")]
+    pub ctime: i64,
+
+    // The fractional part of the file's ctime.
+    #[prost(sfixed32, tag = "7")]
+    pub ctime_ns: i32,
+
+    // The fingerprints for each chunk as pairs of u64.  The first
+    // chunk has fingerprint `chunks[0], chunks[1]`, the second
+    // `chunks[2], chunks[3]`, etc.
+    #[prost(fixed64, repeated, tag = "15")]
+    pub chunks: Vec<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
