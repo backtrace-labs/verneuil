@@ -136,7 +136,7 @@ impl Tracker {
             // But first, make sure to overwrite the replication config with our own.
             buf.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
             copier = Copier::get_global_copier()
-                .with_spool_path(Arc::new(buf.spooling_directory().to_owned()));
+                .with_spool_path(Arc::new(buf.spooling_directory().to_owned()), path.clone());
             copier.signal_ready_buffer();
         } else {
             copier = Copier::get_global_copier()

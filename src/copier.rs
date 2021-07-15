@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::fresh_warn;
+use crate::racy_time::RacySystemTime;
 use crate::replication_buffer;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
@@ -71,8 +73,11 @@ const WORKER_COUNT: usize = 2;
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
 /// copiers for the same directory, so we must refcount them.
+///
+/// The optional secondary value for `Join` is a path to the
+/// replicated file.
 enum ActiveSetMaintenance {
-    Join(Arc<PathBuf>),
+    Join(Arc<PathBuf>, Option<PathBuf>),
     Leave(Arc<PathBuf>),
 }
 
@@ -96,10 +101,25 @@ type Governor = governor::RateLimiter<
 
 /// The `CopierSpoolState` represent what we know about the spool for
 /// a given replicated sqlite db file.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CopierSpoolState {
-    path: Arc<PathBuf>,
+    spool_path: Arc<PathBuf>,
+    source: Option<PathBuf>,
+    // Refcount for this spool state.
     count: AtomicUsize,
+
+    // Set to true by the `CopierBackend` thread when we have
+    // successfully queued up this pool state for upload, cleared
+    // by `CopierWorker`s immediately as they scan working on
+    // the `SpoolState`.
+    signaled: AtomicBool,
+
+    // Last time we started a copy scan.
+    last_scanned: RacySystemTime,
+
+    // Copier workers attempt to acquire this mutex before processing
+    // the spool path's contents.
+    upload_lock: std::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -114,7 +134,7 @@ struct CopierBackend {
 
 impl Clone for Copier {
     fn clone(&self) -> Self {
-        self.incref();
+        self.incref(None);
 
         Copier {
             ready_buffers: self.ready_buffers.clone(),
@@ -149,10 +169,10 @@ impl Copier {
 
     /// Increments the refcount for the current spool path, if any.
     #[instrument(level = "debug")]
-    fn incref(&self) {
+    fn incref(&self, source_file: Option<PathBuf>) {
         if let Some(path) = &self.spool_path {
             self.maintenance
-                .send(ActiveSetMaintenance::Join(path.clone()))
+                .send(ActiveSetMaintenance::Join(path.clone(), source_file))
                 .expect("channel should not disconnect");
         }
     }
@@ -169,12 +189,12 @@ impl Copier {
 
     /// Returns a copy of `self` with an updated `spool_path`.
     #[instrument(level = "debug")]
-    pub fn with_spool_path(mut self, spool_path: Arc<PathBuf>) -> Copier {
+    pub fn with_spool_path(mut self, spool_path: Arc<PathBuf>, file_path: PathBuf) -> Copier {
         let noop = matches!(&self.spool_path, Some(old) if *old == spool_path);
         if !noop {
             self.delref();
             self.spool_path = Some(spool_path);
-            self.incref();
+            self.incref(Some(file_path));
         }
 
         self
@@ -195,7 +215,7 @@ impl Copier {
             spool_path: None,
         };
 
-        ret.incref();
+        ret.incref(None);
         ret
     }
 
@@ -819,7 +839,11 @@ impl CopierWorker {
 
     fn worker_loop(&self) {
         while let Ok(state) = self.work.recv() {
-            self.handle_spooling_directory(&state.path);
+            if let Ok(_guard) = state.upload_lock.try_lock() {
+                state.signaled.store(false, Ordering::Relaxed);
+                state.last_scanned.store(std::time::SystemTime::now());
+                self.handle_spooling_directory(&state.spool_path);
+            }
         }
     }
 }
@@ -885,22 +909,43 @@ impl CopierBackend {
                 Ok(ready) => {
                     // Data in `ready_buffer` is only advisory, it's
                     // never incorrect to drop the work unit.
-            if let Some(state) = self.active_spool_paths.get(&ready) {
-            self.send_work(state.clone());
-            }
+                    if let Some(state) = self.active_spool_paths.get(&ready) {
+                        if state.signaled.load(Ordering::Relaxed) == false {
+                // Flip the flag to true before the worker can
+                // reset it.
+                            state.signaled.store(true, Ordering::Relaxed);
+                            if self.send_work(state.clone()).is_some() {
+                // If we failed to send work, clear
+                // the flag ourself and try again.
+                                state.signaled.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 },
                 // Errors only happen when there is no more sender.
                 // That means the worker should shut down.
                 Err(_) => return false,
             },
             recv(self.maintenance) -> maintenance => match maintenance {
-                Ok(Join(path)) => {
+                Ok(Join(spool_path, source_or)) => {
                     self.active_spool_paths
-                        .entry(path.clone())
-                        .or_insert_with(|| Arc::new(CopierSpoolState{
-                            path,
-                            count: AtomicUsize::new(0),
-                        }))
+                        .entry(spool_path.clone())
+                        .or_insert_with(|| {
+                            // The initial spool `Join` message (via
+                            // `Copier::with_spool_path`) should
+                            // always have a source.  It's only later
+                            // clones that lack the source path.
+                            if source_or.is_none() {
+                                tracing::warn!(?spool_path,
+                                               "registering a new CopierSpoolState without a source path.");
+                            }
+
+                            Arc::new(CopierSpoolState{
+                                spool_path,
+                                source: source_or,
+                                ..Default::default()
+                            })
+                        })
                         .count
                         // No one else writes to this field, so we don't
                         // have to worry about the count flapping around 0.
@@ -955,13 +1000,20 @@ impl CopierBackend {
                 break;
             }
 
-            if let Some(state) = active_set.pop() {
-                if let Some(state) = self.send_work(state) {
-                    // Push pack to the `active_set` on failure.
-                    active_set.push(state);
+            match active_set.pop() {
+                Some(state) => {
+                    // Unconditionally signal for work: we don't want to get
+                    // stuck if `state.signaled` somehow never gets cleared,
+                    // and the background scan is our catch-all fix for such
+                    // liveness bugs.
+                    state.signaled.store(true, Ordering::Relaxed);
+                    if let Some(state) = self.send_work(state) {
+                        state.signaled.store(false, Ordering::Relaxed);
+                        // Push pack to the `active_set` on failure.
+                        active_set.push(state);
+                    }
                 }
-            } else {
-                active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
+                None => active_set = shuffle_active_set(&self.active_spool_paths, &mut rng),
             }
         }
 
@@ -981,14 +1033,18 @@ impl CopierBackend {
             // anything that's not active anymore, and we don't want
             // to scan directories twice during shutdown.
             if let Some(state) = self.active_spool_paths.remove(&ready) {
-                self.send_work(state);
+                if !state.signaled.load(Ordering::Relaxed) {
+                    self.send_work(state);
+                }
             }
         }
 
         // One final pass through all remaining spooling directories.
-        for path in shuffle_active_set(&self.active_spool_paths, &mut rng) {
-            let _span = info_span!("handle_requests_shutdown_bg_scan", ?path);
-            self.send_work(path);
+        for state in shuffle_active_set(&self.active_spool_paths, &mut rng) {
+            let _span = info_span!("handle_requests_shutdown_bg_scan", ?state);
+            if !state.signaled.load(Ordering::Relaxed) {
+                self.send_work(state);
+            }
         }
     }
 }

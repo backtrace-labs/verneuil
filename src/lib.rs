@@ -2,6 +2,7 @@ mod copier;
 mod directory_schema;
 mod instance_id;
 mod process_id;
+mod racy_time;
 mod replication_buffer;
 mod replication_target;
 mod result;
