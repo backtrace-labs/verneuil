@@ -490,7 +490,9 @@ fn directory_is_empty_or_absent(path: &Path) -> Result<bool> {
 /// the same identifier, it is the same (unless someone is maliciously
 /// tampering with it).
 #[instrument(level = "debug")]
-fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64, i64, i64)> {
+fn file_identifier(
+    file: &File,
+) -> Result<(Option<std::time::SystemTime>, u64, u64, u64, i64, i64)> {
     use std::os::unix::fs::MetadataExt;
 
     let meta = file
@@ -498,7 +500,8 @@ fn file_identifier(file: &File) -> Result<(std::time::SystemTime, u64, u64, u64,
         .map_err(|e| chain_error!(e, "failed to stat file"))?;
     Ok((
         meta.created()
-            .map_err(|e| chain_error!(e, "failed to compute file creation time", ?meta))?,
+            .map_err(|e| chain_debug!(e, "failed to compute file creation time", ?meta))
+            .ok(),
         meta.len(),
         meta.dev(),
         meta.ino(),
