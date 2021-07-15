@@ -70,8 +70,8 @@ const WORKER_COUNT: usize = 2;
 /// adds a new directory, `Leave` removes it.  There may be multiple
 /// copiers for the same directory, so we must refcount them.
 enum ActiveSetMaintenance {
-    Join(PathBuf),
-    Leave(PathBuf),
+    Join(Arc<PathBuf>),
+    Leave(Arc<PathBuf>),
 }
 
 /// A `Copier` is only a message-passing handle to a background worker
@@ -81,9 +81,9 @@ enum ActiveSetMaintenance {
 /// will be notified and commence shutdown.
 #[derive(Debug)]
 pub(crate) struct Copier {
-    ready_buffers: crossbeam_channel::Sender<PathBuf>,
+    ready_buffers: crossbeam_channel::Sender<Arc<PathBuf>>,
     maintenance: crossbeam_channel::Sender<ActiveSetMaintenance>,
-    spool_path: Option<PathBuf>,
+    spool_path: Option<Arc<PathBuf>>,
 }
 
 type Governor = governor::RateLimiter<
@@ -94,11 +94,11 @@ type Governor = governor::RateLimiter<
 
 #[derive(Debug)]
 struct CopierBackend {
-    ready_buffers: crossbeam_channel::Receiver<PathBuf>,
+    ready_buffers: crossbeam_channel::Receiver<Arc<PathBuf>>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
-    workers: crossbeam_channel::Sender<PathBuf>,
+    workers: crossbeam_channel::Sender<Arc<PathBuf>>,
     // Map from PathBuf for spool directories to refcount.
-    active_spool_paths: HashMap<PathBuf, usize>,
+    active_spool_paths: HashMap<Arc<PathBuf>, usize>,
 }
 
 impl Clone for Copier {
@@ -162,7 +162,7 @@ impl Copier {
         let mut copy = self.clone();
 
         copy.delref();
-        copy.spool_path = spool_path;
+        copy.spool_path = spool_path.map(Arc::new);
         copy.incref();
         copy
     }
@@ -179,7 +179,7 @@ impl Copier {
         let ret = Copier {
             ready_buffers: buf_send,
             maintenance: maintenance_send,
-            spool_path,
+            spool_path: spool_path.map(Arc::new),
         };
 
         ret.incref();
@@ -512,7 +512,7 @@ fn file_identifier(
 
 #[derive(Debug)]
 struct CopierWorker {
-    work: crossbeam_channel::Receiver<PathBuf>,
+    work: crossbeam_channel::Receiver<Arc<PathBuf>>,
     governor: Arc<Governor>,
 }
 
@@ -727,7 +727,7 @@ impl CopierWorker {
     /// Processes one spooling directory that should be ready for
     /// replication.
     #[instrument]
-    fn handle_spooling_directory(&self, spool: PathBuf) {
+    fn handle_spooling_directory(&self, spool: &Path) {
         let creds_or =
             Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"));
         if let Ok(creds) = creds_or {
@@ -739,7 +739,7 @@ impl CopierWorker {
             // the buffering system bounds the amount of replication
             // data we keep around.
             let targets_or: Result<ReplicationTargetList> = (|| {
-                let metadata = replication_buffer::buffer_metadata_file(spool.clone());
+                let metadata = replication_buffer::buffer_metadata_file(spool.to_path_buf());
                 let contents = std::fs::read(&*metadata)
                     .map_err(|e| chain_error!(e, "failed to read .metadata file", ?metadata))?;
                 let parsed = serde_json::from_slice(&contents).map_err(|e| {
@@ -750,7 +750,7 @@ impl CopierWorker {
             })();
 
             if let Ok(targets) = targets_or {
-                let ready = replication_buffer::mutable_ready_directory(spool.clone());
+                let ready = replication_buffer::mutable_ready_directory(spool.to_path_buf());
                 let is_empty = directory_is_empty_or_absent(&ready)
                     .map_err(|e| chain_debug!(e, "failed to list directory", ?ready));
                 if matches!(is_empty, Ok(true)) {
@@ -768,7 +768,7 @@ impl CopierWorker {
                     // choose to keep it untouched rather than drop
                     // data that we have failed to copy to the
                     // replication targets.
-                    drop_result!(self.handle_ready_directory(&targets, creds.clone(), spool.clone()),
+                    drop_result!(self.handle_ready_directory(&targets, creds.clone(), spool.to_path_buf()),
                                  e => chain_info!(e, "failed to handle ready directory", ?spool));
 
                     // We've done some work here (handled a non-empty
@@ -783,7 +783,7 @@ impl CopierWorker {
                 // Opportunistically try to copy from the "staging"
                 // directory.  That's never staler than "ready", so we do
                 // not go backward in our replication.
-                drop_result!(self.handle_staging_directory(&targets, creds.clone(), spool.clone()),
+                drop_result!(self.handle_staging_directory(&targets, creds.clone(), spool.to_path_buf()),
                              e => chain_info!(e, "failed to handle staging directory", ?spool));
 
                 // And now see if the ready directory was updated again.
@@ -794,7 +794,7 @@ impl CopierWorker {
                 // the "ready" directory must be at least as recent as
                 // what we found in staging, so, again, replication
                 // cannot go backwards.
-                drop_result!(self.handle_ready_directory(&targets, creds, spool.clone()),
+                drop_result!(self.handle_ready_directory(&targets, creds, spool.to_path_buf()),
                              e => chain_info!(e, "failed to rehandle ready directory", ?spool));
 
                 // When we get here, the remote data should be at least as
@@ -806,7 +806,7 @@ impl CopierWorker {
 
     fn worker_loop(&self) {
         while let Ok(path) = self.work.recv() {
-            self.handle_spooling_directory(path);
+            self.handle_spooling_directory(&*path);
         }
     }
 }
@@ -817,7 +817,7 @@ impl CopierBackend {
         channel_capacity: usize,
     ) -> (
         Self,
-        crossbeam_channel::Sender<PathBuf>,
+        crossbeam_channel::Sender<Arc<PathBuf>>,
         crossbeam_channel::Sender<ActiveSetMaintenance>,
     ) {
         let governor = Arc::new(governor::RateLimiter::direct_with_clock(
@@ -852,7 +852,7 @@ impl CopierBackend {
     /// Returns None on success, `work` if the channel is full, and
     /// panics if the workers disconnected.
     #[instrument]
-    fn send_work(&self, work: PathBuf) -> Option<PathBuf> {
+    fn send_work(&self, work: Arc<PathBuf>) -> Option<Arc<PathBuf>> {
         use crossbeam_channel::TrySendError::*;
         match self.workers.try_send(work) {
             Ok(_) => None,
@@ -909,9 +909,9 @@ impl CopierBackend {
         use rand::Rng;
 
         fn shuffle_active_set(
-            active: &HashMap<PathBuf, usize>,
+            active: &HashMap<Arc<PathBuf>, usize>,
             rng: &mut impl rand::Rng,
-        ) -> Vec<PathBuf> {
+        ) -> Vec<Arc<PathBuf>> {
             let mut keys: Vec<_> = active.keys().cloned().collect();
 
             keys.shuffle(rng);
