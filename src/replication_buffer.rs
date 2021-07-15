@@ -2,6 +2,17 @@
 //! ensures that consistent snapshots are regularly propagated to
 //! remote object storage.
 //!
+//! The base spooling directory contains a subdirectory keyed on the
+//! current boot id: this prefix will change if the machine crashes,
+//! and we can deal with missing data (as opposed to corrupt data) so
+//! we don't have to slow down our operations with fsyncs everywhere.
+//!
+//! Finally, that subdirectory will include "spooling buffer"
+//! sub(sub-)directories (`$MANGLED_PATH/$DEV.$INODE/`) for each
+//! sqlite DB that is replicated.  The boot id directory also includes
+//! a ".tap" subdirectory, where we store "meta" (directory) files
+//! once they have been copied to remote storage.
+//!
 //! Each spooling buffer is a directory that includes a "staging"
 //! directory, and a "ready" directory.
 //!
@@ -154,6 +165,11 @@ lazy_static::lazy_static! {
     static ref DEFAULT_SPOOLING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
 
+/// The ".tap" subdirectory isn't associated with any specific
+/// replicated file, and is populated with name-addressed files
+/// we successfully copied to remote storage.
+const DOT_TAP: &str = ".tap";
+
 /// The "staging" subdirectory is updated in-place to match the db.
 const STAGING: &str = "staging";
 
@@ -237,6 +253,64 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
         .set_permissions(Permissions::from_mode(0o444))
         .map_err(|e| chain_error!(e, "failed to set file read-only", ?temp))?;
     Ok((temp, scratch))
+}
+
+/// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
+#[instrument(level = "debug")]
+pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &File) -> Result<()> {
+    use rand::Rng;
+    use std::os::unix::io::AsRawFd;
+
+    // See c/file_ops.h
+    extern "C" {
+        fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
+    }
+
+    // `spool_dir` is for a specific replicated file, i.e.,
+    // ".../$MANGLED_PATH/$DEV.$INO/".  The ".tap" directory lives
+    // in ".../.tap/"
+    let base = spool_dir
+        .parent()
+        .map(Path::parent)
+        .flatten()
+        .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
+    let mut tap = base.to_path_buf();
+
+    tap.push(DOT_TAP);
+    std::fs::create_dir_all(&tap).map_err(|e| {
+        filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
+                                        "failed to rceate .tap dir", dir=?tap)
+    })?;
+
+    tap.push(name);
+
+    let mut scratch = spool_dir.to_path_buf();
+    scratch.push(STAGING);
+    scratch.push(SCRATCH);
+    scratch.push(format!(
+        "{}.tap_meta.{}.{}.tmp",
+        process_id(),
+        name.to_string_lossy(),
+        rand::thread_rng().gen::<u64>()
+    ));
+
+    let scratch_str = CString::new(scratch.as_os_str().as_bytes())
+        .map_err(|e| chain_error!(e, "unable to convert scratch path to C string", ?scratch))?;
+
+    // We must create a new name for the file's inode before we can rename it.
+    if unsafe { verneuil__link_temp_file(file.as_raw_fd(), scratch_str.as_ptr()) } < 0 {
+        return Err(
+            filtered_os_error!(ErrorKind::NotFound => Level::DEBUG, "failed to create scratch file", ?scratch),
+        );
+    }
+
+    std::fs::rename(&scratch, &tap).map_err(|e| {
+        // If we failed to rename `scratch` away, try to clean up
+        // before erroring out.
+        drop_result!(std::fs::remove_file(&scratch),
+                     e => chain_warn!(e, "failed to remove scratch file", ?scratch));
+        chain_warn!(e, "failed to tap update meta file")
+    })
 }
 
 /// Removes directory separators from the input, and replaces them
@@ -595,7 +669,8 @@ impl ReplicationBuffer {
 
         drop_result!(
             std::fs::create_dir_all(&buf),
-            e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG, "failed to create staging dir", dir=?buf)
+            e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
+                                    "failed to create staging dir", dir=?buf)
         );
         for subdir in &SUBDIRS {
             buf.push(subdir);

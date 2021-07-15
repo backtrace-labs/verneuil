@@ -588,7 +588,10 @@ impl CopierWorker {
                 replication_buffer::directory_meta(ready),
                 |name, mut file| {
                     self.pace();
-                    copy_file(name, &mut file, &meta_buckets)
+                    copy_file(name, &mut file, &meta_buckets)?;
+                    replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
+                        chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                    })
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
@@ -683,7 +686,7 @@ impl CopierWorker {
         // replicated its contents.  Either way, it's safe to copy the
         // meta files (unless they have changed).
         {
-            let ready_directory = replication_buffer::mutable_ready_directory(parent);
+            let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
             if !directory_is_empty_or_absent(&ready_directory)? {
                 return Err(fresh_info!("ready directory exists", ?ready_directory));
             }
@@ -706,10 +709,13 @@ impl CopierWorker {
                 &mut |name: &OsStr, mut file| {
                     if initial_meta.get(name) == Some(&file_identifier(&file)?) {
                         self.pace();
-                        copy_file(name, &mut file, &meta_buckets)
-                    } else {
-                        Ok(())
+                        copy_file(name, &mut file, &meta_buckets)?;
+                        replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
+                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                        })?;
                     }
+
+                    Ok(())
                 },
                 ConsumeDirectoryPolicy::KeepAll,
             )?;
