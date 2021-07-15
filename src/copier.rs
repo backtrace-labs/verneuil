@@ -133,12 +133,12 @@ impl Drop for Copier {
 impl Copier {
     /// Returns a handle for the global `Copier` worker.
     #[instrument(level = "debug")]
-    pub fn get_global_copier(spool_path: Option<PathBuf>) -> Copier {
+    pub fn get_global_copier() -> Copier {
         lazy_static::lazy_static! {
             static ref GLOBAL_COPIER: Copier = Copier::new();
         }
 
-        GLOBAL_COPIER.with_spool_path(spool_path)
+        GLOBAL_COPIER.clone()
     }
 
     /// Returns a handle for a fresh Copier.
@@ -169,13 +169,15 @@ impl Copier {
 
     /// Returns a copy of `self` with an updated `spool_path`.
     #[instrument(level = "debug")]
-    pub fn with_spool_path(&self, spool_path: Option<PathBuf>) -> Copier {
-        let mut copy = self.clone();
+    pub fn with_spool_path(mut self, spool_path: Arc<PathBuf>) -> Copier {
+        let noop = matches!(&self.spool_path, Some(old) if *old == spool_path);
+        if !noop {
+            self.delref();
+            self.spool_path = Some(spool_path);
+            self.incref();
+        }
 
-        copy.delref();
-        copy.spool_path = spool_path.map(Arc::new);
-        copy.incref();
-        copy
+        self
     }
 
     /// Returns a handle for a fresh Copier that allows for

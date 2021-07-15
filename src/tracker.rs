@@ -8,6 +8,7 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::instrument;
 use umash::Fingerprint;
 use uuid::Uuid;
@@ -134,10 +135,11 @@ impl Tracker {
         if let Some(buf) = &buffer {
             // But first, make sure to overwrite the replication config with our own.
             buf.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
-            copier = Copier::get_global_copier(Some(buf.spooling_directory().to_owned()));
+            copier = Copier::get_global_copier()
+                .with_spool_path(Arc::new(buf.spooling_directory().to_owned()));
             copier.signal_ready_buffer();
         } else {
-            copier = Copier::get_global_copier(None)
+            copier = Copier::get_global_copier()
         }
 
         Ok(Tracker {
