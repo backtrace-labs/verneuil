@@ -135,7 +135,7 @@ impl Copier {
     #[instrument(level = "debug")]
     pub fn get_global_copier(spool_path: Option<PathBuf>) -> Copier {
         lazy_static::lazy_static! {
-            static ref GLOBAL_COPIER: Copier = Copier::new(None);
+            static ref GLOBAL_COPIER: Copier = Copier::new();
         }
 
         GLOBAL_COPIER.with_spool_path(spool_path)
@@ -143,8 +143,8 @@ impl Copier {
 
     /// Returns a handle for a fresh Copier.
     #[instrument(level = "debug")]
-    pub fn new(spool_path: Option<PathBuf>) -> Copier {
-        Copier::new_with_capacity(spool_path, 100)
+    pub fn new() -> Copier {
+        Copier::new_with_capacity(100)
     }
 
     /// Increments the refcount for the current spool path, if any.
@@ -182,7 +182,7 @@ impl Copier {
     /// `channel_capacity` pending signalled ready buffer
     /// before dropping anything.
     #[instrument(level = "debug")]
-    pub fn new_with_capacity(spool_path: Option<PathBuf>, channel_capacity: usize) -> Copier {
+    pub fn new_with_capacity(channel_capacity: usize) -> Copier {
         let (mut backend, buf_send, maintenance_send) =
             CopierBackend::new(WORKER_COUNT, channel_capacity);
         std::thread::spawn(move || backend.handle_requests());
@@ -190,7 +190,7 @@ impl Copier {
         let ret = Copier {
             ready_buffers: buf_send,
             maintenance: maintenance_send,
-            spool_path: spool_path.map(Arc::new),
+            spool_path: None,
         };
 
         ret.incref();
