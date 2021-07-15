@@ -11,6 +11,8 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug_span;
@@ -92,13 +94,22 @@ type Governor = governor::RateLimiter<
     governor::clock::MonotonicClock,
 >;
 
+/// The `CopierSpoolState` represent what we know about the spool for
+/// a given replicated sqlite db file.
+#[derive(Debug)]
+struct CopierSpoolState {
+    path: Arc<PathBuf>,
+    count: AtomicUsize,
+}
+
 #[derive(Debug)]
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<Arc<PathBuf>>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
-    workers: crossbeam_channel::Sender<Arc<PathBuf>>,
-    // Map from PathBuf for spool directories to refcount.
-    active_spool_paths: HashMap<Arc<PathBuf>, usize>,
+    workers: crossbeam_channel::Sender<Arc<CopierSpoolState>>,
+    // Map from PathBuf for spool directories to their state.
+    // The key is always equal to the value's `path` field.
+    active_spool_paths: HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
 }
 
 impl Clone for Copier {
@@ -512,7 +523,7 @@ fn file_identifier(
 
 #[derive(Debug)]
 struct CopierWorker {
-    work: crossbeam_channel::Receiver<Arc<PathBuf>>,
+    work: crossbeam_channel::Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
 }
 
@@ -805,8 +816,8 @@ impl CopierWorker {
     }
 
     fn worker_loop(&self) {
-        while let Ok(path) = self.work.recv() {
-            self.handle_spooling_directory(&*path);
+        while let Ok(state) = self.work.recv() {
+            self.handle_spooling_directory(&state.path);
         }
     }
 }
@@ -852,7 +863,7 @@ impl CopierBackend {
     /// Returns None on success, `work` if the channel is full, and
     /// panics if the workers disconnected.
     #[instrument]
-    fn send_work(&self, work: Arc<PathBuf>) -> Option<Arc<PathBuf>> {
+    fn send_work(&self, work: Arc<CopierSpoolState>) -> Option<Arc<CopierSpoolState>> {
         use crossbeam_channel::TrySendError::*;
         match self.workers.try_send(work) {
             Ok(_) => None,
@@ -872,7 +883,9 @@ impl CopierBackend {
                 Ok(ready) => {
                     // Data in `ready_buffer` is only advisory, it's
                     // never incorrect to drop the work unit.
-                    self.send_work(ready);
+            if let Some(state) = self.active_spool_paths.get(&ready) {
+            self.send_work(state.clone());
+            }
                 },
                 // Errors only happen when there is no more sender.
                 // That means the worker should shut down.
@@ -880,13 +893,20 @@ impl CopierBackend {
             },
             recv(self.maintenance) -> maintenance => match maintenance {
                 Ok(Join(path)) => {
-                    *self.active_spool_paths.entry(path).or_insert(0) += 1;
+                    self.active_spool_paths
+                        .entry(path.clone())
+                        .or_insert_with(|| Arc::new(CopierSpoolState{
+                            path,
+                            count: AtomicUsize::new(0),
+                        }))
+                        .count
+                        // No one else writes to this field, so we don't
+                        // have to worry about the count flapping around 0.
+                        .fetch_add(1, Ordering::Relaxed);
                 },
                 Ok(Leave(path)) => {
                     if let Some(v) = self.active_spool_paths.get_mut(&path) {
-                        if *v > 1 {
-                            *v -= 1;
-                        } else {
+                        if v.count.fetch_sub(1, Ordering::Relaxed) == 1 {
                             self.active_spool_paths.remove(&path);
                         }
                     }
@@ -909,10 +929,10 @@ impl CopierBackend {
         use rand::Rng;
 
         fn shuffle_active_set(
-            active: &HashMap<Arc<PathBuf>, usize>,
+            active: &HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
             rng: &mut impl rand::Rng,
-        ) -> Vec<Arc<PathBuf>> {
-            let mut keys: Vec<_> = active.keys().cloned().collect();
+        ) -> Vec<Arc<CopierSpoolState>> {
+            let mut keys: Vec<_> = active.values().cloned().collect();
 
             keys.shuffle(rng);
             keys
@@ -933,10 +953,10 @@ impl CopierBackend {
                 break;
             }
 
-            if let Some(path) = active_set.pop() {
-                if let Some(path) = self.send_work(path) {
+            if let Some(state) = active_set.pop() {
+                if let Some(state) = self.send_work(state) {
                     // Push pack to the `active_set` on failure.
-                    active_set.push(path);
+                    active_set.push(state);
                 }
             } else {
                 active_set = shuffle_active_set(&self.active_spool_paths, &mut rng);
@@ -958,8 +978,8 @@ impl CopierBackend {
             // Remove from the set of active paths: we want to skip
             // anything that's not active anymore, and we don't want
             // to scan directories twice during shutdown.
-            if self.active_spool_paths.remove(&ready).is_some() {
-                self.send_work(ready);
+            if let Some(state) = self.active_spool_paths.remove(&ready) {
+                self.send_work(state);
             }
         }
 
