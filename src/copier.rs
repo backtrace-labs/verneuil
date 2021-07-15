@@ -393,7 +393,7 @@ fn create_target(
 
 /// Attempts to publish the `contents` to `name` in all `targets`.
 #[instrument(level = "debug")]
-fn copy_file(name: &OsStr, mut contents: File, targets: &[Bucket]) -> Result<()> {
+fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
 
@@ -564,9 +564,9 @@ impl CopierWorker {
 
             consume_directory(
                 replication_buffer::directory_chunks(ready.clone()),
-                |name, file| {
+                |name, mut file| {
                     self.pace();
-                    copy_file(name, file, &chunks_buckets)
+                    copy_file(name, &mut file, &chunks_buckets)
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
@@ -586,9 +586,9 @@ impl CopierWorker {
 
             consume_directory(
                 replication_buffer::directory_meta(ready),
-                |name, file| {
+                |name, mut file| {
                     self.pace();
-                    copy_file(name, file, &meta_buckets)
+                    copy_file(name, &mut file, &meta_buckets)
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
@@ -638,9 +638,9 @@ impl CopierWorker {
 
             consume_directory(
                 chunks_directory.clone(),
-                &mut |name: &OsStr, file| {
+                &mut |name: &OsStr, mut file| {
                     self.pace();
-                    copy_file(name, file, &chunks_buckets)?;
+                    copy_file(name, &mut file, &chunks_buckets)?;
                     published += 1;
                     Ok(())
                 },
@@ -703,10 +703,10 @@ impl CopierWorker {
 
             consume_directory(
                 meta_directory,
-                &mut |name: &OsStr, file| {
+                &mut |name: &OsStr, mut file| {
                     if initial_meta.get(name) == Some(&file_identifier(&file)?) {
                         self.pace();
-                        copy_file(name, file, &meta_buckets)
+                        copy_file(name, &mut file, &meta_buckets)
                     } else {
                         Ok(())
                     }
