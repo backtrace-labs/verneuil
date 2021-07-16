@@ -625,6 +625,8 @@ impl Tracker {
                 self.validate_all_snapshots(&buffer);
                 // Nothing to do if we know we're clean.
                 if self.backing_file_state != MutationState::Clean {
+                    let _span = tracing::info_span!("snapshot",
+                                                    path=?self.path, ?self.backing_file_state);
                     return self.snapshot_file_contents(&buffer);
                 }
             }
