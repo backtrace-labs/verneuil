@@ -9,20 +9,6 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
-#ifndef RENAME_EXCHANGE
-# define RENAME_EXCHANGE (1 << 1)
-#elif RENAME_EXCHANGE != (1 << 1)
-# error "Mismatch in RENAME_EXCHANGE constant value."
-#endif
-
-static inline int
-renameat2_compat(int olddirfd, const char *oldpath,
-    int newdirfd, const char *newpath, unsigned int flags)
-{
-
-        return syscall(SYS_renameat2, olddirfd, oldpath, newdirfd, newpath, flags);
-}
-
 int
 verneuil__open_temp_file(const char *directory, int mode)
 {
