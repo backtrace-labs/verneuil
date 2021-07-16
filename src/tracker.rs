@@ -410,6 +410,11 @@ impl Tracker {
         let header_fprint = fingerprint_sqlite_header(&self.file)
             .ok_or_else(|| fresh_warn!("invalid db file", path=?self.path))?;
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
+        // If we can't find any version id, try to set one for the next run.
+        if version_id.is_empty() {
+            drop_result!(update_version_id(&self.file, None),
+                         e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
+        }
 
         let mut current_directory: Option<Directory> = buf
             .read_staged_directory(&self.path)
