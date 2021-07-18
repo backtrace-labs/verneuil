@@ -70,6 +70,11 @@ const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 /// worker threads to achieve that.
 const WORKER_COUNT: usize = 2;
 
+/// How many of the last directory files we have uploaded must we
+/// remember?  This memory lets us avoid repeated uploads of the
+/// same "staged" directory file.
+const STAGED_DIRECTORY_MEMORY: usize = 2;
+
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
 /// copiers for the same directory, so we must refcount them.
@@ -99,6 +104,25 @@ type Governor = governor::RateLimiter<
     governor::clock::MonotonicClock,
 >;
 
+/// An opaque identifier for a file's contents inode.
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct FileIdentifier {
+    btime: Option<std::time::SystemTime>,
+    len: u64,
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+/// This state belongs to the copier worker that is currently
+/// uploading the contents of a spool directory for that database
+/// file.
+#[derive(Debug, Default)]
+struct CopierUploadState {
+    recent_staged_directories: uluru::LRUCache<FileIdentifier, STAGED_DIRECTORY_MEMORY>,
+}
+
 /// The `CopierSpoolState` represent what we know about the spool for
 /// a given replicated sqlite db file.
 #[derive(Debug, Default)]
@@ -119,7 +143,7 @@ struct CopierSpoolState {
 
     // Copier workers attempt to acquire this mutex before processing
     // the spool path's contents.
-    upload_lock: std::sync::Mutex<()>,
+    upload_lock: std::sync::Mutex<CopierUploadState>,
 }
 
 #[derive(Debug)]
@@ -130,17 +154,6 @@ struct CopierBackend {
     // Map from PathBuf for spool directories to their state.
     // The key is always equal to the value's `path` field.
     active_spool_paths: HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
-}
-
-/// An opaque identifier for a file's contents inode.
-#[derive(Debug, Eq, PartialEq, Hash)]
-struct FileIdentifier {
-    btime: Option<std::time::SystemTime>,
-    len: u64,
-    dev: u64,
-    ino: u64,
-    ctime: i64,
-    ctime_nsec: i64,
 }
 
 impl Clone for Copier {
@@ -656,6 +669,7 @@ impl CopierWorker {
     /// calls `handle_ready_directory`.
     fn handle_staging_directory(
         &self,
+        state: &mut CopierUploadState,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
@@ -682,24 +696,15 @@ impl CopierWorker {
                 return Ok(());
             }
 
-            let mut published = 0;
-
             consume_directory(
                 chunks_directory.clone(),
-                &mut |name: &OsStr, mut file| {
+                |name: &OsStr, mut file| {
                     self.pace();
                     copy_file(name, &mut file, &chunks_buckets)?;
-                    published += 1;
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
             )?;
-
-            // Assume there is no update to publish if the chunks
-            // directory is empty.
-            if published == 0 {
-                return Ok(());
-            }
         }
 
         // Snapshot the current meta files.  We hang on to the file to prevent
@@ -753,14 +758,29 @@ impl CopierWorker {
             consume_directory(
                 meta_directory,
                 &mut |name: &OsStr, mut file| {
-                    if initial_meta.get(name).map(|x| &x.0) == Some(&FileIdentifier::new(&file)?) {
-                        self.pace();
-                        copy_file(name, &mut file, &meta_buckets)?;
-                        replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
-                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                        })?;
+                    let identifier = FileIdentifier::new(&file)?;
+
+                    // This is a new directory file, we don't want to upload it.
+                    if initial_meta.get(name).map(|x| &x.0) != Some(&identifier) {
+                        return Ok(());
                     }
 
+                    // We have already uploaded this file, nothing to do.
+                    if state
+                        .recent_staged_directories
+                        .find(|x| x == &identifier)
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+
+                    self.pace();
+                    copy_file(name, &mut file, &meta_buckets)?;
+                    replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
+                        chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                    })?;
+
+                    state.recent_staged_directories.insert(identifier);
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::KeepAll,
@@ -773,7 +793,7 @@ impl CopierWorker {
     /// Processes one spooling directory that should be ready for
     /// replication.
     #[instrument]
-    fn handle_spooling_directory(&self, spool: &Path) {
+    fn handle_spooling_directory(&self, state: &mut CopierUploadState, spool: &Path) {
         let creds_or =
             Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"));
         if let Ok(creds) = creds_or {
@@ -829,7 +849,7 @@ impl CopierWorker {
                 // Opportunistically try to copy from the "staging"
                 // directory.  That's never staler than "ready", so we do
                 // not go backward in our replication.
-                drop_result!(self.handle_staging_directory(&targets, creds.clone(), spool.to_path_buf()),
+                drop_result!(self.handle_staging_directory(state, &targets, creds.clone(), spool.to_path_buf()),
                              e => chain_info!(e, "failed to handle staging directory", ?spool));
 
                 // And now see if the ready directory was updated again.
@@ -852,10 +872,10 @@ impl CopierWorker {
 
     fn worker_loop(&self) {
         while let Ok(state) = self.work.recv() {
-            if let Ok(_guard) = state.upload_lock.try_lock() {
+            if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 state.signaled.store(false, Ordering::Relaxed);
                 state.last_scanned.store(std::time::SystemTime::now());
-                self.handle_spooling_directory(&state.spool_path);
+                self.handle_spooling_directory(&mut upload_state, &state.spool_path);
             }
         }
     }

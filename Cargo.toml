@@ -38,6 +38,7 @@ serde_json = "1.0"
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.2", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
+uluru = "2"
 umash = "0.1.2"
 uuid = { version = "0.8", features = ["v4"] }
 
