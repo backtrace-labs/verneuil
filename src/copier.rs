@@ -132,6 +132,17 @@ struct CopierBackend {
     active_spool_paths: HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
 }
 
+/// An opaque identifier for a file's contents inode.
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct FileIdentifier {
+    btime: Option<std::time::SystemTime>,
+    len: u64,
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
 impl Clone for Copier {
     fn clone(&self) -> Self {
         self.incref(None);
@@ -519,28 +530,29 @@ fn directory_is_empty_or_absent(path: &Path) -> Result<bool> {
     }
 }
 
-/// Returns a tuple that identifies a given file; if a given path has
-/// the same identifier, it is the same (unless someone is maliciously
-/// tampering with it).
-#[instrument(level = "debug")]
-fn file_identifier(
-    file: &File,
-) -> Result<(Option<std::time::SystemTime>, u64, u64, u64, i64, i64)> {
-    use std::os::unix::fs::MetadataExt;
+impl FileIdentifier {
+    /// Returns a tuple that identifies a given file; if a given path has
+    /// the same identifier, it is the same (unless someone is maliciously
+    /// tampering with it).
+    #[instrument(level = "debug")]
+    fn new(file: &File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
 
-    let meta = file
-        .metadata()
-        .map_err(|e| chain_error!(e, "failed to stat file"))?;
-    Ok((
-        meta.created()
-            .map_err(|e| chain_debug!(e, "failed to compute file creation time", ?meta))
-            .ok(),
-        meta.len(),
-        meta.dev(),
-        meta.ino(),
-        meta.ctime(),
-        meta.ctime_nsec(),
-    ))
+        let meta = file
+            .metadata()
+            .map_err(|e| chain_error!(e, "failed to stat file"))?;
+        Ok(FileIdentifier {
+            btime: meta
+                .created()
+                .map_err(|e| chain_debug!(e, "failed to compute file creation time", ?meta))
+                .ok(),
+            len: meta.len(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -695,7 +707,7 @@ impl CopierWorker {
         consume_directory(
             meta_directory.clone(),
             &mut |name: &OsStr, file| {
-                initial_meta.insert(name.to_owned(), file_identifier(&file)?);
+                initial_meta.insert(name.to_owned(), FileIdentifier::new(&file)?);
                 Ok(())
             },
             ConsumeDirectoryPolicy::KeepAll,
@@ -740,7 +752,7 @@ impl CopierWorker {
             consume_directory(
                 meta_directory,
                 &mut |name: &OsStr, mut file| {
-                    if initial_meta.get(name) == Some(&file_identifier(&file)?) {
+                    if initial_meta.get(name) == Some(&FileIdentifier::new(&file)?) {
                         self.pace();
                         copy_file(name, &mut file, &meta_buckets)?;
                         replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
