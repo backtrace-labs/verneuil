@@ -702,12 +702,13 @@ impl CopierWorker {
             }
         }
 
-        // Snapshot the current meta files.
-        let mut initial_meta = HashMap::new();
+        // Snapshot the current meta files.  We hang on to the file to prevent
+        // inode reuse.
+        let mut initial_meta: HashMap<std::ffi::OsString, (FileIdentifier, File)> = HashMap::new();
         consume_directory(
             meta_directory.clone(),
             &mut |name: &OsStr, file| {
-                initial_meta.insert(name.to_owned(), FileIdentifier::new(&file)?);
+                initial_meta.insert(name.to_owned(), (FileIdentifier::new(&file)?, file));
                 Ok(())
             },
             ConsumeDirectoryPolicy::KeepAll,
@@ -752,7 +753,7 @@ impl CopierWorker {
             consume_directory(
                 meta_directory,
                 &mut |name: &OsStr, mut file| {
-                    if initial_meta.get(name) == Some(&FileIdentifier::new(&file)?) {
+                    if initial_meta.get(name).map(|x| &x.0) == Some(&FileIdentifier::new(&file)?) {
                         self.pace();
                         copy_file(name, &mut file, &meta_buckets)?;
                         replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
