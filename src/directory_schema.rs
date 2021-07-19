@@ -32,6 +32,22 @@ impl From<&Fingerprint> for Fprint {
     }
 }
 
+impl From<Fprint> for Fingerprint {
+    fn from(fp: Fprint) -> Fingerprint {
+        Fingerprint {
+            hash: [fp.major, fp.minor],
+        }
+    }
+}
+
+impl From<&Fprint> for Fingerprint {
+    fn from(fp: &Fprint) -> Fingerprint {
+        Fingerprint {
+            hash: [fp.major, fp.minor],
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub(crate) struct DirectoryV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There
