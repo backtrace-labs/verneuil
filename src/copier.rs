@@ -953,13 +953,13 @@ impl CopierBackend {
                     // Data in `ready_buffer` is only advisory, it's
                     // never incorrect to drop the work unit.
                     if let Some(state) = self.active_spool_paths.get(&ready) {
-                        if state.signaled.load(Ordering::Relaxed) == false {
-                // Flip the flag to true before the worker can
-                // reset it.
+                        if !state.signaled.load(Ordering::Relaxed) {
+                            // Flip the flag to true before the worker can
+                            // reset it.
                             state.signaled.store(true, Ordering::Relaxed);
                             if self.send_work(state.clone()).is_some() {
-                // If we failed to send work, clear
-                // the flag ourself and try again.
+                                // If we failed to send work, clear
+                                // the flag ourself and try again.
                                 state.signaled.store(false, Ordering::Relaxed);
                             }
                         }

@@ -62,7 +62,7 @@ impl RacySystemTime {
         self.since_epoch.store(
             update
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or(Duration::default()),
+                .unwrap_or_default(),
         );
     }
 }
