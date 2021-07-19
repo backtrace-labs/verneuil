@@ -261,21 +261,38 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
     Ok((temp, scratch))
 }
 
+/// Returns the .tap path for `source_db`'s directory proto file,
+/// given the path prefix for spooling directories (or None to use
+/// the global default).
+#[instrument(level = "debug")]
+pub(crate) fn tapped_meta_path_in_spool_prefix(
+    spool_prefix: Option<PathBuf>,
+    source_db: &Path,
+) -> Result<PathBuf> {
+    match spool_prefix.or_else(|| DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone()) {
+        None => Err(fresh_error!(
+            "no spool_prefix provided or defaulted",
+            ?source_db
+        )),
+        Some(mut tap) => {
+            tap.push(DOT_TAP);
+            tap.push(percent_encode_path_uri(source_db)?);
+            Ok(tap)
+        }
+    }
+}
+
 /// Returns the .tap path for `source_db`'s directory proto file, given the file's `spool_dir`.
 #[instrument(level = "debug")]
 pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> Result<PathBuf> {
-    // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to `...`.
+    // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to the prefix, `...`.
     let base = spool_dir
         .parent()
         .map(Path::parent)
         .flatten()
         .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
-    let mut tap = base.to_path_buf();
 
-    // And now append ".tap/$BLOB_NAME".
-    tap.push(DOT_TAP);
-    tap.push(percent_encode_path_uri(source_db)?);
-    Ok(tap)
+    tapped_meta_path_in_spool_prefix(Some(base.to_path_buf()), source_db)
 }
 
 /// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.

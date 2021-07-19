@@ -208,3 +208,195 @@ pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -
 
     verneuil_test_only_register()
 }
+
+pub struct ReplicationProtoData {
+    // Fingerprint of the sqlite db's header.
+    pub header_fprint: umash::Fingerprint,
+    // Fingerprint of the db's full contents.
+    pub contents_fprint: umash::Fingerprint,
+    // ctime of the snapshotted db file.
+    pub ctime: std::time::SystemTime,
+
+    // Directory proto bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Attempts to return the name for the directory proto blob associated
+/// with `source_db`, and our local snapshot of that blob if available.
+///
+/// The contents of the file are looked up in a subdirectory of
+/// `spool_prefix`, or in the default prefix if None.
+pub fn current_replication_proto_for_db(
+    source_db: &std::path::Path,
+    spool_prefix: Option<std::path::PathBuf>,
+) -> result::Result<(String, Option<ReplicationProtoData>)> {
+    let meta_path = replication_buffer::tapped_meta_path_in_spool_prefix(spool_prefix, source_db)?;
+
+    let blob_name = meta_path
+        .file_name()
+        .expect("meta_path must have file name")
+        .to_str()
+        .expect("url-encoded blob name must be valid utf-8")
+        .to_string();
+
+    let proto_data = (|| {
+        use prost::Message;
+
+        let bytes = match std::fs::read(&meta_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(chain_error!(
+                    e,
+                    "failed to read tapped meta file",
+                    ?meta_path
+                ))
+            }
+            Ok(bytes) => bytes,
+        };
+
+        let v1 = match directory_schema::Directory::decode(&*bytes) {
+            Err(e) => {
+                let _ = chain_error!(e, "failed to decode proto bytes", ?meta_path);
+                return Ok(None);
+            }
+            Ok(directory) => {
+                if let Some(v1) = directory.v1 {
+                    v1
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        let header_fprint = if let Some(fprint) = v1.header_fprint {
+            fprint.into()
+        } else {
+            return Ok(None);
+        };
+        let contents_fprint = if let Some(fprint) = v1.contents_fprint {
+            fprint.into()
+        } else {
+            return Ok(None);
+        };
+        let ctime = if v1.ctime > 0 {
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(v1.ctime as u64, v1.ctime_ns as u32)
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(ReplicationProtoData {
+            header_fprint,
+            contents_fprint,
+            ctime,
+            bytes,
+        }))
+    })()?;
+
+    Ok((blob_name, proto_data))
+}
+
+#[repr(C)]
+pub struct ForeignReplicationInfo {
+    blob_name: *mut c_char,
+
+    header_fprint: [u64; 2],
+    contents_fprint: [u64; 2],
+    ctime: u64,
+    ctime_ns: u32,
+
+    num_bytes: usize,
+    bytes: *mut c_char,
+}
+
+/// Populates `dst_ptr` with the replication information for
+/// sqlite file `c_db`, inside the `c_prefix` spooling directory
+/// (or `NULL` for the global default).
+///
+/// # Safety
+///
+/// This function assumes its arguments are valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn verneuil_replication_info_for_db(
+    dst_ptr: *mut ForeignReplicationInfo,
+    c_db: *const c_char,
+    c_prefix: *const c_char,
+) -> i32 {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if dst_ptr.is_null() {
+        tracing::error!("invalid dst (null)");
+        return -1;
+    }
+
+    let dst = dst_ptr.as_mut().expect("should be non-null");
+    *dst = std::mem::zeroed();
+
+    if c_db.is_null() {
+        tracing::error!("invalid db argument (null)");
+        return -1;
+    }
+
+    let db = CStr::from_ptr(c_db);
+    let prefix = if c_prefix.is_null() {
+        None
+    } else {
+        Some(Path::new(OsStr::from_bytes(CStr::from_ptr(c_prefix).to_bytes())).to_path_buf())
+    };
+
+    let (blob_name, info_or) = match current_replication_proto_for_db(
+        Path::new(OsStr::from_bytes(db.to_bytes())),
+        prefix.clone(),
+    ) {
+        Err(e) => {
+            let _ = chain_error!(e, "failed to fetch replication info for db", ?db, ?prefix);
+            return -1;
+        }
+        Ok(ret) => ret,
+    };
+
+    dst.blob_name = CString::from_vec_unchecked(blob_name.into_bytes()).into_raw();
+    if let Some(info) = info_or {
+        dst.header_fprint = info.header_fprint.hash;
+        dst.contents_fprint = info.contents_fprint.hash;
+
+        let ctime = info
+            .ctime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        dst.ctime = ctime.as_secs();
+        dst.ctime_ns = ctime.subsec_nanos();
+
+        let mut bytes = info.bytes.into_boxed_slice();
+        dst.num_bytes = bytes.len();
+        dst.bytes = bytes.as_mut_ptr() as *mut _;
+
+        // Leak `bytes`: we will reconstruct it in
+        // `verneuil_replication_info_deinit`.
+        let _ = Box::into_raw(bytes);
+    }
+
+    0
+}
+
+/// Releases resources owned by `info_ptr`
+///
+/// # Safety
+///
+/// This function assumes its argument is a valid pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn verneuil_replication_info_deinit(info_ptr: *mut ForeignReplicationInfo) {
+    if let Some(info) = info_ptr.as_mut() {
+        if !info.blob_name.is_null() {
+            std::mem::drop(CString::from_raw(info.blob_name));
+        }
+
+        if !info.bytes.is_null() {
+            let slice = std::slice::from_raw_parts_mut(info.bytes, info.num_bytes);
+            std::mem::drop(Box::from_raw(slice))
+        }
+
+        *info = std::mem::zeroed();
+    }
+}

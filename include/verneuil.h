@@ -1,6 +1,7 @@
 #pragma once
 #include <sqlite3ext.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct verneuil_options {
@@ -81,3 +82,44 @@ int verneuil_configure(const struct verneuil_options *options);
  */
 int sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
     const sqlite3_api_routines *pApi);
+
+/**
+ * Information about the replication proto for a given sqlite db file.
+ *
+ * The `blob_name` is a C string and should always be available on
+ * success.  All remaining fields may be 0 on failure.
+ */
+struct verneuil_replication_info {
+	/* Name of the corresponding blob in remote storage. */
+	char *blob_name;
+
+	/* Metadata from the blob proto. */
+	uint64_t header_fprint[2];
+	uint64_t contents_fprint[2];
+	uint64_t ctime;
+	uint32_t ctime_ns;
+
+	/*
+	 * Actual protobuf-encoded payload in the directory blob, if
+	 * known.
+	 */
+	size_t num_bytes;
+	char *bytes;
+};
+
+/**
+ * Populates `dst` with the replication information for sqlite file `db`,
+ * inside the `spool_prefix` spooling directory (or `NULL` for the
+ * default).
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int verneuil_replication_info_for_db(struct verneuil_replication_info *dst, const char *db,
+    const char *spool_prefix);
+
+/**
+ * Releases resources owned by `info`.
+ *
+ * Safe to call on zero-initialised or NULL `info`.
+ */
+void verneuil_replication_info_deinit(struct verneuil_replication_info *info);
