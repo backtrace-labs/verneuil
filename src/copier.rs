@@ -12,6 +12,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -28,7 +29,6 @@ use crate::chain_warn;
 use crate::drop_result;
 use crate::filtered_io_error;
 use crate::fresh_error;
-use crate::fresh_info;
 use crate::fresh_warn;
 use crate::racy_time::RacySystemTime;
 use crate::replication_buffer;
@@ -140,6 +140,18 @@ struct CopierSpoolState {
 
     // Last time we started a copy scan.
     last_scanned: RacySystemTime,
+
+    // Incremented when we successfully handle the spool directory.
+    consecutive_successes: AtomicU64,
+    last_success: RacySystemTime,
+
+    // Incremented when we fail to handle the spool directory.
+    consecutive_failures: AtomicU64,
+    last_failure: RacySystemTime,
+
+    // Incremented when we upload a new directory blob.
+    consecutive_updates: AtomicU64,
+    last_update: RacySystemTime,
 
     // Copier workers attempt to acquire this mutex before processing
     // the spool path's contents.
@@ -596,12 +608,14 @@ impl CopierWorker {
     /// the corresponding files and directory as we go.  Once *everything*
     /// has been copied, the directory will be empty, which will
     /// make it possible to rename fresh replication data over it.
+    ///
+    /// Returns whether we successfully updated the remote snapshot.
     fn handle_ready_directory(
         &self,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _span = info_span!("handle_ready_directory", ?targets, ?parent);
 
         let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
@@ -617,7 +631,7 @@ impl CopierWorker {
             // If we don't have replication target, best to leave the data
             // where it is.
             if chunks_buckets.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
 
             consume_directory(
@@ -630,6 +644,8 @@ impl CopierWorker {
             )?;
         }
 
+        let mut did_something = false;
+
         {
             let meta_buckets = targets
                 .replication_targets
@@ -639,12 +655,12 @@ impl CopierWorker {
                 .collect::<Vec<_>>();
 
             if meta_buckets.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
 
             let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
                 Some(file) => file,
-                None => return Ok(()),
+                None => return Ok(false),
             };
 
             consume_directory(
@@ -654,7 +670,9 @@ impl CopierWorker {
                     copy_file(name, &mut file, &meta_buckets)?;
                     replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
                         chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                    })
+                    })?;
+                    did_something = true;
+                    Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
             )?;
@@ -663,8 +681,7 @@ impl CopierWorker {
         // And now try to get rid of the hopefully empty directory.
         drop_result!(replication_buffer::remove_ready_directory_if_empty(parent),
                      e => chain_info!(e, "failed to clean up ready directory"));
-
-        Ok(())
+        Ok(did_something)
     }
 
     /// Handles one "staging" directory: copy the chunks, then copy
@@ -678,7 +695,7 @@ impl CopierWorker {
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let _span = info_span!("handle_staging_directory", ?targets, ?parent);
 
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
@@ -698,7 +715,7 @@ impl CopierWorker {
             // If we don't have replication target, best to leave the data
             // where it is.
             if chunks_buckets.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
 
             consume_directory(
@@ -727,10 +744,8 @@ impl CopierWorker {
         // We must now make sure that we have published all the chunks
         // before publishing the meta files.
         if !directory_is_empty_or_absent(&chunks_directory)? {
-            return Err(fresh_info!(
-                "unpublished staged chunks remain",
-                ?chunks_directory
-            ));
+            tracing::info!(?chunks_directory, "unpublished staged chunks remain");
+            return Ok(false);
         }
 
         // If the "ready" directory now exists, we may have observed an
@@ -744,9 +759,12 @@ impl CopierWorker {
         {
             let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
             if !directory_is_empty_or_absent(&ready_directory)? {
-                return Err(fresh_info!("ready directory exists", ?ready_directory));
+                tracing::info!(?ready_directory, "ready directory exists");
+                return Ok(false);
             }
         }
+
+        let mut did_something = false;
 
         {
             let meta_buckets = targets
@@ -757,12 +775,12 @@ impl CopierWorker {
                 .collect::<Vec<_>>();
 
             if meta_buckets.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
 
             let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
                 Some(file) => file,
-                None => return Ok(()),
+                None => return Ok(false),
             };
 
             consume_directory(
@@ -791,101 +809,145 @@ impl CopierWorker {
                     })?;
 
                     state.recent_staged_directories.insert(identifier);
+                    did_something = true;
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::KeepAll,
             )?;
         }
 
-        Ok(())
+        Ok(did_something)
     }
 
     /// Processes one spooling directory that should be ready for
     /// replication.
+    ///
+    /// Returns `Err` on failure, `Ok(true)` if we updated snapshots,
+    /// and `Ok(false)` if we successfully did not make progress.
     #[instrument]
-    fn handle_spooling_directory(&self, state: &mut CopierUploadState, spool: &Path) {
-        let creds_or =
-            Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"));
-        if let Ok(creds) = creds_or {
-            // Try to read the metadata JSON, which tells us where to
-            // replicate the chunks and meta files.  If we can't do
-            // that, leave this precious data where it is...  We don't
-            // provide any hard liveness guarantee on replication, so
-            // that's not incorrect.  Even when replication is stuck,
-            // the buffering system bounds the amount of replication
-            // data we keep around.
-            let targets_or: Result<ReplicationTargetList> = (|| {
-                let metadata = replication_buffer::buffer_metadata_file(spool.to_path_buf());
-                let contents = std::fs::read(&*metadata)
-                    .map_err(|e| chain_error!(e, "failed to read .metadata file", ?metadata))?;
-                let parsed = serde_json::from_slice(&contents).map_err(|e| {
-                    chain_error!(e, "failed to parse .metadata file", ?metadata, ?contents)
-                })?;
+    fn handle_spooling_directory(
+        &self,
+        state: &mut CopierUploadState,
+        spool: &Path,
+    ) -> Result<bool> {
+        let mut did_something = false;
+        let creds =
+            Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"))?;
 
-                Ok(parsed)
-            })();
+        // Try to read the metadata JSON, which tells us where to
+        // replicate the chunks and meta files.  If we can't do
+        // that, leave this precious data where it is...  We don't
+        // provide any hard liveness guarantee on replication, so
+        // that's not incorrect.  Even when replication is stuck,
+        // the buffering system bounds the amount of replication
+        // data we keep around.
+        let targets: ReplicationTargetList = {
+            let metadata = replication_buffer::buffer_metadata_file(spool.to_path_buf());
+            let contents = std::fs::read(&*metadata)
+                .map_err(|e| chain_error!(e, "failed to read .metadata file", ?metadata))?;
 
-            if let Ok(targets) = targets_or {
-                let ready = replication_buffer::mutable_ready_directory(spool.to_path_buf());
-                let is_empty = directory_is_empty_or_absent(&ready)
-                    .map_err(|e| chain_debug!(e, "failed to list directory", ?ready));
-                if matches!(is_empty, Ok(true)) {
-                    // It's not an error if this fails: we expect
-                    // failures when `ready` becomes non-empty, and
-                    // we never lose data.
-                    drop_result!(std::fs::remove_dir(&ready),
-                                 e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
-                                                         "failed to remove ready directory", ?ready));
-                } else {
-                    // Failures are expected when concurrent processes
-                    // or copiers work on the same `path`.  Even when
-                    // `handle_directory` fails, we're either making
-                    // progress, or `path` is in a bad state and we
-                    // choose to keep it untouched rather than drop
-                    // data that we have failed to copy to the
-                    // replication targets.
-                    drop_result!(self.handle_ready_directory(&targets, creds.clone(), spool.to_path_buf()),
-                                 e => chain_info!(e, "failed to handle ready directory", ?spool));
+            serde_json::from_slice(&contents).map_err(|e| {
+                chain_error!(e, "failed to parse .metadata file", ?metadata, ?contents)
+            })?
+        };
 
-                    // We've done some work here (handled a non-empty
-                    // "ready" directory).  If the governor isn't
-                    // immediately ready for us, bail and let another
-                    // directory make progress.
-                    if self.governor.check().is_err() {
-                        return;
-                    }
-                }
+        let ready = replication_buffer::mutable_ready_directory(spool.to_path_buf());
+        let is_empty = directory_is_empty_or_absent(&ready)
+            .map_err(|e| chain_debug!(e, "failed to list directory", ?ready));
+        if matches!(is_empty, Ok(true)) {
+            // It's not an error if this fails: we expect
+            // failures when `ready` becomes non-empty, and
+            // we never lose data.
+            drop_result!(std::fs::remove_dir(&ready),
+                         e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+                                                 "failed to remove ready directory", ?ready));
+        } else {
+            // Failures are expected when concurrent processes
+            // or copiers work on the same `path`.  Even when
+            // `handle_directory` fails, we're either making
+            // progress, or `path` is in a bad state and we
+            // choose to keep it untouched rather than drop
+            // data that we have failed to copy to the
+            // replication targets.
+            did_something |= self
+                .handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
+                .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))?;
 
-                // Opportunistically try to copy from the "staging"
-                // directory.  That's never staler than "ready", so we do
-                // not go backward in our replication.
-                drop_result!(self.handle_staging_directory(state, &targets, creds.clone(), spool.to_path_buf()),
-                             e => chain_info!(e, "failed to handle staging directory", ?spool));
-
-                // And now see if the ready directory was updated again.
-                // We only upload meta files (directory protos) if we
-                // observed that the "ready" directory was empty while the
-                // meta files had the same value as when we entered
-                // "handle_staging_directory".  Anything we now find in
-                // the "ready" directory must be at least as recent as
-                // what we found in staging, so, again, replication
-                // cannot go backwards.
-                drop_result!(self.handle_ready_directory(&targets, creds, spool.to_path_buf()),
-                             e => chain_info!(e, "failed to rehandle ready directory", ?spool));
-
-                // When we get here, the remote data should be at least as
-                // fresh as the last staged snapshot when we entered the
-                // loop body.
+            // We've done some work here (handled a non-empty
+            // "ready" directory).  If the governor isn't
+            // immediately ready for us, bail and let another
+            // directory make progress.
+            if self.governor.check().is_err() {
+                return Ok(did_something);
             }
         }
+
+        // Opportunistically try to copy from the "staging"
+        // directory.  That's never staler than "ready", so we do
+        // not go backward in our replication.
+        match self.handle_staging_directory(state, &targets, creds.clone(), spool.to_path_buf()) {
+            Ok(ret) => did_something |= ret,
+            Err(e) => {
+                if !did_something {
+                    return Err(chain_warn!(e, "failed to handle staging directory", ?spool));
+                }
+            }
+        }
+
+        // And now see if the ready directory was updated again.
+        // We only upload meta files (directory protos) if we
+        // observed that the "ready" directory was empty while the
+        // meta files had the same value as when we entered
+        // "handle_staging_directory".  Anything we now find in
+        // the "ready" directory must be at least as recent as
+        // what we found in staging, so, again, replication
+        // cannot go backwards.
+        match self.handle_ready_directory(&targets, creds, spool.to_path_buf()) {
+            Ok(ret) => did_something |= ret,
+            Err(e) => {
+                if !did_something {
+                    return Err(chain_warn!(e, "failed to rehandle ready directory", ?spool));
+                }
+            }
+        }
+
+        // When we get here, the remote data should be at least as
+        // fresh as the last staged snapshot when we entered the
+        // loop body.
+        Ok(did_something)
     }
 
     fn worker_loop(&self) {
         while let Ok(state) = self.work.recv() {
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 state.signaled.store(false, Ordering::Relaxed);
-                state.last_scanned.store(std::time::SystemTime::now());
-                self.handle_spooling_directory(&mut upload_state, &state.spool_path);
+                state.last_scanned.store_now();
+                match self.handle_spooling_directory(&mut upload_state, &state.spool_path) {
+                    Ok(true) => {
+                        state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
+                        state.consecutive_failures.store(0, Ordering::Relaxed);
+                        state.consecutive_updates.fetch_add(1, Ordering::Relaxed);
+
+                        let now = std::time::SystemTime::now();
+                        state.last_success.store(now);
+                        state.last_update.store(now);
+                    }
+                    Ok(false) => {
+                        state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
+                        state.consecutive_failures.store(0, Ordering::Relaxed);
+                        state.consecutive_updates.store(0, Ordering::Relaxed);
+
+                        state.last_success.store_now();
+                    }
+                    Err(e) => {
+                        let _ = chain_info!(e, "failed to handle spooling directory", ?state.spool_path);
+                        state.consecutive_successes.store(0, Ordering::Relaxed);
+                        state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                        state.consecutive_updates.store(0, Ordering::Relaxed);
+
+                        state.last_failure.store_now();
+                    }
+                }
             }
         }
     }

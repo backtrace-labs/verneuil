@@ -65,4 +65,8 @@ impl RacySystemTime {
                 .unwrap_or_default(),
         );
     }
+
+    pub fn store_now(&self) {
+        self.store(SystemTime::now());
+    }
 }
