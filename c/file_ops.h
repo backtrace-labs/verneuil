@@ -37,3 +37,11 @@ ssize_t verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz);
  * Returns 0 on success, 1 if ENOTSUP, and -1 on all other errors.
  */
 int verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz);
+
+/**
+ * Attempts to acquire an exclusive file-private (OFD) lock on bytes
+ * [0, 1) of `fd`.
+ *
+ * Returns 0 on success, 1 if the lock is taken, -1 on failure.
+ */
+int verneuil__ofd_lock_exclusive(int fd);

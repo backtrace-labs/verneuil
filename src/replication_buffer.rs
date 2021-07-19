@@ -182,6 +182,12 @@ const READY: &str = "ready";
 /// tells copier where to copy ready and staged data.
 const DOT_METADATA: &str = ".metadata";
 
+/// The ".meta_copy_lock" file, at the toplevel of the buffer
+/// directory, lets copiers serialise their upload and consumption of
+/// directory blobs.  This serialisation prevents snapshots from going
+/// back in time when a copier is slow to upload an old directory blob.
+const DOT_META_COPY_LOCK: &str = ".meta_copy_lock";
+
 const CHUNKS: &str = "chunks";
 const META: &str = "meta";
 const SCRATCH: &str = "scratch";
@@ -313,6 +319,43 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
                      e => chain_warn!(e, "failed to remove scratch file", ?scratch));
         chain_warn!(e, "failed to tap update meta file")
     })
+}
+
+/// Attempts to acquire the local lock around uploading "meta"
+/// directory blobs.
+///
+/// Returns a File object that owns the lock on success (dropping that
+/// file will release the lock), None on acquisition failure.
+#[instrument(level = "debug")]
+pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    extern "C" {
+        fn verneuil__ofd_lock_exclusive(fd: i32) -> i32;
+    }
+
+    let mut lock_path = spool_dir;
+    lock_path.push(DOT_META_COPY_LOCK);
+
+    let file = std::fs::OpenOptions::new()
+        .mode(0o666)
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|e| chain_error!(e, "failed to open meta copy lock file", ?lock_path))?;
+    match unsafe { verneuil__ofd_lock_exclusive(file.as_raw_fd()) } {
+        0 => Ok(Some(file)),
+        1 => {
+            tracing::info!(?lock_path, "meta copy lock unavailable");
+            Ok(None)
+        }
+        _ => Err(error_from_os!(
+            "failed to acquire meta copy lock",
+            ?lock_path
+        )),
+    }
 }
 
 /// Removes directory separators from the input, and replaces them

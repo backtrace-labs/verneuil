@@ -9,6 +9,20 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 
+/**
+ * Some older distributions fail to expose OFD constants.  Hardcode
+ * them if necessary: open file description locks have been around
+ * since Linux 3.15, and we don't try to support anything that old
+ * (getrandom was introduced in 3.17, and we also use that).
+ */
+#ifndef F_OFD_SETLK
+#define F_OFD_SETLK     37
+#endif
+
+#if F_OFD_SETLK != 37
+# error "Mismatch in fallback OFD fcntl constant."
+#endif
+
 int
 verneuil__open_temp_file(const char *directory, int mode)
 {
@@ -80,6 +94,30 @@ verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz)
                 return 0;
 
         if (errno == ENOTSUP)
+                return 1;
+
+        return -1;
+}
+
+int
+verneuil__ofd_lock_exclusive(int fd)
+{
+        struct flock fl = {
+                .l_type = F_WRLCK,
+                .l_whence = SEEK_SET,
+                .l_start = 0,
+                .l_len = 1,
+        };
+        int r;
+
+        do {
+                r = fcntl(fd, F_OFD_SETLK, &fl);
+        } while (r < 0 && errno == EINTR);
+
+        if (r == 0)
+                return 0;
+
+        if (errno == EAGAIN)
                 return 1;
 
         return -1;

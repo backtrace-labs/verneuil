@@ -642,6 +642,11 @@ impl CopierWorker {
                 return Ok(());
             }
 
+            let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
+                Some(file) => file,
+                None => return Ok(()),
+            };
+
             consume_directory(
                 replication_buffer::directory_meta(ready),
                 |name, mut file| {
@@ -754,6 +759,11 @@ impl CopierWorker {
             if meta_buckets.is_empty() {
                 return Ok(());
             }
+
+            let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
+                Some(file) => file,
+                None => return Ok(()),
+            };
 
             consume_directory(
                 meta_directory,
