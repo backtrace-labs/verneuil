@@ -89,21 +89,23 @@ macro_rules! fresh {
     ($level:expr, $message:expr $(,)?) => {{
         #[allow(unused)]
         const LEVEL: tracing::Level = $level;
-        let cause: (_, Option<()>, _) = (uuid::Uuid::new_v4(), None, $crate::result::__maybe_compute_backtrace(LEVEL));
+        let root_id = uuid::Uuid::new_v4();
+        let bt = $crate::result::__maybe_compute_backtrace(LEVEL);
         let message = $message;
-        let ret = $crate::result::Error::new(cause.0, message);
+        let ret = $crate::result::Error::new(root_id, message);
 
-        tracing::event!(LEVEL, ?cause, $message);
+        tracing::event!(LEVEL, %root_id, ?bt, $message);
         ret
     }};
     ($level:expr, $message:expr, $($fields:tt)+) => {{
         #[allow(unused)]
         const LEVEL: tracing::Level = $level;
-        let cause: (_, Option<()>, _) = (uuid::Uuid::new_v4(), None, $crate::result::__maybe_compute_backtrace(LEVEL));
+        let root_id = uuid::Uuid::new_v4();
+        let bt = $crate::result::__maybe_compute_backtrace(LEVEL);
         let message = $message;
-        let ret = $crate::result::Error::new(cause.0, message);
+        let ret = $crate::result::Error::new(root_id, message);
 
-        tracing::event!(LEVEL, $($fields)+, ?cause, $message);
+        tracing::event!(LEVEL, $($fields)+, %root_id, ?bt, $message);
         ret
     }};
 }
@@ -137,21 +139,21 @@ macro_rules! chain {
     ($initial:expr, $level:expr, $message:expr $(,)?) => {{
         #[allow(unused)]
         const LEVEL: tracing::Level = $level;
-        let cause = $crate::result::__extract_cause_info($initial, LEVEL);
+        let (root_id, cause, bt) = $crate::result::__extract_cause_info($initial, LEVEL);
         let message = $message;
-        let ret = $crate::result::Error::new(cause.0, message);
+        let ret = $crate::result::Error::new(root_id, message);
 
-        tracing::event!(LEVEL, ?cause, $message);
+        tracing::event!(LEVEL, %root_id, ?cause, ?bt, $message);
         ret
     }};
     ($initial:expr, $level:expr, $message:expr, $($fields:tt)+) => {{
         #[allow(unused)]
         const LEVEL: tracing::Level = $level;
-        let cause = $crate::result::__extract_cause_info($initial, LEVEL);
+        let (root_id, cause, bt) = $crate::result::__extract_cause_info($initial, LEVEL);
         let message = $message;
-        let ret = $crate::result::Error::new(cause.0, message);
+        let ret = $crate::result::Error::new(root_id, message);
 
-        tracing::event!(LEVEL, $($fields)+, ?cause, $message);
+        tracing::event!(LEVEL, $($fields)+, %root_id, ?cause, ?bt, $message);
         ret
     }};
 }
