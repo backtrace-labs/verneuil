@@ -279,8 +279,10 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
     tap.push(DOT_TAP);
     std::fs::create_dir_all(&tap).map_err(|e| {
         filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
-                                        "failed to rceate .tap dir", dir=?tap)
+                                        "failed to create .tap dir", dir=?tap)
     })?;
+    std::fs::set_permissions(&tap, PermissionsExt::from_mode(0o777))
+        .map_err(|e| chain_error!(e, "failed to set .tap permissions", dir=?tap))?;
 
     tap.push(name);
 
@@ -648,6 +650,9 @@ impl ReplicationBuffer {
                     ?spooling
                 )
             })?;
+            std::fs::set_permissions(&spooling, PermissionsExt::from_mode(0o777)).map_err(
+                |e| chain_error!(e, "failed to set spooling dir permissions", dir=?spooling),
+            )?;
             Ok(Some(ReplicationBuffer {
                 spooling_directory: spooling,
             }))
@@ -672,12 +677,17 @@ impl ReplicationBuffer {
             e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
                                     "failed to create staging dir", dir=?buf)
         );
+        drop_result!(std::fs::set_permissions(&buf, PermissionsExt::from_mode(0o777)),
+                     e => chain_error!(e, "failed to set staging dir permissions", dir=?buf));
         for subdir in &SUBDIRS {
             buf.push(subdir);
             drop_result!(
                 std::fs::create_dir_all(&buf),
-                e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG, "failed to create staging subdir", subdir, dir=?buf)
+                e => filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
+                                        "failed to create staging subdir", subdir, dir=?buf)
             );
+            drop_result!(std::fs::set_permissions(&buf, PermissionsExt::from_mode(0o777)),
+                         e => chain_error!(e, "failed to set staging subdir permissions", dir=?buf));
             buf.pop();
         }
 
@@ -839,6 +849,9 @@ impl ReplicationBuffer {
             .map_err(|e| chain_error!(e, "failed to create temporary directory", ?target))?;
 
         let mut temp_path = temp.path().to_owned();
+        std::fs::set_permissions(&temp_path, PermissionsExt::from_mode(0o777)).map_err(
+            |e| chain_error!(e, "failed to set temporary dir permissions", dir=?temp_path),
+        )?;
 
         // hardlink relevant chunk files to `temp_path/chunks`.
         staging.push(CHUNKS);
@@ -851,6 +864,9 @@ impl ReplicationBuffer {
                 ?temp_path
             )
         })?;
+        std::fs::set_permissions(&temp_path, PermissionsExt::from_mode(0o777)).map_err(
+            |e| chain_error!(e, "failed to set temporary chunks dir permissions", dir=?temp_path),
+        )?;
 
         for file in std::fs::read_dir(&staging)
             .map_err(|e| chain_error!(e, "failed to list staged chunks", ?staging))?
@@ -899,6 +915,9 @@ impl ReplicationBuffer {
                 ?temp_path
             )
         })?;
+        std::fs::set_permissions(&temp_path, PermissionsExt::from_mode(0o777)).map_err(
+            |e| chain_error!(e, "failed to set temporary meta dir permissions", dir=?temp_path),
+        )?;
 
         for file_or in std::fs::read_dir(&staging)
             .map_err(|e| chain_error!(e, "failed to list staged meta", ?staging))?
