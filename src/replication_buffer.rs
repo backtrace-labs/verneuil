@@ -261,6 +261,23 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
     Ok((temp, scratch))
 }
 
+/// Returns the .tap path for `source_db`'s directory proto file, given the file's `spool_dir`.
+#[instrument(level = "debug")]
+pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> Result<PathBuf> {
+    // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to `...`.
+    let base = spool_dir
+        .parent()
+        .map(Path::parent)
+        .flatten()
+        .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
+    let mut tap = base.to_path_buf();
+
+    // And now append ".tap/$BLOB_NAME".
+    tap.push(DOT_TAP);
+    tap.push(percent_encode_path_uri(source_db)?);
+    Ok(tap)
+}
+
 /// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
 #[instrument(level = "debug")]
 pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &File) -> Result<()> {

@@ -5,6 +5,7 @@
 use core::num::NonZeroU32;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -26,6 +27,7 @@ use crate::chain_debug;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
+use crate::directory_schema::parse_directory_ctime;
 use crate::drop_result;
 use crate::filtered_io_error;
 use crate::fresh_error;
@@ -74,6 +76,12 @@ const WORKER_COUNT: usize = 2;
 /// remember?  This memory lets us avoid repeated uploads of the
 /// same "staged" directory file.
 const STAGED_DIRECTORY_MEMORY: usize = 2;
+
+/// Try to identify lagging replication roughly at this period.
+const REPLICATION_LAG_REPORT_PERIOD: Duration = Duration::from_secs(61);
+
+/// Warn about DB files for which replication is this far behind.
+const REPLICATION_LAG_REPORT_THRESHOLD: Duration = Duration::from_secs(120);
 
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
@@ -158,11 +166,46 @@ struct CopierSpoolState {
     upload_lock: std::sync::Mutex<CopierUploadState>,
 }
 
+type DateTime = chrono::DateTime<chrono::Utc>;
+
+fn is_epoch(date_time: &DateTime) -> bool {
+    let epoch: DateTime = std::time::SystemTime::UNIX_EPOCH.into();
+    date_time == &epoch
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CopierSpoolLagInfo {
+    // ctime for the local sqlite db file.
+    #[serde(skip_serializing_if = "is_epoch")]
+    source_file_ctime: DateTime,
+
+    // ctime in the last replicated directory proto.
+    replicated_file_ctime: DateTime,
+
+    // time of the last copier scan
+    #[serde(skip_serializing_if = "is_epoch")]
+    last_scanned: DateTime,
+
+    // Success / failure / update statistics.
+    consecutive_successes: u64,
+    #[serde(skip_serializing_if = "is_epoch")]
+    last_success: DateTime,
+
+    consecutive_failures: u64,
+    #[serde(skip_serializing_if = "is_epoch")]
+    last_failure: DateTime,
+
+    consecutive_updates: u64,
+    #[serde(skip_serializing_if = "is_epoch")]
+    last_update: DateTime,
+}
+
 #[derive(Debug)]
 struct CopierBackend {
     ready_buffers: crossbeam_channel::Receiver<Arc<PathBuf>>,
     maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
     workers: crossbeam_channel::Sender<Arc<CopierSpoolState>>,
+    periodic_lag_scan: crossbeam_channel::Receiver<std::time::Instant>,
     // Map from PathBuf for spool directories to their state.
     // The key is always equal to the value's `path` field.
     active_spool_paths: HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
@@ -953,6 +996,58 @@ impl CopierWorker {
     }
 }
 
+impl CopierSpoolState {
+    /// Returns a pair of (key, lag info).  The key is the source db
+    /// file if it is known, and the mangled replication path otherwise.
+    fn lag_info(&self) -> Result<(PathBuf, CopierSpoolLagInfo)> {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::SystemTime;
+
+        let (key, source_file_ctime, replicated_file_ctime) = match &self.source {
+            Some(path) => {
+                let stat = path.metadata().map_err(|e| {
+                    filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+                                       "failed to stat source db file")
+                })?;
+                let source_ctime = SystemTime::UNIX_EPOCH
+                    + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
+
+                let tap_file =
+                    replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
+                (
+                    path.clone(),
+                    source_ctime,
+                    parse_directory_ctime(&tap_file)?,
+                )
+            }
+            None => (
+                Path::new(self.spool_path.file_name().unwrap_or_default()).to_path_buf(),
+                SystemTime::UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
+            ),
+        };
+
+        Ok((
+            key,
+            CopierSpoolLagInfo {
+                source_file_ctime: source_file_ctime.into(),
+                replicated_file_ctime: replicated_file_ctime.into(),
+
+                last_scanned: self.last_scanned.load().into(),
+
+                consecutive_successes: self.consecutive_successes.load(Ordering::Relaxed),
+                last_success: self.last_success.load().into(),
+
+                consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
+                last_failure: self.last_failure.load().into(),
+
+                consecutive_updates: self.consecutive_updates.load(Ordering::Relaxed),
+                last_update: self.last_update.load().into(),
+            },
+        ))
+    }
+}
+
 impl CopierBackend {
     fn new(
         worker_count: usize,
@@ -984,6 +1079,7 @@ impl CopierBackend {
             ready_buffers: buf_recv,
             maintenance: maintenance_recv,
             workers: worker_send,
+            periodic_lag_scan: crossbeam_channel::tick(REPLICATION_LAG_REPORT_PERIOD),
             active_spool_paths: HashMap::new(),
         };
 
@@ -1001,6 +1097,53 @@ impl CopierBackend {
             Err(Full(work)) => Some(work),
             Err(Disconnected(_)) => panic!("workers disconnected"),
         }
+    }
+
+    /// Gathers statistics on replication lag for all currently
+    /// tracked sqlite db files.
+    ///
+    /// Logs at WARNing level when lag is above the
+    /// `REPLICATION_LAG_REPORT_THRESHOLD`.
+    #[instrument]
+    fn scan_for_replication_lag(&self) {
+        let stats: BTreeMap<String, CopierSpoolLagInfo> = self
+            .active_spool_paths
+            .values()
+            .map(|spool_state| -> Result<_> {
+                let (k, v) = spool_state.lag_info().map_err(|e| {
+                    chain_error!(e, "failed to extract replication lag info", ?spool_state)
+                })?;
+
+                Ok((k.to_string_lossy().into_owned(), v))
+            })
+            .flatten()
+            .collect();
+
+        for (path, stats) in stats.iter() {
+            // If the replicated file is behind...
+            if matches!(stats
+                .source_file_ctime
+                .signed_duration_since(stats.replicated_file_ctime)
+                .to_std(),
+                Ok(lag) if lag > Duration::new(0, 1))
+            {
+                let now: DateTime = std::time::SystemTime::now().into();
+
+                // and this has been the case for a while.
+                match now.signed_duration_since(stats.source_file_ctime).to_std() {
+                    Ok(delay) if delay >= REPLICATION_LAG_REPORT_THRESHOLD => {
+                        let stats = serde_json::to_string(&stats)
+                            .expect("failed to serialise replication lag statistics");
+                        tracing::warn!(?path, ?delay, %stats, "replication lag exceeds threshold");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let json_stats =
+            serde_json::to_string(&stats).expect("failed to serialise replication lag statistics");
+        tracing::info!(num_tracked=stats.len(), %json_stats, "computed replication lag");
     }
 
     /// Handles the next request from our channels.  Returns true on
@@ -1065,6 +1208,7 @@ impl CopierBackend {
                 },
                 Err(_) => return false,
             },
+        recv(self.periodic_lag_scan) -> _ => self.scan_for_replication_lag(),
             default(timeout) => {},
         }
 

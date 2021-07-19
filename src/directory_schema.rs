@@ -4,6 +4,7 @@ use tracing::instrument;
 use umash::Fingerprint;
 use uuid::Uuid;
 
+use crate::chain_error;
 use crate::result::Result;
 use crate::warn_from_os;
 
@@ -309,6 +310,32 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
     }
 
     Fingerprint::generate(&DIRECTORY_PARAMS, 0, &bytes)
+}
+
+/// Returns the ctime stored in the directory proto at `path`, or `UNIX_EPOCH` if
+/// there is no such file.
+pub(crate) fn parse_directory_ctime(path: &std::path::Path) -> Result<std::time::SystemTime> {
+    use prost::Message;
+    use std::time::SystemTime;
+
+    match std::fs::read(path) {
+        Ok(contents) => {
+            let directory = Directory::decode(&*contents)
+                .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
+            if let Some(v1) = directory.v1 {
+                Ok(SystemTime::UNIX_EPOCH
+                    + std::time::Duration::new(v1.ctime as u64, v1.ctime_ns as u32))
+            } else {
+                Ok(SystemTime::UNIX_EPOCH)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SystemTime::UNIX_EPOCH),
+        Err(e) => Err(chain_error!(
+            e,
+            "failed to open directory proto file",
+            ?path
+        )),
+    }
 }
 
 #[test]
