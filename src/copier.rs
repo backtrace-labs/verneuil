@@ -622,13 +622,8 @@ impl FileIdentifier {
         })
     }
 
-    /// Returns true if we can assume that `self == other`, except for
-    /// `ctime`.
+    /// Returns whether `self == other`, except for `ctime`/`ctime_nsec`.
     fn equal_except_ctime(&self, other: &FileIdentifier) -> bool {
-        if self.btime.is_none() || other.btime.is_none() {
-            return false;
-        }
-
         (self.btime, self.len, self.dev, self.ino) == (other.btime, other.len, other.dev, other.ino)
     }
 }
@@ -752,11 +747,19 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
+        use rand::Rng;
+
+        const FORCE_META_PROBABILITY: f64 = 0.05;
+
         let _span = info_span!("handle_staging_directory", ?targets, ?parent);
 
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
         let chunks_directory = replication_buffer::directory_chunks(staging.clone());
         let meta_directory = replication_buffer::directory_meta(staging);
+
+        // If true, we always try to upload the contents of the meta
+        // directory, even if we think that might be useless.
+        let mut force_meta = rand::thread_rng().gen_bool(FORCE_META_PROBABILITY);
 
         // It's always safe to publish chunks: they don't have any
         // dependency.
@@ -779,6 +782,9 @@ impl CopierWorker {
                 |name: &OsStr, mut file| {
                     self.pace();
                     copy_file(name, &mut file, &chunks_buckets)?;
+                    // Always upload the contents of the meta
+                    // directory if we found chunks to upload.
+                    force_meta = true;
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
@@ -849,13 +855,16 @@ impl CopierWorker {
                         return Ok(());
                     }
 
-                    // We have already uploaded this file, nothing to do.
-                    // We must ignore ctime because tapping a file changes
-                    // its hardlink count, and thus updates its ctime.
-                    if state
-                        .recent_staged_directories
-                        .find(|x| x.equal_except_ctime(&identifier))
-                        .is_some()
+                    // If we're not forcing uploads and we think we
+                    // have already uploaded this file, nothing to do.
+                    // We must ignore ctime because tapping a file
+                    // changes its hardlink count, and thus updates
+                    // its ctime.
+                    if !force_meta
+                        && state
+                            .recent_staged_directories
+                            .find(|x| x.equal_except_ctime(&identifier))
+                            .is_some()
                     {
                         return Ok(());
                     }
