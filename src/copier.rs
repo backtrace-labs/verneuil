@@ -621,6 +621,16 @@ impl FileIdentifier {
             ctime_nsec: meta.ctime_nsec(),
         })
     }
+
+    /// Returns true if we can assume that `self == other`, except for
+    /// `ctime`.
+    fn equal_except_ctime(&self, other: &FileIdentifier) -> bool {
+        if self.btime.is_none() || other.btime.is_none() {
+            return false;
+        }
+
+        (self.btime, self.len, self.dev, self.ino) == (other.btime, other.len, other.dev, other.ino)
+    }
 }
 
 #[derive(Debug)]
@@ -840,9 +850,11 @@ impl CopierWorker {
                     }
 
                     // We have already uploaded this file, nothing to do.
+                    // We must ignore ctime because tapping a file changes
+                    // its hardlink count, and thus updates its ctime.
                     if state
                         .recent_staged_directories
-                        .find(|x| x == &identifier)
+                        .find(|x| x.equal_except_ctime(&identifier))
                         .is_some()
                     {
                         return Ok(());
