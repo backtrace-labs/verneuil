@@ -39,6 +39,11 @@ ssize_t verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz);
 int verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz);
 
 /**
+ * Attempts to update the atime, mtime, and ctime of `fd` (to now).
+ */
+int verneuil__touch(int fd);
+
+/**
  * Attempts to acquire an exclusive file-private (OFD) lock on bytes
  * [0, 1) of `fd`.
  *

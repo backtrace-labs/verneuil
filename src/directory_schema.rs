@@ -5,6 +5,7 @@ use umash::Fingerprint;
 use uuid::Uuid;
 
 use crate::chain_error;
+use crate::drop_result;
 use crate::fresh_info;
 use crate::result::Result;
 use crate::warn_from_os;
@@ -279,15 +280,26 @@ pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
 
     extern "C" {
         fn verneuil__setxattr(fd: i32, name: *const i8, buf: *const u8, bufsz: usize) -> isize;
+        fn verneuil__touch(fd: i32) -> i32;
+    }
+
+    if unsafe { verneuil__touch(file.as_raw_fd()) } < 0 {
+        let _ = warn_from_os!("failed to touch file");
     }
 
     let ret = unsafe { verneuil__setxattr(file.as_raw_fd(), XATTR_NAME.as_ptr(), [].as_ptr(), 0) };
-
-    if ret >= 0 {
+    let result = if ret >= 0 {
         Ok(())
     } else {
         Err(warn_from_os!("failed to clear version xattr"))
-    }
+    };
+
+    // An fsync failure really means badness.  In theory, the only way
+    // to recover is to abort the process.
+    drop_result!(file.sync_all(),
+                 e => chain_error!(e, "failed to fsync updated version id"));
+
+    result
 }
 
 /// Computes the fingerprint for a chunk of sqlite db file.

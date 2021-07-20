@@ -100,6 +100,18 @@ verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz)
 }
 
 int
+verneuil__touch(int fd)
+{
+        int r;
+
+        do {
+                r = futimens(fd, NULL);
+        } while (r < 0 && errno == EINTR);
+
+        return r;
+}
+
+int
 verneuil__ofd_lock_exclusive(int fd)
 {
         struct flock fl = {
