@@ -949,7 +949,7 @@ impl CopierWorker {
             Ok(ret) => did_something |= ret,
             Err(e) => {
                 if !did_something {
-                    return Err(chain_warn!(e, "failed to rehandle ready directory", ?spool));
+                    return Err(chain_info!(e, "failed to rehandle ready directory", ?spool));
                 }
             }
         }
