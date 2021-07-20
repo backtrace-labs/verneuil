@@ -140,6 +140,10 @@ struct CopierSpoolState {
     // Refcount for this spool state.
     count: AtomicUsize,
 
+    // Set to true if we find that the replicated data is behind
+    // the source sqlite file on disk.
+    stale: AtomicBool,
+
     // Set to true by the `CopierBackend` thread when we have
     // successfully queued up this pool state for upload, cleared
     // by `CopierWorker`s immediately as they scan working on
@@ -743,6 +747,7 @@ impl CopierWorker {
     fn handle_staging_directory(
         &self,
         state: &mut CopierUploadState,
+        stale: bool,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
@@ -759,7 +764,7 @@ impl CopierWorker {
 
         // If true, we always try to upload the contents of the meta
         // directory, even if we think that might be useless.
-        let mut force_meta = rand::thread_rng().gen_bool(FORCE_META_PROBABILITY);
+        let mut force_meta = stale || rand::thread_rng().gen_bool(FORCE_META_PROBABILITY);
 
         // It's always safe to publish chunks: they don't have any
         // dependency.
@@ -895,6 +900,7 @@ impl CopierWorker {
     fn handle_spooling_directory(
         &self,
         state: &mut CopierUploadState,
+        stale: bool,
         spool: &Path,
     ) -> Result<bool> {
         let mut did_something = false;
@@ -952,7 +958,13 @@ impl CopierWorker {
         // Opportunistically try to copy from the "staging"
         // directory.  That's never staler than "ready", so we do
         // not go backward in our replication.
-        match self.handle_staging_directory(state, &targets, creds.clone(), spool.to_path_buf()) {
+        match self.handle_staging_directory(
+            state,
+            stale,
+            &targets,
+            creds.clone(),
+            spool.to_path_buf(),
+        ) {
             Ok(ret) => did_something |= ret,
             Err(e) => {
                 if !did_something {
@@ -989,7 +1001,8 @@ impl CopierWorker {
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 state.signaled.store(false, Ordering::Relaxed);
                 state.last_scanned.store_now();
-                match self.handle_spooling_directory(&mut upload_state, &state.spool_path) {
+                let stale = state.stale.swap(false, Ordering::Relaxed);
+                match self.handle_spooling_directory(&mut upload_state, stale, &state.spool_path) {
                     Ok(true) => {
                         state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
                         state.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1038,11 +1051,13 @@ impl CopierSpoolState {
 
                 let tap_file =
                     replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
-                (
-                    path.clone(),
-                    source_ctime,
-                    parse_directory_ctime(&tap_file)?,
-                )
+                let directory_ctime = parse_directory_ctime(&tap_file)?;
+
+                if source_ctime > directory_ctime {
+                    self.stale.store(true, Ordering::Relaxed);
+                }
+
+                (path.clone(), source_ctime, directory_ctime)
             }
             None => (
                 Path::new(self.spool_path.file_name().unwrap_or_default()).to_path_buf(),
@@ -1255,6 +1270,13 @@ impl CopierBackend {
             let mut keys: Vec<_> = active.values().cloned().collect();
 
             keys.shuffle(rng);
+            // Move stale records first.
+            keys.sort_by(|x, y| {
+                x.stale
+                    .load(Ordering::Relaxed)
+                    .cmp(&y.stale.load(Ordering::Relaxed))
+                    .reverse()
+            });
             keys
         }
 
