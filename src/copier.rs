@@ -661,7 +661,10 @@ impl CopierWorker {
     ) -> Result<bool> {
         let _span = info_span!("handle_ready_directory", ?targets, ?parent);
 
-        let (ready, _file) = replication_buffer::snapshot_ready_directory(parent.clone())?;
+        let (ready, _file) = match replication_buffer::snapshot_ready_directory(parent.clone())? {
+            Some(ret) => ret,
+            None => return Ok(false),
+        };
 
         {
             let chunks_buckets = targets

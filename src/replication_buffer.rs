@@ -603,8 +603,10 @@ pub(crate) fn mutable_ready_directory(parent: PathBuf) -> PathBuf {
 ///
 /// On success, returns a process-local path to that subdirectory, and
 /// a file object that must be kept alive to ensure the path is valid.
+///
+/// Returns Ok(None) if the directory does not exist.
 #[instrument(level = "trace")]
-pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File)> {
+pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBuf, File)>> {
     use std::os::unix::io::FromRawFd;
 
     // See c/file_ops.h
@@ -617,15 +619,21 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<(PathBuf, File
         .map_err(|e| chain_error!(e, "failed to convert path to C string", ?ready))?;
     let fd = unsafe { verneuil__open_directory(ready_str.as_ptr()) };
     if fd < 0 {
-        return Err(filtered_os_error!(
-            ErrorKind::NotFound => Level::DEBUG,
+        let error = std::io::Error::last_os_error();
+
+        if error.kind() == ErrorKind::NotFound {
+            return Ok(None);
+        }
+
+        return Err(chain_error!(
+            error,
             "failed to open ready directory",
             ?ready
         ));
     }
 
     let file = unsafe { File::from_raw_fd(fd) };
-    Ok((format!("/proc/self/fd/{}/", fd).into(), file))
+    Ok(Some((format!("/proc/self/fd/{}/", fd).into(), file)))
 }
 
 /// Attempts to remove the "ready" subdirectory of `parent`, if it is
