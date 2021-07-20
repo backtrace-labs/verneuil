@@ -1311,7 +1311,7 @@ verneuil__file_sync_impl(sqlite3_file *vfile, int flags)
                 return SQLITE_OK;
 
         do {
-                r = fdatasync(file->fd);
+                r = fsync(file->fd);
         } while (r != 0 && errno == EINTR);
 
         if (r != 0) {
