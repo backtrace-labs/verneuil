@@ -27,6 +27,8 @@ use crate::chain_debug;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
+use crate::directory_schema::clear_version_id;
+use crate::directory_schema::parse_directory_chunks;
 use crate::directory_schema::parse_directory_ctime;
 use crate::drop_result;
 use crate::filtered_io_error;
@@ -82,6 +84,9 @@ const REPLICATION_LAG_REPORT_PERIOD: Duration = Duration::from_secs(61);
 
 /// Warn about DB files for which replication is this far behind.
 const REPLICATION_LAG_REPORT_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// Time background "touch" to fully cover each db file once per period.
+const PATROL_TOUCH_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
@@ -538,6 +543,7 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
                     return Err(chain_error!(
                         (body, code),
                         "failed to post chunk",
+                        %target.name,
                         ?blob_name,
                         len = bytes.len()
                     ));
@@ -547,6 +553,7 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
                         return Err(chain_warn!(
                             err,
                             "reached retry limit",
+                            %target.name,
                             ?blob_name,
                             COPY_RETRY_LIMIT,
                             len = bytes.len()
@@ -560,8 +567,95 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
                     tracing::info!(
                         ?err,
                         ?backoff,
+                        %target.name,
                         ?blob_name,
                         len = bytes.len(),
+                        "backing off after a failed PUT."
+                    );
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Attempts to touch the blob `name` in all `targets`, by copying the
+/// blob to itself.
+///
+/// The buckets in `targets` must only be used for `touch_blob`.
+///
+/// This function only returns `Err` if we successfully contacted the
+/// remote blob store and something is actively wrong with `blob_name`
+/// (e.g., it doesn't exist).
+#[instrument(level = "debug")]
+fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
+    use rand::Rng;
+
+    const COPY_SOURCE: &str = "x-amz-copy-source";
+    const METADATA_DIRECTIVE: &str = "x-amz-metadata-directive";
+    const METADATA_DIRECTIVE_VALUE: &str = "REPLACE";
+
+    let mut rng = rand::thread_rng();
+
+    for target in targets {
+        let location_name = format!("{}/{}", target.name, blob_name);
+        // The value must be URL encoded (yes, that is double encoding
+        // given that blob names are themselves percent encoded).
+        let url_encoded_name = percent_encoding::utf8_percent_encode(
+            &location_name,
+            &percent_encoding::NON_ALPHANUMERIC,
+        );
+
+        target.add_header(COPY_SOURCE, &url_encoded_name.to_string());
+        // We're about to copy an object to itself.  S3 only allows this
+        // if we replace all metadata.
+        target.add_header(METADATA_DIRECTIVE, METADATA_DIRECTIVE_VALUE);
+
+        for i in 0..=COPY_RETRY_LIMIT {
+            match target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE) {
+                Ok((_, code)) if (200..300).contains(&code) => {
+                    break;
+                }
+                Ok((body, 404)) => {
+                    // Something's definitely wrong with our
+                    // replication data if we can't find the blob.
+                    return Err(chain_error!(
+                        (body, 404),
+                        "chunk not found",
+                        %target.name,
+                        ?blob_name
+                    ));
+                }
+                // If it's a non-404 error, don't retry.
+                Ok((body, code)) if (400..500).contains(&code) => {
+                    let _ = chain_warn!((body, code), "failed to touch chunk", %target.name, ?blob_name);
+                    break;
+                }
+                err => {
+                    if i == COPY_RETRY_LIMIT {
+                        let _ = chain_warn!(
+                            err,
+                            "reached retry limit",
+                            %target.name,
+                            ?blob_name,
+                            COPY_RETRY_LIMIT
+                        );
+
+                        // Don't error out if the remote is unreachable.
+                        break;
+                    }
+
+                    let sleep = COPY_RETRY_BASE_WAIT.mul_f64(COPY_RETRY_MULTIPLIER.powi(i));
+                    let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+                    let backoff = sleep.mul_f64(jitter_scale);
+
+                    tracing::info!(
+                        ?err,
+                        ?backoff,
+                        %target.name,
+                        ?blob_name,
                         "backing off after a failed PUT."
                     );
                     std::thread::sleep(backoff);
@@ -636,6 +730,41 @@ impl FileIdentifier {
 struct CopierWorker {
     work: crossbeam_channel::Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
+}
+
+/// Attempts to force a full snapshot the next time a change `Tracker`
+/// synchronises the db file.
+#[instrument]
+fn force_full_snapshot(state: &CopierSpoolState) {
+    fn reset_db_file_id(path: &Path) -> Result<()> {
+        use std::fs::OpenOptions;
+
+        let file = match OpenOptions::new()
+            .create(false)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(chain_error!(e, "failed to open sqlite db file")),
+        };
+
+        clear_version_id(&file)
+    }
+
+    // Mess with the sqlite file's version id if we can.
+    if let Some(path) = &state.source {
+        drop_result!(reset_db_file_id(&path),
+                     e => chain_error!(e, "failed to clear version id", ?path));
+    }
+
+    // And now delete all (directory) files in staging/meta.
+    let staging = replication_buffer::mutable_staging_directory(state.spool_path.to_path_buf());
+    let meta_directory = replication_buffer::directory_meta(staging);
+    drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
+                                   ConsumeDirectoryPolicy::RemoveFiles),
+                 e => chain_error!(e, "failed to delete staged meta files", ?state.spool_path));
 }
 
 impl CopierWorker {
@@ -996,9 +1125,113 @@ impl CopierWorker {
         Ok(did_something)
     }
 
+    /// Attempts to touch a small pseudrandom subset of the chunks
+    /// referred by the latest uploaded directory.
+    ///
+    /// Only errors out if we successfully connected to remote storage
+    /// and failed to update one of the "touched" chunks.
+    #[instrument]
+    fn patrol_touch_chunks(
+        &self,
+        spool_state: &CopierSpoolState,
+        time_since_last_patrol: Duration,
+    ) -> Result<()> {
+        use rand::seq::SliceRandom;
+
+        let spool_path = &*spool_state.spool_path;
+        let source = match &spool_state.source {
+            Some(source) => source,
+            None => {
+                tracing::debug!(?spool_path, ?spool_state, "source db file unknown");
+                return Ok(());
+            }
+        };
+
+        // Stop touching the dependencies once the source file has
+        // been deleted.
+        if !source.exists() {
+            tracing::debug!(?spool_path, ?source, "source db file not found");
+            return Ok(());
+        }
+
+        // Compute what fraction of the file's current chunks we want to touch.
+        let coverage_fraction = (time_since_last_patrol.as_secs_f64()
+            / PATROL_TOUCH_PERIOD.as_secs_f64())
+        .clamp(0.0, 1.0);
+        let tap_file = replication_buffer::construct_tapped_meta_path(spool_path, source)?;
+        let mut chunks = parse_directory_chunks(&tap_file)?;
+
+        // Touch that fraction of the chunks list, and always at least
+        // one chunk (otherwise we might repeatedly round down to 0).
+        let touch_count = ((chunks.len() as f64 * coverage_fraction) as usize)
+            .saturating_add(1)
+            .clamp(0, chunks.len());
+
+        let (shuffled, _) = chunks.partial_shuffle(&mut rand::thread_rng(), touch_count);
+        if shuffled.is_empty() {
+            return Ok(());
+        }
+
+        let targets: ReplicationTargetList = {
+            let metadata = replication_buffer::buffer_metadata_file(spool_path.to_path_buf());
+
+            // Failing to read replication targets isn't a reason to
+            // trigger a full snapshot from scratch.
+            let contents = match std::fs::read(&*metadata) {
+                Ok(contents) => contents,
+                Err(e) => {
+                    let _ = chain_error!(e, "failed to read .metadata file", ?metadata);
+                    return Ok(());
+                }
+            };
+
+            match serde_json::from_slice(&contents) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    let _ = chain_error!(e, "failed to parse .metadata file", ?metadata, ?contents);
+                    return Ok(());
+                }
+            }
+        };
+
+        // Similarly, a failure here shouldn't trigger a full snapshot.
+        let creds = match Credentials::default() {
+            Ok(creds) => creds,
+            Err(e) => {
+                let _ = chain_error!(e, "failed to get S3 credentials");
+                return Ok(());
+            }
+        };
+
+        let mut chunks_buckets = targets
+            .replication_targets
+            .iter()
+            .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+            .flatten() // TODO: how do we want to handle failures here?
+            .collect::<Vec<_>>();
+
+        if chunks_buckets.is_empty() {
+            return Ok(());
+        }
+
+        for fprint in shuffled {
+            self.pace();
+            touch_blob(
+                &replication_buffer::fingerprint_chunk_name(&fprint),
+                &mut chunks_buckets,
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn worker_loop(&self) {
+        use std::time::SystemTime;
+
         while let Ok(state) = self.work.recv() {
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
+                let last_scanned = state.last_scanned.load();
+
                 state.signaled.store(false, Ordering::Relaxed);
                 state.last_scanned.store_now();
                 let stale = state.stale.swap(false, Ordering::Relaxed);
@@ -1026,6 +1259,20 @@ impl CopierWorker {
                         state.consecutive_updates.store(0, Ordering::Relaxed);
 
                         state.last_failure.store_now();
+                    }
+                }
+
+                if last_scanned > SystemTime::UNIX_EPOCH {
+                    if let Err(e) = self.patrol_touch_chunks(
+                        &state,
+                        SystemTime::now()
+                            .duration_since(last_scanned)
+                            .unwrap_or_default(),
+                    ) {
+                        let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
+                                            db=?state.source, ?state.spool_path);
+
+                        force_full_snapshot(&state);
                     }
                 }
             }

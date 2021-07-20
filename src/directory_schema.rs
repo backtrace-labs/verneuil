@@ -5,6 +5,7 @@ use umash::Fingerprint;
 use uuid::Uuid;
 
 use crate::chain_error;
+use crate::fresh_info;
 use crate::result::Result;
 use crate::warn_from_os;
 
@@ -346,6 +347,39 @@ pub(crate) fn parse_directory_ctime(path: &std::path::Path) -> Result<std::time:
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SystemTime::UNIX_EPOCH),
+        Err(e) => Err(chain_error!(
+            e,
+            "failed to open directory proto file",
+            ?path
+        )),
+    }
+}
+
+/// Returns the list of chunks in the directory proto at `Path`, or
+/// an empty list if there is no such file.
+pub(crate) fn parse_directory_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
+    use prost::Message;
+
+    match std::fs::read(path) {
+        Ok(contents) => {
+            let directory = Directory::decode(&*contents)
+                .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
+            match directory.v1 {
+                Some(v1) if v1.chunks.len() % 2 == 0 => {
+                    let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
+
+                    for i in 0..v1.chunks.len() / 2 {
+                        ret.push(Fingerprint {
+                            hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
+                        });
+                    }
+
+                    Ok(ret)
+                }
+                _ => Err(fresh_info!("invalid directory proto v1", ?path)),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(chain_error!(
             e,
             "failed to open directory proto file",
