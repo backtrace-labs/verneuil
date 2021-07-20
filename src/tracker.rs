@@ -591,7 +591,7 @@ impl Tracker {
             // chunks.  The probability is low enough that we can
             // amortise the wasted work as constant overhead for
             // each call to `snapshot_file_contents`.
-            if copied >= rng.gen_range(0..=chunks.len()) {
+            if copied >= rng.gen_range(0..=chunks.len() / 4) {
                 drop_result!(buf.gc_chunks(&chunks),
                             e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
             }
