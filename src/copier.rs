@@ -70,9 +70,9 @@ const COPY_RETRY_MULTIPLIER: f64 = 10.0;
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
-/// We aim for ~2 requests / second.  We shouldn't need more than two
-/// worker threads to achieve that.
-const WORKER_COUNT: usize = 2;
+/// We aim for ~2 requests / second.  We shouldn't need more than four
+/// worker threads to achieve that, with additional sleeping / backoff.
+const WORKER_COUNT: usize = 4;
 
 /// How many of the last directory files we have uploaded must we
 /// remember?  This memory lets us avoid repeated uploads of the
