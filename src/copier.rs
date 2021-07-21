@@ -1137,6 +1137,7 @@ impl CopierWorker {
         time_since_last_patrol: Duration,
     ) -> Result<()> {
         use rand::seq::SliceRandom;
+        use rand::Rng;
 
         let spool_path = &*spool_state.spool_path;
         let source = match &spool_state.source {
@@ -1160,14 +1161,22 @@ impl CopierWorker {
         .clamp(0.0, 1.0);
         let tap_file = replication_buffer::construct_tapped_meta_path(spool_path, source)?;
         let mut chunks = parse_directory_chunks(&tap_file)?;
+        let mut rng = rand::thread_rng();
 
-        // Touch that fraction of the chunks list, and always at least
-        // one chunk (otherwise we might repeatedly round down to 0).
-        let touch_count = ((chunks.len() as f64 * coverage_fraction) as usize)
-            .saturating_add(1)
+        // Touch that fraction of the chunks list, with randomised
+        // rounding for any fractional number of chunks: rounding
+        // down might consistently round to 0, and rounding up
+        // ends up triggering a lot of useless work.
+        let desired_touch_count = chunks.len() as f64 * coverage_fraction;
+        // Bump the randomised rounding probability up a little: we'd
+        // rather touch too many chunks than too few, if something goes
+        // wrong with the PRNG.
+        let round_up_probability = (desired_touch_count.fract() * 2.0).clamp(0.0, 1.0);
+        let touch_count = (desired_touch_count.floor() as usize)
+            .saturating_add(rng.gen_bool(round_up_probability) as usize)
             .clamp(0, chunks.len());
 
-        let (shuffled, _) = chunks.partial_shuffle(&mut rand::thread_rng(), touch_count);
+        let (shuffled, _) = chunks.partial_shuffle(&mut rng, touch_count);
         if shuffled.is_empty() {
             return Ok(());
         }
