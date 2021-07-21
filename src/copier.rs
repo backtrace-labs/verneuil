@@ -1559,7 +1559,6 @@ impl CopierBackend {
                 x.stale
                     .load(Ordering::Relaxed)
                     .cmp(&y.stale.load(Ordering::Relaxed))
-                    .reverse()
             });
             keys
         }
