@@ -309,23 +309,6 @@ impl Tracker {
         let update = &mut |chunk_index, expected_fprint| -> Result<bool> {
             num_snapshotted += 1;
 
-            // Fast-path in non-test mode.  In test mode, we always
-            // go through every step to confirm that the expected
-            // fingerprint matches the actual chunk fingerprint.
-            #[cfg(not(feature = "verneuil_test_validate_writes"))]
-            if let Some(fprint) = expected_fprint {
-                // We had the write lock when we preemptively wrote the
-                // chunk file.  No other process could have GCed chunks
-                // until we released the write lock... at which time the
-                // chunk was clearly useful.
-                //
-                // The chunk file might be missing, but, if so, that's
-                // because the copier has already uploaded it.
-                let ret = fprint != chunk_fprints[chunk_index as usize];
-                chunk_fprints[chunk_index as usize] = fprint;
-                return Ok(ret);
-            }
-
             let begin = chunk_index * SNAPSHOT_GRANULARITY;
             let end = if (len - begin) > SNAPSHOT_GRANULARITY {
                 begin + SNAPSHOT_GRANULARITY
@@ -340,9 +323,15 @@ impl Tracker {
 
             let fprint = fingerprint_file_chunk(slice);
 
-            #[cfg(feature = "verneuil_test_validate_writes")]
             if let Some(expected) = expected_fprint {
+                #[cfg(feature = "verneuil_test_validate_writes")]
                 assert_eq!(fprint, expected);
+
+                // Outside tests, trigger a full rescan if the chunk
+                // on disk doesn't match our expectation.
+                if fprint != expected {
+                    return Ok(true);
+                }
             }
 
             repl.stage_chunk(fprint, slice)?;
@@ -382,8 +371,10 @@ impl Tracker {
                 //
                 // However, if we can't confirm that the chunk is
                 // clean, force a full scan.
-                let result = update(random_index, None)
-                    .map_err(|e| chain_error!(e, "failed to scrub random clean chunk", path=?self.path, random_index));
+                let result = update(random_index, None).map_err(|e| {
+                    chain_error!(e, "failed to scrub random clean chunk",
+                                              path=?self.path, random_index)
+                });
                 if !matches!(result, Ok(false)) {
                     tracing::error!(path=?self.path, random_index, ?result,
                                     "forcing resynchronisation scan");
