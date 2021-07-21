@@ -70,6 +70,17 @@ const COPY_RETRY_MULTIPLIER: f64 = 10.0;
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
+/// Wait at least this long (and more for random jitter) when we
+/// fail to acquire the copy lock for a spooling directory.
+///
+/// During testing, the p99 for blob uploads on S3 and GCS is < 1
+/// second, and even the worst case latency over a few days was < 1.8
+/// seconds on S3.  Waiting a bit should suffice to make it unlikely
+/// that a fresh upload will race in front of a slow stale upload.
+/// However, even if that were to happen, we should eventually
+/// recover, since copiers always eventually upload from staging.
+const COPY_LOCK_CONTENTION_WAIT: Duration = Duration::from_secs(2);
+
 /// We aim for ~2 requests / second.  We shouldn't need more than four
 /// worker threads to achieve that, with additional sleeping / backoff.
 const WORKER_COUNT: usize = 4;
@@ -772,6 +783,50 @@ fn force_full_snapshot(state: &CopierSpoolState) {
                  e => chain_error!(e, "failed to delete staged meta files", ?state.spool_path));
 }
 
+/// Waits for the meta copy lock on the spooling directory at
+/// `parent`.  This function may return Ok() without actually owning
+/// the lock: the copy lock is only used to avoid letting slow uploads
+/// overwrite more recent data, but isn't necessary for correctness.
+/// In the worst case, we will eventually overwrite with fresh data,
+/// as long as copiers can make progress.
+///
+/// Returns Err on failure, Ok on success or if we waited long enough.
+fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<File>> {
+    use rand::Rng;
+
+    if let Some(file) = replication_buffer::acquire_meta_copy_lock(parent.to_path_buf())? {
+        return Ok(Some(file));
+    };
+
+    let jitter_scale = rand::thread_rng().gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+    let backoff = COPY_LOCK_CONTENTION_WAIT.mul_f64(jitter_scale);
+
+    tracing::info!(
+        ?backoff,
+        ?parent,
+        "failed to acquire meta copy lock. sleeping."
+    );
+    std::thread::sleep(backoff);
+
+    let ret = replication_buffer::acquire_meta_copy_lock(parent.to_path_buf());
+    if matches!(&ret, Ok(Some(_))) {
+        tracing::debug!(
+            ?backoff,
+            ?parent,
+            "successfully acquired meta copy lock after sleeping."
+        );
+    } else {
+        tracing::info!(
+            ?backoff,
+            ?parent,
+            ?ret,
+            "failed to acquire meta copy lock after sleeping."
+        );
+    }
+
+    ret
+}
+
 impl CopierWorker {
     /// Sleeps until the governor lets us fire the next set of API calls.
     #[instrument(level = "debug")]
@@ -847,11 +902,7 @@ impl CopierWorker {
                 return Ok(false);
             }
 
-            let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
-                Some(file) => file,
-                None => return Ok(false),
-            };
-
+            let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
                 replication_buffer::directory_meta(ready),
                 |name, mut file| {
@@ -979,11 +1030,7 @@ impl CopierWorker {
                 return Ok(false);
             }
 
-            let _lock = match replication_buffer::acquire_meta_copy_lock(parent.clone())? {
-                Some(file) => file,
-                None => return Ok(false),
-            };
-
+            let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
                 meta_directory,
                 &mut |name: &OsStr, mut file| {
