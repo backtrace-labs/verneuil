@@ -392,6 +392,19 @@ pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<File>>
     }
 }
 
+/// Clears the meta copy lock's state for `spool_dir`.
+#[instrument(level = "debug")]
+pub(crate) fn reset_meta_copy_lock(spool_dir: PathBuf) -> Result<()> {
+    let mut lock_path = spool_dir;
+    lock_path.push(DOT_META_COPY_LOCK);
+
+    std::fs::remove_file(&lock_path).map_err(|e| {
+        filtered_io_error!(e,
+                           ErrorKind::NotFound => Level::DEBUG,
+                           "failed to remove lock file", ?lock_path)
+    })
+}
+
 /// Removes directory separators from the input, and replaces them
 /// with `#`. Either the input is not expected to ever include
 /// slashes, or the result is allowed to collide for different inputs.

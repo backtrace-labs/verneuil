@@ -81,6 +81,12 @@ const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 /// recover, since copiers always eventually upload from staging.
 const COPY_LOCK_CONTENTION_WAIT: Duration = Duration::from_secs(2);
 
+/// When we repeatedly fail to acquire the copy lock, try to reset it
+/// (delete the lock file) at this rate.  Resetting the copy lock lets
+/// most copier processes make use of the lock when only one process
+/// is misbehaving.
+const COPY_LOCK_RESET_RATE: f64 = 0.01;
+
 /// We aim for ~2 requests / second.  We shouldn't need more than four
 /// worker threads to achieve that, with additional sleeping / backoff.
 const WORKER_COUNT: usize = 4;
@@ -791,6 +797,7 @@ fn force_full_snapshot(state: &CopierSpoolState) {
 /// as long as copiers can make progress.
 ///
 /// Returns Err on failure, Ok on success or if we waited long enough.
+#[instrument(level = "debug")]
 fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<File>> {
     use rand::Rng;
 
@@ -798,7 +805,8 @@ fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<File>> {
         return Ok(Some(file));
     };
 
-    let jitter_scale = rand::thread_rng().gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+    let mut rng = rand::thread_rng();
+    let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
     let backoff = COPY_LOCK_CONTENTION_WAIT.mul_f64(jitter_scale);
 
     tracing::info!(
@@ -822,6 +830,13 @@ fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<File>> {
             ?ret,
             "failed to acquire meta copy lock after sleeping."
         );
+
+        if rng.gen_bool(COPY_LOCK_RESET_RATE) {
+            tracing::info!(?parent, "resetting stuck meta copy lock file.");
+            drop_result!(replication_buffer::reset_meta_copy_lock(parent.to_path_buf()),
+                         e => chain_error!(e, "failed to reset meta copy lock after acquisition failure",
+                                           ?backoff, ?parent));
+        }
     }
 
     ret
