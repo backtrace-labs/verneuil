@@ -541,7 +541,7 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
                 Ok((_, code)) if (200..300).contains(&code) => {
                     break;
                 }
-                Ok((body, code)) if code < 500 => {
+                Ok((body, code)) if code < 500 && code != 408 && code != 429 => {
                     // Permanent failure.  In theory, we should maybe
                     // retry on 400: RequestTimeout, but we'll catch
                     // it in the next background scan.
@@ -634,7 +634,7 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                     ));
                 }
                 // If it's a non-404 error, don't retry.
-                Ok((body, code)) if (400..500).contains(&code) => {
+                Ok((body, code)) if (400..500).contains(&code) && code != 408 && code != 429 => {
                     let _ = chain_warn!((body, code), "failed to touch chunk", %target.name, ?blob_name);
                     break;
                 }
