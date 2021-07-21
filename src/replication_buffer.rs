@@ -374,8 +374,8 @@ pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<File>>
 
     let file = std::fs::OpenOptions::new()
         .mode(0o666)
+        .read(true)
         .write(true)
-        .truncate(true)
         .create(true)
         .open(&lock_path)
         .map_err(|e| chain_error!(e, "failed to open meta copy lock file", ?lock_path))?;

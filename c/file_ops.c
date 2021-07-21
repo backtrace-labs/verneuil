@@ -118,7 +118,7 @@ verneuil__ofd_lock_exclusive(int fd)
                 .l_type = F_WRLCK,
                 .l_whence = SEEK_SET,
                 .l_start = 0,
-                .l_len = 1,
+                .l_len = 0,
         };
         int r;
 
@@ -129,7 +129,7 @@ verneuil__ofd_lock_exclusive(int fd)
         if (r == 0)
                 return 0;
 
-        if (errno == EAGAIN)
+        if (errno == EAGAIN || errno == EACCES)
                 return 1;
 
         return -1;
