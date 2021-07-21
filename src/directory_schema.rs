@@ -341,9 +341,11 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
     Fingerprint::generate(&DIRECTORY_PARAMS, 0, &bytes)
 }
 
-/// Returns the ctime stored in the directory proto at `path`, or `UNIX_EPOCH` if
-/// there is no such file.
-pub(crate) fn parse_directory_ctime(path: &std::path::Path) -> Result<std::time::SystemTime> {
+/// Returns the header Fingerprint and ctime stored in the directory
+/// proto at `path`, or `(None, UNIX_EPOCH)` if there is no such file.
+pub(crate) fn parse_directory_info(
+    path: &std::path::Path,
+) -> Result<(Option<Fingerprint>, std::time::SystemTime)> {
     use prost::Message;
     use std::time::SystemTime;
 
@@ -352,13 +354,16 @@ pub(crate) fn parse_directory_ctime(path: &std::path::Path) -> Result<std::time:
             let directory = Directory::decode(&*contents)
                 .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
             if let Some(v1) = directory.v1 {
-                Ok(SystemTime::UNIX_EPOCH
-                    + std::time::Duration::new(v1.ctime as u64, v1.ctime_ns as u32))
+                Ok((
+                    v1.header_fprint.map(Into::into),
+                    SystemTime::UNIX_EPOCH
+                        + std::time::Duration::new(v1.ctime as u64, v1.ctime_ns as u32),
+                ))
             } else {
-                Ok(SystemTime::UNIX_EPOCH)
+                Ok((None, SystemTime::UNIX_EPOCH))
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SystemTime::UNIX_EPOCH),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, SystemTime::UNIX_EPOCH)),
         Err(e) => Err(chain_error!(
             e,
             "failed to open directory proto file",

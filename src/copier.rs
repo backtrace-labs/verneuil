@@ -29,7 +29,7 @@ use crate::chain_info;
 use crate::chain_warn;
 use crate::directory_schema::clear_version_id;
 use crate::directory_schema::parse_directory_chunks;
-use crate::directory_schema::parse_directory_ctime;
+use crate::directory_schema::parse_directory_info;
 use crate::drop_result;
 use crate::filtered_io_error;
 use crate::fresh_error;
@@ -190,6 +190,11 @@ struct CopierSpoolLagInfo {
 
     // ctime in the last replicated directory proto.
     replicated_file_ctime: DateTime,
+
+    // true if the source and replicated headers match.  This
+    // indicates that the replicated file is semantically equivalent
+    // to the source file, although its bytes might differ.
+    sqlite_headers_match: bool,
 
     // time of the last copier scan
     #[serde(skip_serializing_if = "is_epoch")]
@@ -1296,8 +1301,8 @@ impl CopierSpoolState {
         use std::os::unix::fs::MetadataExt;
         use std::time::SystemTime;
 
-        let (key, source_file_ctime, replicated_file_ctime) = match &self.source {
-            Some(path) => {
+        let (key, source_file_ctime, replicated_file_ctime, sqlite_headers_match) =
+            if let Some(path) = &self.source {
                 let stat = path.metadata().map_err(|e| {
                     filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                        "failed to stat source db file")
@@ -1307,27 +1312,36 @@ impl CopierSpoolState {
 
                 let tap_file =
                     replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
-                let directory_ctime = parse_directory_ctime(&tap_file)?;
+                let (fprint, ctime) = parse_directory_info(&tap_file)?;
 
-                if source_ctime > directory_ctime {
+                let headers_match = match File::open(&path) {
+                    Ok(file) => crate::directory_schema::fingerprint_sqlite_header(&file) == fprint,
+                    Err(e) => {
+                        let _ = chain_info!(e, "failed to open source file", ?path);
+                        false
+                    }
+                };
+
+                if source_ctime > ctime && !headers_match {
                     self.stale.store(true, Ordering::Relaxed);
                 }
 
-                (path.clone(), source_ctime, directory_ctime)
-            }
-            None => (
-                Path::new(self.spool_path.file_name().unwrap_or_default()).to_path_buf(),
-                SystemTime::UNIX_EPOCH,
-                SystemTime::UNIX_EPOCH,
-            ),
-        };
+                (path.clone(), source_ctime, ctime, headers_match)
+            } else {
+                (
+                    Path::new(self.spool_path.file_name().unwrap_or_default()).to_path_buf(),
+                    SystemTime::UNIX_EPOCH,
+                    SystemTime::UNIX_EPOCH,
+                    false,
+                )
+            };
 
         Ok((
             key,
             CopierSpoolLagInfo {
                 source_file_ctime: source_file_ctime.into(),
                 replicated_file_ctime: replicated_file_ctime.into(),
-
+                sqlite_headers_match,
                 last_scanned: self.last_scanned.load().into(),
 
                 consecutive_successes: self.consecutive_successes.load(Ordering::Relaxed),
@@ -1414,6 +1428,9 @@ impl CopierBackend {
             .flatten()
             .collect();
 
+        let mut num_maybe_stale = 0usize;
+        let mut num_stale = 0usize;
+
         for (path, stats) in stats.iter() {
             // If the replicated file is behind...
             if matches!(stats
@@ -1427,9 +1444,19 @@ impl CopierBackend {
                 // and this has been the case for a while.
                 match now.signed_duration_since(stats.source_file_ctime).to_std() {
                     Ok(delay) if delay >= REPLICATION_LAG_REPORT_THRESHOLD => {
-                        let stats = serde_json::to_string(&stats)
+                        let json_stats = serde_json::to_string(&stats)
                             .expect("failed to serialise replication lag statistics");
-                        tracing::warn!(?path, ?delay, %stats, "replication lag exceeds threshold");
+
+                        // If the headers match, this is probably a false positive.,
+                        if stats.sqlite_headers_match {
+                            tracing::info!(?path, ?delay, %json_stats,
+                                           "replication lag exceeds threshold, but file headers are up to date");
+                            num_maybe_stale += 1;
+                        } else {
+                            tracing::warn!(?path, ?delay, %json_stats,
+                                           "replication lag exceeds threshold");
+                            num_stale += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -1438,7 +1465,8 @@ impl CopierBackend {
 
         let json_stats =
             serde_json::to_string(&stats).expect("failed to serialise replication lag statistics");
-        tracing::info!(num_tracked=stats.len(), %json_stats, "computed replication lag");
+        tracing::info!(num_tracked=stats.len(), num_stale, num_maybe_stale, %json_stats,
+                       "computed replication lag");
     }
 
     /// Handles the next request from our channels.  Returns true on
