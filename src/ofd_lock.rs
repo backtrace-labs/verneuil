@@ -14,6 +14,20 @@ pub(crate) struct OfdLock {
     file: File,
 }
 
+impl Drop for OfdLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+
+        extern "C" {
+            fn verneuil__ofd_lock_release(fd: i32) -> i32;
+        }
+
+        if unsafe { verneuil__ofd_lock_release(self.file.as_raw_fd()) } < 0 {
+            let _ = error_from_os!("failed to release lock", ?self.file);
+        }
+    }
+}
+
 impl OfdLock {
     /// Attempts to acquire an exclusive lock on the file at
     /// `lock_path`.

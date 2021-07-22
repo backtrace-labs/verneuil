@@ -134,3 +134,21 @@ verneuil__ofd_lock_exclusive(int fd)
 
         return -1;
 }
+
+int
+verneuil__ofd_lock_release(int fd)
+{
+        struct flock fl = {
+                .l_type = F_UNLCK,
+                .l_whence = SEEK_SET,
+                .l_start = 0,
+                .l_len = 0,
+        };
+        int r;
+
+        do {
+                r = fcntl(fd, F_OFD_SETLK, &fl);
+        } while (r < 0 && errno == EINTR);
+
+	return r;
+}
