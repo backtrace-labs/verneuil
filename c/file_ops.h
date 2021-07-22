@@ -2,8 +2,8 @@
 #include <sys/types.h>
 
 /**
- * replication_buffer.rs and directory_schema.rs call into these
- * functions for low-level file operations.
+ * replication_buffer.rs, directory_schema.rs, and ofd_lock.rs call
+ * into these functions for low-level file operations.
  */
 
 /**

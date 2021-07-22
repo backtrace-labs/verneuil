@@ -152,6 +152,7 @@ use crate::filtered_os_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::instance_id;
+use crate::ofd_lock::OfdLock;
 use crate::process_id::process_id;
 use crate::replication_target::ReplicationTargetList;
 use crate::result::Result;
@@ -361,35 +362,12 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
 /// Returns a File object that owns the lock on success (dropping that
 /// file will release the lock), None on acquisition failure.
 #[instrument(level = "debug")]
-pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    extern "C" {
-        fn verneuil__ofd_lock_exclusive(fd: i32) -> i32;
-    }
-
+pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<OfdLock>> {
     let mut lock_path = spool_dir;
     lock_path.push(DOT_META_COPY_LOCK);
 
-    let file = std::fs::OpenOptions::new()
-        .mode(0o666)
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&lock_path)
-        .map_err(|e| chain_error!(e, "failed to open meta copy lock file", ?lock_path))?;
-    match unsafe { verneuil__ofd_lock_exclusive(file.as_raw_fd()) } {
-        0 => Ok(Some(file)),
-        1 => {
-            tracing::info!(?lock_path, "meta copy lock unavailable");
-            Ok(None)
-        }
-        _ => Err(error_from_os!(
-            "failed to acquire meta copy lock",
-            ?lock_path
-        )),
-    }
+    OfdLock::try_lock(&lock_path)
+        .map_err(|e| chain_error!(e, "failed to acquire meta copy lock", ?lock_path))
 }
 
 /// Clears the meta copy lock's state for `spool_dir`.

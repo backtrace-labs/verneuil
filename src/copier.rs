@@ -34,6 +34,7 @@ use crate::drop_result;
 use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_warn;
+use crate::ofd_lock::OfdLock;
 use crate::racy_time::RacySystemTime;
 use crate::replication_buffer;
 use crate::replication_target::ReplicationTarget;
@@ -798,7 +799,7 @@ fn force_full_snapshot(state: &CopierSpoolState) {
 ///
 /// Returns Err on failure, Ok on success or if we waited long enough.
 #[instrument(level = "debug")]
-fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<File>> {
+fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<OfdLock>> {
     use rand::Rng;
 
     if let Some(file) = replication_buffer::acquire_meta_copy_lock(parent.to_path_buf())? {
