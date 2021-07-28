@@ -14,6 +14,7 @@ use umash::Fingerprint;
 
 use crate::chain_error;
 use crate::chain_warn;
+use crate::directory_schema::fingerprint_file_chunk;
 use crate::directory_schema::hash_file_chunk;
 use crate::fresh_error;
 use crate::replication_target::ReplicationTarget;
@@ -63,6 +64,20 @@ lazy_static::lazy_static! {
     static ref CACHED_CHUNKS: Mutex<lru::LruCache<Fingerprint, Arc<Chunk>>> = Mutex::new(lru::LruCache::new(LRU_CACHE_SIZE));
 }
 
+lazy_static::lazy_static! {
+    // Some database files are sparsely populated, and mostly consist
+    // of zero-filled chunks.  Fast-path such chunks, and keep a copy
+    // of the fingerprint outside the `Arc` to minimise indirection
+    // when this optimisation does not trigger.
+    static ref ZERO_FILLED_CHUNK: (Fingerprint, Arc<Chunk>) = {
+        let mut payload = Vec::new();
+        payload.resize(crate::tracker::SNAPSHOT_GRANULARITY as usize, 0u8);
+
+        let fprint = fingerprint_file_chunk(&payload);
+        (fprint, Arc::new(Chunk::new(fprint, payload).expect("fprint must match")))
+    };
+}
+
 impl Chunk {
     /// Returns a fresh chunk for `fprint`.
     ///
@@ -71,10 +86,7 @@ impl Chunk {
         // The contents of a content-addressed chunk must have the same
         // fingerprint as the chunk's name.
         #[cfg(feature = "verneuil_test_vfs")]
-        assert_eq!(
-            fprint,
-            crate::directory_schema::fingerprint_file_chunk(&payload)
-        );
+        assert_eq!(fprint, fingerprint_file_chunk(&payload));
 
         // In production, only check the first 64-bit half of the
         // fingerprint, for speed.
@@ -143,6 +155,10 @@ impl Loader {
     /// Returns Ok(None) if nothing was found.
     #[instrument(level = "debug")]
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
+        if fprint == ZERO_FILLED_CHUNK.0 {
+            return Ok(Some(ZERO_FILLED_CHUNK.1.clone()));
+        }
+
         let mut contents = fetch_from_cache(fprint);
 
         // Don't fast path in tests.

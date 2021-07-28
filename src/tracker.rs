@@ -33,7 +33,7 @@ use crate::replication_target::ReplicationTargetList;
 use crate::result::Result;
 
 /// We snapshot db files in 64KB content-addressed chunks.
-const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
+pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
