@@ -655,64 +655,39 @@ impl Tracker {
     }
 }
 
-/// Returns a zero-filled chunk of `SNAPSHOT_GRANULARITY` bytes.
-#[cfg(feature = "verneuil_test_vfs")]
-fn zero_filled_chunk() -> &'static [u8] {
-    lazy_static::lazy_static! {
-        static ref BUF: Vec<u8> = {
-            let mut buf = Vec::new();
-
-            buf.resize(SNAPSHOT_GRANULARITY as usize, 0u8);
-            buf
-        };
-    }
-
-    &BUF
-}
-
-/// Returns the fingerprint for a zero-filled chunk of `SNAPSHOT_GRANULARITY` bytes.
-#[cfg(feature = "verneuil_test_vfs")]
-fn fingerprint_for_zero_filled_chunk() -> Fingerprint {
-    lazy_static::lazy_static! {
-        static ref FPRINT: Fingerprint = fingerprint_file_chunk(zero_filled_chunk());
-    }
-
-    // This should not change.
-    assert_eq!(
-        *FPRINT,
-        Fingerprint {
-            hash: [8155395758008617606, 2728302605148947890]
-        }
-    );
-    *FPRINT
-}
-
 #[cfg(feature = "verneuil_test_vfs")]
 impl Tracker {
-    /// Fetches the contents of the chunk for `fprint`, or dies
-    /// trying.
-    fn fetch_chunk_or_die(
+    /// Converts a slice of u64 hashes to a vector of `Fingerprint`s.
+    fn convert_all_fprints(chunks: &[u64]) -> Vec<Fingerprint> {
+        let mut ret = Vec::new();
+        for i in 0..chunks.len() / 2 {
+            ret.push(Fingerprint {
+                hash: [chunks[2 * i], chunks[2 * i + 1]],
+            });
+        }
+
+        ret
+    }
+
+    fn fetch_all_chunks(
         &self,
         buf: &ReplicationBuffer,
-        fprint: &Fingerprint,
+        fprints: &[Fingerprint],
         from_staging: bool,
-    ) -> std::sync::Arc<crate::loader::Chunk> {
+    ) -> std::collections::HashMap<Fingerprint, std::sync::Arc<crate::loader::Chunk>> {
         let mut local_chunk_dirs = Vec::new();
         if from_staging {
             local_chunk_dirs.push(buf.staged_chunk_directory());
         }
 
         local_chunk_dirs.push(buf.ready_chunk_directory());
-
-        let loader = crate::loader::Loader::new(
+        crate::loader::Loader::new(
             local_chunk_dirs,
             &self.replication_targets.replication_targets,
         )
-        .expect("failed to instantiate loader");
-        loader
-            .fetch_chunk(*fprint)
-            .expect("fetch should succeed")
-            .expect("chunk data must exist")
+        .expect("failed to instantiate loader")
+        .fetch_all_chunks(fprints)
+        .expect("fetch should succeed")
     }
 
     /// If the snapshot directory exists, confirms that we can get
@@ -731,22 +706,13 @@ impl Tracker {
             Err(err) => return Err(err),
         };
 
-        let zero_fprint = fingerprint_for_zero_filled_chunk();
         let v1 = directory.v1.expect("v1 must exist");
+        let fprints = Tracker::convert_all_fprints(&v1.chunks);
+        let chunks = self.fetch_all_chunks(buf, &fprints, from_staging);
+
         let mut len = 0;
-        for i in 0..v1.chunks.len() / 2 {
-            let fprint = Fingerprint {
-                hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
-            };
-
-            // Don't bother fetching the zero-filled chunk: we know
-            // what it is.
-            if fprint == zero_fprint {
-                len += zero_filled_chunk().len() as u64;
-                continue;
-            }
-
-            let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
+        for (i, fprint) in fprints.into_iter().enumerate() {
+            let contents = chunks.get(&fprint).expect("must have chunk");
             len += contents.payload.len() as u64;
             if i + 1 < v1.chunks.len() / 2 {
                 assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
@@ -804,23 +770,12 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
-        let zero_fprint = fingerprint_for_zero_filled_chunk();
+        let fprints = Tracker::convert_all_fprints(&directory.chunks);
+        let chunks = self.fetch_all_chunks(buf, &fprints, true);
+
         let mut len = 0;
-        for i in 0..directory.chunks.len() / 2 {
-            let fprint = Fingerprint {
-                hash: [directory.chunks[2 * i], directory.chunks[2 * i + 1]],
-            };
-
-            // Fast-path the zero-filled chunk: some tests create multi-GB
-            // sparse DB file.
-            if fprint == zero_fprint {
-                let chunk = zero_filled_chunk();
-                len += chunk.len() as u64;
-                hasher.update(chunk);
-                continue;
-            }
-
-            let contents = self.fetch_chunk_or_die(buf, &fprint, true);
+        for (i, fprint) in fprints.into_iter().enumerate() {
+            let contents = chunks.get(&fprint).expect("must have chunk");
             if i + 1 < directory.chunks.len() / 2 {
                 assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
             }

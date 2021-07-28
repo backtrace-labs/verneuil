@@ -150,6 +150,25 @@ impl Loader {
         })
     }
 
+    /// Attempts to fetch the chunk for each fingerprint in `fprints`.
+    ///
+    /// Return `Err` if any fetch fails.  Even on success, the return
+    /// value may be missing entries.
+    pub(crate) fn fetch_all_chunks(
+        &self,
+        fprints: &[Fingerprint],
+    ) -> Result<HashMap<Fingerprint, Arc<Chunk>>> {
+        let chunks: Vec<Option<Arc<Chunk>>> = fprints
+            .iter()
+            .map(|fprint| self.fetch_chunk(*fprint))
+            .collect::<Result<_>>()?;
+
+        Ok(chunks
+            .into_iter()
+            .filter_map(|chunk_or| chunk_or.map(|chunk| (chunk.fprint, chunk)))
+            .collect())
+    }
+
     /// Attempts to return the bytes for chunk `fprint`.
     ///
     /// Returns Ok(None) if nothing was found.
