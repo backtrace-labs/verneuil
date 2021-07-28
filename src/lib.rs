@@ -17,8 +17,11 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 
+/// Read the verneuil configuration from this variable by default.
+pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";
+
 /// Initialization options for the Verneuil VFS.
-#[derive(Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct Options {
     /// If true, the Verneuil VFS overrides the default sqlite VFS.
@@ -59,6 +62,69 @@ extern "C" {
     fn verneuil_test_only_register() -> i32;
 }
 
+/// Attempts to parse the Verneuil config in `config`.  The string's
+/// contents must be a config JSON for an `Options` struct, or a
+/// "@/path/to/config_file.json".
+#[tracing::instrument]
+pub fn parse_configuration_string(config: &str) -> Option<Options> {
+    if let Some(path) = config.strip_prefix("@") {
+        let contents = match std::fs::read(path) {
+            Ok(contents) => contents,
+            Err(e) => {
+                tracing::warn!(?e, %path, "failed to read verneuil configuration file");
+                return None;
+            }
+        };
+
+        match serde_json::from_slice(&contents) {
+            Ok(parsed) => {
+                tracing::info!(?parsed, %path, "found verneuil configuration");
+                Some(parsed)
+            }
+            Err(e) => {
+                tracing::warn!(?e, %path, "failed to parse verneuil configuration file");
+                None
+            }
+        }
+    } else {
+        match serde_json::from_str(config) {
+            Ok(parsed) => {
+                tracing::info!(?parsed, "found verneuil configuration");
+                Some(parsed)
+            }
+            Err(e) => {
+                tracing::warn!(?e, %config, "failed to parse verneuil configuration string");
+                None
+            }
+        }
+    }
+}
+
+/// Attempts to load a default Verneuil configuration from the
+/// `var_name_or` environment variable, or `VERNEUIL_CONFIG_ENV_VAR`
+/// if `None`.  The variable's value should be a config JSON for
+/// an `Options` struct, or "@/path/to/config_file.json".
+#[tracing::instrument]
+pub fn load_configuration_from_env(var_name_or: Option<&str>) -> Option<Options> {
+    let var_name = var_name_or.unwrap_or(&VERNEUIL_CONFIG_ENV_VAR);
+
+    let os_value = std::env::var_os(var_name)?;
+    let value = if let Some(value) = os_value.to_str() {
+        value
+    } else {
+        tracing::warn!(?os_value, %var_name, "invalid value for verneuil configuration string");
+        return None;
+    };
+
+    // With environment variables, it's sometimes easier to set an
+    // empty value than to unset the variable.
+    if value.is_empty() {
+        return None;
+    }
+
+    parse_configuration_string(value)
+}
+
 /// Configures the Verneuil VFS
 pub fn configure(options: Options) -> Result<(), i32> {
     let c_path;
@@ -97,12 +163,15 @@ pub fn configure(options: Options) -> Result<(), i32> {
 
 /// This is the C-visible configuration function.
 ///
+/// When `options_ptr` is NULL, attempts to load a configuration from the
+/// `VERNEUIL_CONFIG` environment variable.
+///
 /// # Safety
 ///
 /// Assumes the `options_ptr` is NULL or valid.
 #[no_mangle]
 pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) -> i32 {
-    let mut options: Options = Default::default();
+    let mut options: Options;
 
     fn cstr_to_string(ptr: *const c_char) -> Option<String> {
         if ptr.is_null() {
@@ -116,14 +185,18 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
         Some(cstr)
     }
 
-    if !options_ptr.is_null() {
+    if options_ptr.is_null() {
+        options = load_configuration_from_env(None).unwrap_or_default();
+    } else {
         let foreign_options = &*options_ptr;
 
         if let Some(json) = cstr_to_string(foreign_options.json_options) {
-            match serde_json::from_str(&json) {
-                Ok(parsed) => options = parsed,
-                Err(_) => return -1,
+            match parse_configuration_string(&json) {
+                Some(parsed) => options = parsed,
+                None => return -1,
             }
+        } else {
+            options = Default::default();
         }
 
         options.make_default = foreign_options.make_default;
@@ -177,8 +250,6 @@ pub unsafe extern "C" fn sqlite3_verneuil_init(
 #[no_mangle]
 #[cfg(feature = "verneuil_test_vfs")]
 pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -> i32 {
-    use replication_target::*;
-
     // Send tracing calls to stdout, and converts any log! call to
     // traces.
     let _ = tracing_subscriber::fmt::try_init();
@@ -187,23 +258,9 @@ pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -
     crate::replication_buffer::ENABLE_AUTO_CLEANUP
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
-    if let Err(code) = configure(Options {
-        make_default: true,
-        tempdir: None,
-        replication_spooling_dir: Some("/tmp".into()),
-        replication_spooling_dir_permissions: None,
-        replication_targets: vec![
-            #[cfg(feature = "verneuil_test_minio")]
-            ReplicationTarget::S3(S3ReplicationTarget {
-                region: "minio".into(),
-                endpoint: Some("http://127.0.0.1:7777".into()),
-                chunk_bucket: "chunks".into(),
-                directory_bucket: "directories".into(),
-                domain_addressing: false,
-                create_buckets_on_demand: true,
-            }),
-        ],
-    }) {
+    if let Err(code) =
+        configure(load_configuration_from_env(None).expect("VERNEUIL_CONFIG must be populated"))
+    {
         return code;
     }
 

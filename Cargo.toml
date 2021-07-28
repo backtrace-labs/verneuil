@@ -15,7 +15,6 @@ default = ["verneuil_vendor_sqlite"]
 verneuil_vendor_sqlite = []
 verneuil_compat_no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
 verneuil_test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
-verneuil_test_minio = []  # Publish data to 127.0.0.1:7777
 verneuil_test_validate_writes = ["verneuil_test_vfs"]  # Validate snapshots after writes
 verneuil_test_validate_reads = ["verneuil_test_vfs"]  # Validate snapshots after reads as well (extra slow)
 verneuil_test_validate_all = ["verneuil_test_validate_writes", "verneuil_test_validate_reads"]

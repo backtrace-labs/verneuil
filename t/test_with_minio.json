@@ -1,0 +1,16 @@
+{
+    "make_default": true,
+    "replication_spooling_dir": "/tmp",
+    "replication_targets": [
+	{
+	    "s3": {
+		"region": "minio",
+		"endpoint": "http://127.0.0.1:7777",
+		"chunk_bucket": "chunks",
+		"directory_bucket": "directories",
+		"domain_addressing": false,
+		"create_buckets_on_demand": true
+	    }
+	}
+    ]
+}

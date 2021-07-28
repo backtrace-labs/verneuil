@@ -12,21 +12,22 @@ HERE=$(dirname $(readlink -f "$0"))
 # Default test features: validate after read and write transactions,
 # and publish data to a local minio server.  That gives us a lot of
 # coverage, but can be slow.
-FEATURES="verneuil_test_validate_all,verneuil_test_minio"
+FEATURES="verneuil_test_validate_all"
 
 # Other options:
 #
 # Maximise test speed, no assertion.  Useful for mptest.
 # FEATURES="verneuil_test_vfs"
 #
-# Slightly lower test speed, some assertions.  Also useful for mptest.
+# Slightly lower test speed, some assertions.  Also useful for mptest,
+# especially with minio disabled in VERNEUIL_CONFIG below.
 # FEATURES="verneuil_test_validate_writes"
 #
 # Restore some assertions.  Useful for soaktest.
-# FEATURES="verneuil_test_validate_writes,verneuil_test_minio"
+# FEATURES="verneuil_test_validate_writes"
 #
 # Run full assertions, without xattr support.
-# FEATURES="verneuil_test_validate_all,verneuil_test_minio,verneuil_compat_no_xattr"
+# FEATURES="verneuil_test_validate_all,verneuil_compat_no_xattr"
 #
 # Make sure that we behave usefully without replication targets.
 # FEATURES="verneuil_test_validate_all"
@@ -76,6 +77,15 @@ docker run --net=host \
 
 sleep 5;
 
+OFFLINE_CONFIG=$(cat <<'EOF'
+{
+    "make_default": true,
+    "replication_spooling_dir": "/tmp",
+    "replication_targets": []
+}
+EOF
+)
+
 # Other interesting targets:
 #  mptest: multi-process locks
 #  fulltestonly, fulltest, soaktest: more extensive tests
@@ -83,4 +93,7 @@ sleep 5;
 export AWS_ACCESS_KEY_ID=VERNEUIL_TEST_ACCOUNT
 export AWS_SECRET_ACCESS_KEY=VERNEUIL_TEST_KEY
 export RUST_LOG=off  # Disable logging by default: some sqlite tests take over stdin/stdout.
+
+export VERNEUIL_CONFIG="@${HERE}/test_with_minio.json"
+# export VERNEUIL_CONFIG="$OFFLINE_CONFIG"  # Disable the replication target here.
 make "OPTS=$OPTS" "CFLAGS=$CFLAGS" "LIBS=release/libverneuil.a -lpthread -lm -ldl" test "$@"

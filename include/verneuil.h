@@ -32,6 +32,10 @@ struct verneuil_options {
          * Optional JSON-encoded options.  The fields directly in
          * `verneuil_options` always take priority over the JSON.
          *
+         * If the string is of the form "@/path/to/file", the
+         * contents of that file are instead parsed as JSON-encoded
+         * options.
+         *
          * In particular, `make_default` is a no-op in the JSON.
          *
          * Fields (see `struct Options` in lib.rs and `struct
