@@ -3,6 +3,8 @@
 //! of replication directories, and sending the ready snapshot to
 //! object stores like S3.
 use core::num::NonZeroU32;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use std::collections::BTreeMap;
@@ -124,8 +126,8 @@ enum ActiveSetMaintenance {
 /// will be notified and commence shutdown.
 #[derive(Debug)]
 pub(crate) struct Copier {
-    ready_buffers: crossbeam_channel::Sender<Arc<PathBuf>>,
-    maintenance: crossbeam_channel::Sender<ActiveSetMaintenance>,
+    ready_buffers: Sender<Arc<PathBuf>>,
+    maintenance: Sender<ActiveSetMaintenance>,
     spool_path: Option<Arc<PathBuf>>,
 }
 
@@ -234,10 +236,10 @@ struct CopierSpoolLagInfo {
 
 #[derive(Debug)]
 struct CopierBackend {
-    ready_buffers: crossbeam_channel::Receiver<Arc<PathBuf>>,
-    maintenance: crossbeam_channel::Receiver<ActiveSetMaintenance>,
-    workers: crossbeam_channel::Sender<Arc<CopierSpoolState>>,
-    periodic_lag_scan: crossbeam_channel::Receiver<std::time::Instant>,
+    ready_buffers: Receiver<Arc<PathBuf>>,
+    maintenance: Receiver<ActiveSetMaintenance>,
+    workers: Sender<Arc<CopierSpoolState>>,
+    periodic_lag_scan: Receiver<std::time::Instant>,
     // Map from PathBuf for spool directories to their state.
     // The key is always equal to the value's `path` field.
     active_spool_paths: HashMap<Arc<PathBuf>, Arc<CopierSpoolState>>,
@@ -751,7 +753,7 @@ impl FileIdentifier {
 
 #[derive(Debug)]
 struct CopierWorker {
-    work: crossbeam_channel::Receiver<Arc<CopierSpoolState>>,
+    work: Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
 }
 
@@ -1424,11 +1426,7 @@ impl CopierBackend {
     fn new(
         worker_count: usize,
         channel_capacity: usize,
-    ) -> (
-        Self,
-        crossbeam_channel::Sender<Arc<PathBuf>>,
-        crossbeam_channel::Sender<ActiveSetMaintenance>,
-    ) {
+    ) -> (Self, Sender<Arc<PathBuf>>, Sender<ActiveSetMaintenance>) {
         let governor = Arc::new(governor::RateLimiter::direct_with_clock(
             COPY_RATE_QUOTA,
             &Default::default(),
@@ -1617,7 +1615,7 @@ impl CopierBackend {
             let mut keys: Vec<_> = active.values().cloned().collect();
 
             keys.shuffle(rng);
-            // Move stale records first.
+            // Move stale records to the end, so they're popped first.
             keys.sort_by(|x, y| {
                 x.stale
                     .load(Ordering::Relaxed)
