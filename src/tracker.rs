@@ -697,45 +697,22 @@ impl Tracker {
         fprint: &Fingerprint,
         from_staging: bool,
     ) -> Vec<u8> {
-        let mut contents: Option<Vec<u8>> = None;
-
-        let mut update_contents = |new_contents: Vec<u8>| {
-            // If we already know the chunk's contents, the new ones must match.
-            if let Some(old) = &contents {
-                assert_eq!(old, &new_contents);
-                return;
-            }
-
-            // The contents of a content-addressed chunk must have the same
-            // fingerprint as the chunk's name.
-            assert_eq!(fprint, &fingerprint_file_chunk(&new_contents));
-            contents = Some(new_contents);
-        };
-
-        // Chunks move from staging to ready to replication targets.
-        // Reading in the same order guarantees we will not miss
-        // a chunk that was deleted after successful replication.
+        let mut local_chunk_dirs = Vec::new();
         if from_staging {
-            if let Ok(staged) = buf.read_staged_chunk(&fprint) {
-                update_contents(staged);
-            }
+            local_chunk_dirs.push(buf.staged_chunk_directory());
         }
 
-        // If the ready chunk exists, it must match the staged one.
-        if let Ok(ready) = buf.read_ready_chunk(&fprint) {
-            update_contents(ready);
-        }
+        local_chunk_dirs.push(buf.ready_chunk_directory());
 
-        for blob_value in crate::copier::fetch_chunk_from_targets(
+        let loader = crate::loader::Loader::new(
+            local_chunk_dirs,
             &self.replication_targets.replication_targets,
-            &crate::replication_buffer::fingerprint_chunk_name(fprint),
-        ) {
-            if let Some(data) = blob_value.expect("target must be reachable") {
-                update_contents(data);
-            }
-        }
-
-        contents.expect("chunk data must exist")
+        )
+        .expect("failed to instantiate loader");
+        loader
+            .fetch_chunk(*fprint)
+            .expect("fetch should succeed")
+            .expect("chunk data must exist")
     }
 
     /// If the snapshot directory exists, confirms that we can get

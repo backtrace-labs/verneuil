@@ -1,6 +1,7 @@
 mod copier;
 mod directory_schema;
 mod instance_id;
+mod loader;
 mod ofd_lock;
 mod process_id;
 mod racy_time;

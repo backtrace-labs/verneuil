@@ -872,30 +872,24 @@ impl ReplicationBuffer {
         read_directory_at_path(&src)
     }
 
-    /// Attempts to parse the current staged directory file.
+    /// Returns the path prefix for staged chunks.
     #[allow(dead_code)]
-    #[instrument(level = "trace")]
-    pub fn read_staged_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
-        let mut src = self.spooling_directory.clone();
-        src.push(STAGING);
-        src.push(CHUNKS);
-        src.push(&fingerprint_chunk_name(fprint));
+    pub fn staged_chunk_directory(&self) -> PathBuf {
+        let mut dir = self.spooling_directory.clone();
+        dir.push(STAGING);
+        dir.push(CHUNKS);
 
-        std::fs::read(&src)
-            .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to read staged chunk file", ?src))
+        dir
     }
 
-    /// Attempts to parse the current staged directory file.
+    /// Returns the path prefix for ready chunks.
     #[allow(dead_code)]
-    #[instrument(level = "trace")]
-    pub fn read_ready_chunk(&self, fprint: &Fingerprint) -> Result<Vec<u8>> {
-        let mut src = self.spooling_directory.clone();
-        src.push(READY);
-        src.push(CHUNKS);
-        src.push(&fingerprint_chunk_name(fprint));
+    pub fn ready_chunk_directory(&self) -> PathBuf {
+        let mut dir = self.spooling_directory.clone();
+        dir.push(READY);
+        dir.push(CHUNKS);
 
-        std::fs::read(&src)
-            .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to read ready chunk file", ?src))
+        dir
     }
 
     /// Attempts to copy the current "staging" buffer to a temporary
