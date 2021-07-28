@@ -39,6 +39,9 @@ const LOAD_RETRY_MULTIPLIER: f64 = 10.0;
 /// there is any external strong reference to them.
 const LRU_CACHE_SIZE: usize = 128;
 
+/// Load chunks in a dedicated thread pool of this size.
+const LOADER_POOL_SIZE: usize = 10;
+
 #[derive(Eq, PartialEq, Debug)]
 // `#[non_exhaustive]` is too weak: it's a no-op within the crate.
 #[allow(clippy::manual_non_exhaustive)]
@@ -53,6 +56,13 @@ pub(crate) struct Chunk {
 pub(crate) struct Loader {
     local_caches: Vec<PathBuf>,
     remote_sources: Vec<Bucket>,
+}
+
+lazy_static::lazy_static! {
+    static ref LOADER_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
+        .num_threads(LOADER_POOL_SIZE)
+        .build()
+        .expect("failed to build global loader pool");
 }
 
 lazy_static::lazy_static! {
@@ -159,12 +169,24 @@ impl Loader {
         &self,
         fprints: &[Fingerprint],
     ) -> Result<HashMap<Fingerprint, Arc<Chunk>>> {
+        use rand::prelude::SliceRandom;
+
         // Deduplicate fprints before fetching them.
         let targets: HashSet<Fingerprint> = fprints.iter().cloned().collect();
-        let chunks: Vec<Option<Arc<Chunk>>> = targets
-            .into_iter()
-            .map(|fprint| self.fetch_chunk(fprint))
-            .collect::<Result<_>>()?;
+
+        // Randomize the load order to avoid accidental hotspotting
+        // when threads or processes load similar sets of chunks.
+        let mut shuffled_targets: Vec<Fingerprint> = targets.into_iter().collect();
+        shuffled_targets.shuffle(&mut rand::thread_rng());
+
+        let chunks: Vec<Option<Arc<Chunk>>> = LOADER_POOL.install(move || {
+            use rayon::prelude::*;
+
+            shuffled_targets
+                .into_par_iter()
+                .map(|fprint| self.fetch_chunk(fprint))
+                .collect::<Result<_>>()
+        })?;
 
         Ok(chunks
             .into_iter()
