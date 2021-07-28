@@ -2,6 +2,7 @@
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -158,9 +159,11 @@ impl Loader {
         &self,
         fprints: &[Fingerprint],
     ) -> Result<HashMap<Fingerprint, Arc<Chunk>>> {
-        let chunks: Vec<Option<Arc<Chunk>>> = fprints
-            .iter()
-            .map(|fprint| self.fetch_chunk(*fprint))
+        // Deduplicate fprints before fetching them.
+        let targets: HashSet<Fingerprint> = fprints.iter().cloned().collect();
+        let chunks: Vec<Option<Arc<Chunk>>> = targets
+            .into_iter()
+            .map(|fprint| self.fetch_chunk(fprint))
             .collect::<Result<_>>()?;
 
         Ok(chunks
