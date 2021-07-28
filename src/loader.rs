@@ -4,13 +4,14 @@ use s3::creds::Credentials;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 use umash::Fingerprint;
 
 use crate::chain_error;
 use crate::chain_warn;
-use crate::directory_schema::fingerprint_file_chunk;
+use crate::directory_schema::hash_file_chunk;
 use crate::fresh_error;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
@@ -29,10 +30,54 @@ const LOAD_RETRY_BASE_WAIT: Duration = Duration::from_millis(50);
 /// consecutive failures.
 const LOAD_RETRY_MULTIPLIER: f64 = 10.0;
 
+#[derive(Eq, PartialEq, Debug)]
+// `#[non_exhaustive]` is too weak: it's a no-op within the crate.
+#[allow(clippy::manual_non_exhaustive)]
+pub(crate) struct Chunk {
+    pub fprint: Fingerprint,
+    pub payload: Box<[u8]>,
+
+    _use_constructor: (),
+}
+
 #[derive(Debug)]
 pub(crate) struct Loader {
     local_caches: Vec<PathBuf>,
     remote_sources: Vec<Bucket>,
+}
+
+impl Chunk {
+    /// Returns a fresh chunk for `fprint`.
+    ///
+    /// Returns `Err` when the payload's fingerprint does not match.
+    pub(crate) fn new(fprint: Fingerprint, payload: Vec<u8>) -> Result<Chunk> {
+        // The contents of a content-addressed chunk must have the same
+        // fingerprint as the chunk's name.
+        #[cfg(feature = "verneuil_test_vfs")]
+        assert_eq!(
+            fprint,
+            crate::directory_schema::fingerprint_file_chunk(&payload)
+        );
+
+        // In production, only check the first 64-bit half of the
+        // fingerprint, for speed.
+        let actual_hash = hash_file_chunk(&payload);
+
+        if actual_hash != fprint.hash[0] {
+            return Err(fresh_error!(
+                "mismatching file contents",
+                ?fprint,
+                ?actual_hash,
+                len = payload.len()
+            ));
+        }
+
+        Ok(Chunk {
+            fprint,
+            payload: payload.into(),
+            _use_constructor: (),
+        })
+    }
 }
 
 impl Loader {
@@ -63,34 +108,19 @@ impl Loader {
     ///
     /// Returns Ok(None) if nothing was found.
     #[instrument(level = "debug")]
-    pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Vec<u8>>> {
-        let mut contents: Option<Vec<u8>> = None;
+    pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
+        let mut contents: Option<Arc<Chunk>> = None;
 
         let mut update_contents = |new_contents: Vec<u8>| {
             // If we already know the chunk's contents, the new ones
             // must match.
             if let Some(_old) = &contents {
                 #[cfg(feature = "verneuil_test_vfs")]
-                assert_eq!(_old, &new_contents);
+                assert_eq!(&*_old.payload, new_contents.as_slice());
                 return Ok(());
             }
 
-            // The contents of a content-addressed chunk must have the same
-            // fingerprint as the chunk's name.
-            let actual_fprint = fingerprint_file_chunk(&new_contents);
-            #[cfg(feature = "verneuil_test_vfs")]
-            assert_eq!(fprint, actual_fprint);
-
-            if actual_fprint != fprint {
-                return Err(fresh_error!(
-                    "mismatching file contents",
-                    ?fprint,
-                    ?actual_fprint,
-                    len = new_contents.len()
-                ));
-            }
-
-            contents = Some(new_contents);
+            contents = Some(Arc::new(Chunk::new(fprint, new_contents)?));
             Ok(())
         };
 

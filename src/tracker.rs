@@ -696,7 +696,7 @@ impl Tracker {
         buf: &ReplicationBuffer,
         fprint: &Fingerprint,
         from_staging: bool,
-    ) -> Vec<u8> {
+    ) -> std::sync::Arc<crate::loader::Chunk> {
         let mut local_chunk_dirs = Vec::new();
         if from_staging {
             local_chunk_dirs.push(buf.staged_chunk_directory());
@@ -747,9 +747,9 @@ impl Tracker {
             }
 
             let contents = self.fetch_chunk_or_die(buf, &fprint, from_staging);
-            len += contents.len() as u64;
+            len += contents.payload.len() as u64;
             if i + 1 < v1.chunks.len() / 2 {
-                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
+                assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
             }
         }
 
@@ -822,11 +822,11 @@ impl Tracker {
 
             let contents = self.fetch_chunk_or_die(buf, &fprint, true);
             if i + 1 < directory.chunks.len() / 2 {
-                assert_eq!(contents.len(), SNAPSHOT_GRANULARITY as usize);
+                assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
             }
 
-            len += contents.len() as u64;
-            hasher.update(&contents);
+            len += contents.payload.len() as u64;
+            hasher.update(&contents.payload);
         }
 
         assert_eq!(directory.len, len);

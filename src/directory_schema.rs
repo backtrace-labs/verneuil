@@ -302,13 +302,18 @@ pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
     result
 }
 
+lazy_static::lazy_static! {
+    static ref CHUNK_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db chunk params");
+}
+
 /// Computes the fingerprint for a chunk of sqlite db file.
 pub(crate) fn fingerprint_file_chunk(bytes: &[u8]) -> Fingerprint {
-    lazy_static::lazy_static! {
-        static ref CHUNK_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db chunk params");
-    }
-
     Fingerprint::generate(&CHUNK_PARAMS, 0, bytes)
+}
+
+/// Computes the first half of the fingerprint for a chunk of sqlite db file.
+pub(crate) fn hash_file_chunk(bytes: &[u8]) -> u64 {
+    umash::full(&CHUNK_PARAMS, 0, 0, bytes)
 }
 
 /// Computes the `contents_fprint` for a given `chunks` array of u64.
