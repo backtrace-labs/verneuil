@@ -90,21 +90,21 @@ int sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
  * success.  All remaining fields may be 0 on failure.
  */
 struct verneuil_replication_info {
-	/* Name of the corresponding blob in remote storage. */
-	char *blob_name;
+        /* Name of the corresponding blob in remote storage. */
+        char *blob_name;
 
-	/* Metadata from the blob proto. */
-	uint64_t header_fprint[2];
-	uint64_t contents_fprint[2];
-	uint64_t ctime;
-	uint32_t ctime_ns;
+        /* Metadata from the blob proto. */
+        uint64_t header_fprint[2];
+        uint64_t contents_fprint[2];
+        uint64_t ctime;
+        uint32_t ctime_ns;
 
-	/*
-	 * Actual protobuf-encoded payload in the directory blob, if
-	 * known.
-	 */
-	size_t num_bytes;
-	char *bytes;
+        /*
+         * Actual protobuf-encoded payload in the directory blob, if
+         * known.
+         */
+        size_t num_bytes;
+        char *bytes;
 };
 
 /**
@@ -114,8 +114,8 @@ struct verneuil_replication_info {
  *
  * Returns 0 on success, -1 on failure.
  */
-int verneuil_replication_info_for_db(struct verneuil_replication_info *dst, const char *db,
-    const char *spool_prefix);
+int verneuil_replication_info_for_db(struct verneuil_replication_info *dst,
+    const char *db, const char *spool_prefix);
 
 /**
  * Releases resources owned by `info`.
