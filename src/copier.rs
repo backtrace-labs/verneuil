@@ -237,6 +237,15 @@ struct CopierSpoolLagInfo {
 #[derive(Debug)]
 struct CopierBackend {
     ready_buffers: Receiver<Arc<PathBuf>>,
+    // When the backend newly detects that replicated data is late, it
+    // queues it up for a copy in the `stale_buffers` channel.  We use
+    // dedicated channels instead of overloading `ready_buffer` to
+    // preserve fairness: we don't want currently up-to-date replicas
+    // to keep falling behind until they're detected as stale.
+    stale_buffers: (
+        Sender<Arc<CopierSpoolState>>,
+        Receiver<Arc<CopierSpoolState>>,
+    ),
     maintenance: Receiver<ActiveSetMaintenance>,
     workers: Sender<Arc<CopierSpoolState>>,
     periodic_lag_scan: Receiver<std::time::Instant>,
@@ -1447,6 +1456,7 @@ impl CopierBackend {
 
         let backend = CopierBackend {
             ready_buffers: buf_recv,
+            stale_buffers: crossbeam_channel::bounded(channel_capacity),
             maintenance: maintenance_recv,
             workers: worker_send,
             periodic_lag_scan: crossbeam_channel::tick(REPLICATION_LAG_REPORT_PERIOD),
@@ -1476,18 +1486,39 @@ impl CopierBackend {
     /// `REPLICATION_LAG_REPORT_THRESHOLD`.
     #[instrument]
     fn scan_for_replication_lag(&self) {
+        use rand::prelude::SliceRandom;
+
+        let mut newly_stale = Vec::new();
+
         let stats: BTreeMap<String, CopierSpoolLagInfo> = self
             .active_spool_paths
             .values()
             .map(|spool_state| -> Result<_> {
+                let old_stale = spool_state.stale.load(Ordering::Relaxed);
+
                 let (k, v) = spool_state.lag_info().map_err(|e| {
                     chain_error!(e, "failed to extract replication lag info", ?spool_state)
                 })?;
+
+                // Accumulate states that are newly detected as stale
+                // in the `newly_stale` vector: we want to push them to
+                // the `stale_buffers` channel.
+                if !old_stale && spool_state.stale.load(Ordering::Relaxed) {
+                    newly_stale.push(spool_state.clone());
+                }
 
                 Ok((k.to_string_lossy().into_owned(), v))
             })
             .flatten()
             .collect();
+
+        newly_stale.shuffle(&mut rand::thread_rng());
+        for state in newly_stale {
+            // Sending only fails because the queue is full.  That's
+            // not worth complaining about: in the worst case, the
+            // background scan will get to this spool directory.
+            let _ = self.stale_buffers.0.try_send(state);
+        }
 
         let mut num_maybe_stale = 0usize;
         let mut num_stale = 0usize;
@@ -1561,6 +1592,10 @@ impl CopierBackend {
                 },
                 // Errors only happen when there is no more sender.
                 // That means the worker should shut down.
+                Err(_) => return false,
+            },
+            recv(self.stale_buffers.1) -> stale => match stale {
+                Ok(stale) => self.queue_active_state(&stale),
                 Err(_) => return false,
             },
             recv(self.maintenance) -> maintenance => match maintenance {
