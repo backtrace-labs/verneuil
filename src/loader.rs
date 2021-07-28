@@ -1,10 +1,13 @@
 //! `Loader`s are responsible for fetching chunks.
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 use tracing::instrument;
 use umash::Fingerprint;
@@ -46,6 +49,10 @@ pub(crate) struct Loader {
     remote_sources: Vec<Bucket>,
 }
 
+lazy_static::lazy_static! {
+    static ref LIVE_CHUNKS: Mutex<HashMap<Fingerprint, Weak<Chunk>>> = Default::default();
+}
+
 impl Chunk {
     /// Returns a fresh chunk for `fprint`.
     ///
@@ -80,6 +87,23 @@ impl Chunk {
     }
 }
 
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        // Remove this chunk from the global chunk map.
+        let mut map = LIVE_CHUNKS.lock().expect("mutex should be valid");
+
+        // By the time this `Chunk` is dropped, the Arc's strong count
+        // has already been decremented to 0.  If we can upgrade the
+        // value, it must have been inserted for a different copy of
+        // this `Chunk`.
+        if let Some(weak) = map.remove(&self.fprint) {
+            if let Some(strong) = weak.upgrade() {
+                map.insert(strong.fprint, weak);
+            }
+        }
+    }
+}
+
 impl Loader {
     /// Creates a fresh `Loader` that looks for hits first in `local`,
     /// and then in `remote`.  The `Loader` always check the sources
@@ -109,7 +133,13 @@ impl Loader {
     /// Returns Ok(None) if nothing was found.
     #[instrument(level = "debug")]
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
-        let mut contents: Option<Arc<Chunk>> = None;
+        let mut contents = fetch_from_cache(fprint);
+
+        // Don't fast path in tests.
+        #[cfg(not(feature = "verneuil_test_vfs"))]
+        if contents.is_some() {
+            return Ok(contents);
+        }
 
         let mut update_contents = |new_contents: Vec<u8>| {
             // If we already know the chunk's contents, the new ones
@@ -120,7 +150,9 @@ impl Loader {
                 return Ok(());
             }
 
-            contents = Some(Arc::new(Chunk::new(fprint, new_contents)?));
+            let chunk = Arc::new(Chunk::new(fprint, new_contents)?);
+            update_cache(&chunk);
+            contents = Some(chunk);
             Ok(())
         };
 
@@ -128,7 +160,6 @@ impl Loader {
         for path in &self.local_caches {
             if let Some(cached) = load_from_cache(&path, &name)? {
                 update_contents(cached)?;
-                // Don't fast path in tests.
                 #[cfg(not(feature = "verneuil_test_vfs"))]
                 return Ok(contents);
             }
@@ -144,6 +175,21 @@ impl Loader {
 
         Ok(contents)
     }
+}
+
+fn update_cache(chunk: &Arc<Chunk>) {
+    let key = chunk.fprint;
+    let weak = Arc::downgrade(chunk);
+
+    let mut map = LIVE_CHUNKS.lock().expect("mutex should be valid");
+    map.insert(key, weak);
+}
+
+/// Returns a cached chunk for `key`, if we have one.
+fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
+    let map = LIVE_CHUNKS.lock().expect("mutex should be valid");
+
+    map.get(&key)?.upgrade()
 }
 
 #[instrument(level = "debug")]
