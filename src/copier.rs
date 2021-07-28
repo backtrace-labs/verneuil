@@ -1530,6 +1530,20 @@ impl CopierBackend {
                        "computed replication lag");
     }
 
+    /// Queues a state for copying, unless it is already enqueued.
+    fn queue_active_state(&self, state: &Arc<CopierSpoolState>) {
+        if !state.signaled.load(Ordering::Relaxed) {
+            // Flip the flag to true before the worker can
+            // reset it.
+            state.signaled.store(true, Ordering::Relaxed);
+            if self.send_work(state.clone()).is_some() {
+                // If we failed to send work, clear
+                // the flag ourself and try again.
+                state.signaled.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Handles the next request from our channels.  Returns true on
     /// success, false if the worker thread should abort.
     #[instrument(level = "debug")]
@@ -1542,16 +1556,7 @@ impl CopierBackend {
                     // Data in `ready_buffer` is only advisory, it's
                     // never incorrect to drop the work unit.
                     if let Some(state) = self.active_spool_paths.get(&ready) {
-                        if !state.signaled.load(Ordering::Relaxed) {
-                            // Flip the flag to true before the worker can
-                            // reset it.
-                            state.signaled.store(true, Ordering::Relaxed);
-                            if self.send_work(state.clone()).is_some() {
-                                // If we failed to send work, clear
-                                // the flag ourself and try again.
-                                state.signaled.store(false, Ordering::Relaxed);
-                            }
-                        }
+                        self.queue_active_state(&state);
                     }
                 },
                 // Errors only happen when there is no more sender.
