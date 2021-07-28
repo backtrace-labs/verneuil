@@ -33,6 +33,10 @@ const LOAD_RETRY_BASE_WAIT: Duration = Duration::from_millis(50);
 /// consecutive failures.
 const LOAD_RETRY_MULTIPLIER: f64 = 10.0;
 
+/// Keep up to this many cached `Chunk`s alive, regardless of whether
+/// there is any external strong reference to them.
+const LRU_CACHE_SIZE: usize = 128;
+
 #[derive(Eq, PartialEq, Debug)]
 // `#[non_exhaustive]` is too weak: it's a no-op within the crate.
 #[allow(clippy::manual_non_exhaustive)]
@@ -51,6 +55,12 @@ pub(crate) struct Loader {
 
 lazy_static::lazy_static! {
     static ref LIVE_CHUNKS: Mutex<HashMap<Fingerprint, Weak<Chunk>>> = Default::default();
+}
+
+lazy_static::lazy_static! {
+    // This bounded LRU cache maintains strong references to hot
+    // chunks, to avoid repeatedly dropping and re-fetching them.
+    static ref CACHED_CHUNKS: Mutex<lru::LruCache<Fingerprint, Arc<Chunk>>> = Mutex::new(lru::LruCache::new(LRU_CACHE_SIZE));
 }
 
 impl Chunk {
@@ -151,7 +161,7 @@ impl Loader {
             }
 
             let chunk = Arc::new(Chunk::new(fprint, new_contents)?);
-            update_cache(&chunk);
+            update_cache(chunk.clone());
             contents = Some(chunk);
             Ok(())
         };
@@ -177,19 +187,35 @@ impl Loader {
     }
 }
 
-fn update_cache(chunk: &Arc<Chunk>) {
+fn touch_cached_chunk(chunk: Arc<Chunk>) {
     let key = chunk.fprint;
-    let weak = Arc::downgrade(chunk);
 
-    let mut map = LIVE_CHUNKS.lock().expect("mutex should be valid");
-    map.insert(key, weak);
+    let mut cache = CACHED_CHUNKS.lock().expect("mutex should be valid");
+    cache.put(key, chunk);
+}
+
+fn update_cache(chunk: Arc<Chunk>) {
+    let key = chunk.fprint;
+    let weak = Arc::downgrade(&chunk);
+
+    {
+        let mut map = LIVE_CHUNKS.lock().expect("mutex should be valid");
+        map.insert(key, weak);
+    }
+
+    touch_cached_chunk(chunk);
 }
 
 /// Returns a cached chunk for `key`, if we have one.
 fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
-    let map = LIVE_CHUNKS.lock().expect("mutex should be valid");
+    let upgraded = {
+        let map = LIVE_CHUNKS.lock().expect("mutex should be valid");
 
-    map.get(&key)?.upgrade()
+        map.get(&key)?.upgrade()?
+    };
+
+    touch_cached_chunk(upgraded.clone());
+    Some(upgraded)
 }
 
 #[instrument(level = "debug")]

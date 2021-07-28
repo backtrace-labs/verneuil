@@ -28,6 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 governor = { version = "0.3", default-features = false, features = ["std", "jitter"] }  # 0.3 doesn't build without "jitter"
 lazy_static = "1"
+lru = { version = "0.6", default-features = false }  # Disable hashbrown
 percent-encoding = "2"
 prost = "0.7"
 rand = "0.8"
