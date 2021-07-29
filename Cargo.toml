@@ -44,5 +44,9 @@ uluru = "2"
 umash = "0.1.2"
 uuid = { version = "0.8", features = ["v4"] }
 
+[dev-dependencies]
+tracing-subscriber = { version = "0.2", features = ["tracing-log"] }  # Examples set up tracing.
+structopt = "0.3"
+
 [build-dependencies]
 cc = "1"
