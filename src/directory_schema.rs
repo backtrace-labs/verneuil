@@ -12,7 +12,7 @@ use crate::warn_from_os;
 
 /// A umash fingerprint.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub(crate) struct Fprint {
+pub struct Fprint {
     #[prost(fixed64, tag = "1")]
     pub major: u64,
     #[prost(fixed64, tag = "2")]
@@ -51,7 +51,7 @@ impl From<&Fprint> for Fingerprint {
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub(crate) struct DirectoryV1 {
+pub struct DirectoryV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There
     // may be some rare collisions over long time periods (> 4 billion
     // transactions), or when the file is deleted and re-created, but
@@ -98,7 +98,7 @@ pub(crate) struct DirectoryV1 {
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub(crate) struct Directory {
+pub struct Directory {
     #[prost(message, tag = "1")]
     pub v1: Option<DirectoryV1>,
 }

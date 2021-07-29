@@ -7,7 +7,7 @@ mod process_id;
 mod racy_time;
 mod replication_buffer;
 mod replication_target;
-mod result;
+pub mod result; // Must be exposed for the helper functions
 mod sqlite_code;
 mod tracker;
 mod vfs_ops;
@@ -18,11 +18,14 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 
+pub use directory_schema::Directory;
+pub use result::Result;
+
 /// Read the verneuil configuration from this variable by default.
 pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";
 
 /// Initialization options for the Verneuil VFS.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct Options {
     /// If true, the Verneuil VFS overrides the default sqlite VFS.
@@ -127,7 +130,7 @@ pub fn load_configuration_from_env(var_name_or: Option<&str>) -> Option<Options>
 }
 
 /// Configures the Verneuil VFS
-pub fn configure(options: Options) -> Result<(), i32> {
+pub fn configure(options: Options) -> std::result::Result<(), i32> {
     let c_path;
     let mut foreign_options = ForeignOptions {
         make_default: options.make_default,
@@ -288,7 +291,7 @@ pub struct ReplicationProtoData {
 pub fn current_replication_proto_for_db(
     source_db: &std::path::Path,
     spool_prefix: Option<std::path::PathBuf>,
-) -> result::Result<(String, Option<ReplicationProtoData>)> {
+) -> Result<(String, Option<ReplicationProtoData>)> {
     let meta_path = replication_buffer::tapped_meta_path_in_spool_prefix(spool_prefix, source_db)?;
 
     let blob_name = meta_path
