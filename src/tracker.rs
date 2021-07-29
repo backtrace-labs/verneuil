@@ -657,37 +657,25 @@ impl Tracker {
 
 #[cfg(feature = "verneuil_test_vfs")]
 impl Tracker {
-    /// Converts a slice of u64 hashes to a vector of `Fingerprint`s.
-    fn convert_all_fprints(chunks: &[u64]) -> Vec<Fingerprint> {
-        let mut ret = Vec::new();
-        for i in 0..chunks.len() / 2 {
-            ret.push(Fingerprint {
-                hash: [chunks[2 * i], chunks[2 * i + 1]],
-            });
-        }
-
-        ret
-    }
-
-    fn fetch_all_chunks(
+    fn fetch_snapshot_or_die(
         &self,
         buf: &ReplicationBuffer,
-        fprints: &[Fingerprint],
+        directory: &Directory,
         from_staging: bool,
-    ) -> std::collections::HashMap<Fingerprint, std::sync::Arc<crate::loader::Chunk>> {
+    ) -> crate::snapshot::Snapshot {
         let mut local_chunk_dirs = Vec::new();
         if from_staging {
             local_chunk_dirs.push(buf.staged_chunk_directory());
         }
 
         local_chunk_dirs.push(buf.ready_chunk_directory());
-        crate::loader::Loader::new(
+
+        crate::snapshot::Snapshot::new(
             local_chunk_dirs,
             &self.replication_targets.replication_targets,
+            directory,
         )
-        .expect("failed to instantiate loader")
-        .fetch_all_chunks(fprints)
-        .expect("fetch should succeed")
+        .expect("failed to instantiate snapshot")
     }
 
     /// If the snapshot directory exists, confirms that we can get
@@ -706,20 +694,7 @@ impl Tracker {
             Err(err) => return Err(err),
         };
 
-        let v1 = directory.v1.expect("v1 must exist");
-        let fprints = Tracker::convert_all_fprints(&v1.chunks);
-        let chunks = self.fetch_all_chunks(buf, &fprints, from_staging);
-
-        let mut len = 0;
-        for (i, fprint) in fprints.into_iter().enumerate() {
-            let contents = chunks.get(&fprint).expect("must have chunk");
-            len += contents.payload.len() as u64;
-            if i + 1 < v1.chunks.len() / 2 {
-                assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
-            }
-        }
-
-        assert_eq!(len, v1.len);
+        self.fetch_snapshot_or_die(buf, &directory, from_staging);
         Ok(())
     }
 
@@ -759,32 +734,22 @@ impl Tracker {
         let directory = buf
             .read_staged_directory(&self.path)
             .expect("directory must parse")
-            .expect("directory must exist")
+            .expect("directory must exist");
+
+        let directory_v1 = directory
             .v1
+            .as_ref()
             .expect("v1 component must be populated.");
 
         // The header fingerprint must match the current header.
         assert_eq!(
-            directory.header_fprint,
+            directory_v1.header_fprint,
             fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
                 .map(|fp| fp.into())
         );
 
-        let fprints = Tracker::convert_all_fprints(&directory.chunks);
-        let chunks = self.fetch_all_chunks(buf, &fprints, true);
-
-        let mut len = 0;
-        for (i, fprint) in fprints.into_iter().enumerate() {
-            let contents = chunks.get(&fprint).expect("must have chunk");
-            if i + 1 < directory.chunks.len() / 2 {
-                assert_eq!(contents.payload.len(), SNAPSHOT_GRANULARITY as usize);
-            }
-
-            len += contents.payload.len() as u64;
-            hasher.update(&contents.payload);
-        }
-
-        assert_eq!(directory.len, len);
+        let snapshot = self.fetch_snapshot_or_die(buf, &directory, true);
+        std::io::copy(&mut snapshot.as_read(), &mut hasher).expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())
     }

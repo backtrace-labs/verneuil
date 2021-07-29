@@ -8,6 +8,7 @@ mod racy_time;
 mod replication_buffer;
 mod replication_target;
 pub mod result; // Must be exposed for the helper functions
+mod snapshot;
 mod sqlite_code;
 mod tracker;
 mod vfs_ops;
@@ -20,6 +21,7 @@ use std::path::Path;
 
 pub use directory_schema::Directory;
 pub use result::Result;
+pub use snapshot::Snapshot;
 
 /// Read the verneuil configuration from this variable by default.
 pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";

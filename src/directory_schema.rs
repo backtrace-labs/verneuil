@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::chain_error;
 use crate::drop_result;
-use crate::fresh_info;
+use crate::fresh_warn;
 use crate::result::Result;
 use crate::warn_from_os;
 
@@ -377,8 +377,39 @@ pub(crate) fn parse_directory_info(
     }
 }
 
+/// Returns the list of chunks in `directory`.
+pub(crate) fn extract_directory_chunks(directory: &Directory) -> Result<Vec<Fingerprint>> {
+    match &directory.v1 {
+        Some(v1)
+            if v1.chunks.len() % 2 == 0
+                && Some(fingerprint_v1_chunk_list(&v1.chunks))
+                    == v1.contents_fprint.as_ref().map(Into::into) =>
+        {
+            let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
+
+            for i in 0..v1.chunks.len() / 2 {
+                ret.push(Fingerprint {
+                    hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
+                });
+            }
+
+            Ok(ret)
+        }
+        _ => Err(fresh_warn!("invalid directory proto v1", ?directory)),
+    }
+}
+
+pub(crate) fn extract_directory_len(directory: &Directory) -> Result<u64> {
+    if let Some(v1) = &directory.v1 {
+        Ok(v1.len)
+    } else {
+        Err(fresh_warn!("invalid directory proto v1", ?directory))
+    }
+}
+
 /// Returns the list of chunks in the directory proto at `Path`, or
 /// an empty list if there is no such file.
+#[instrument]
 pub(crate) fn parse_directory_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
     use prost::Message;
 
@@ -386,20 +417,7 @@ pub(crate) fn parse_directory_chunks(path: &std::path::Path) -> Result<Vec<Finge
         Ok(contents) => {
             let directory = Directory::decode(&*contents)
                 .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
-            match directory.v1 {
-                Some(v1) if v1.chunks.len() % 2 == 0 => {
-                    let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
-
-                    for i in 0..v1.chunks.len() / 2 {
-                        ret.push(Fingerprint {
-                            hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
-                        });
-                    }
-
-                    Ok(ret)
-                }
-                _ => Err(fresh_info!("invalid directory proto v1", ?path)),
-            }
+            extract_directory_chunks(&directory)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(chain_error!(
