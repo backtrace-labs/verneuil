@@ -129,7 +129,24 @@ pub fn load_configuration_from_env(var_name_or: Option<&str>) -> Option<Options>
     parse_configuration_string(value)
 }
 
-/// Configures the Verneuil VFS
+/// Configures the replication subsystem, but not the sqlite VFS itself.
+pub fn configure_replication(options: Options) -> Result<()> {
+    if let Some(spooling_dir) = options.replication_spooling_dir {
+        let mode = options.replication_spooling_dir_permissions.unwrap_or(0) | 0o700;
+
+        replication_buffer::set_default_spooling_directory(
+            Path::new(&spooling_dir),
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )?;
+    }
+
+    replication_target::set_default_replication_targets(options.replication_targets);
+
+    Ok(())
+}
+
+/// Configures the Verneuil VFS.  Sqlite must be initialised when
+/// this function is called.
 pub fn configure(options: Options) -> std::result::Result<(), i32> {
     let c_path;
     let mut foreign_options = ForeignOptions {
@@ -140,8 +157,8 @@ pub fn configure(options: Options) -> std::result::Result<(), i32> {
         json_options: std::ptr::null(),
     };
 
-    if let Some(path) = options.tempdir {
-        c_path = CString::new(path).map_err(|_| -1)?;
+    if let Some(path) = &options.tempdir {
+        c_path = CString::new(path.clone()).map_err(|_| -1)?;
         foreign_options.tempdir = c_path.as_ptr();
     }
 
@@ -151,17 +168,7 @@ pub fn configure(options: Options) -> std::result::Result<(), i32> {
         return Err(ret);
     }
 
-    if let Some(spooling_dir) = options.replication_spooling_dir {
-        let mode = options.replication_spooling_dir_permissions.unwrap_or(0) | 0o700;
-
-        replication_buffer::set_default_spooling_directory(
-            Path::new(&spooling_dir),
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )
-        .map_err(|_| -1)?;
-    }
-
-    replication_target::set_default_replication_targets(options.replication_targets);
+    configure_replication(options).map_err(|_| -1)?;
     Ok(())
 }
 
