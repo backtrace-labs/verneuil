@@ -94,6 +94,7 @@ pub fn main() -> verneuil::Result<()> {
     let directory = verneuil::Directory::decode(&*directory_contents)
         .map_err(|e| chain_error!(e, "failed to parse directory file", path=?opts.directory))?;
     let snapshot = verneuil::Snapshot::new_with_default_targets(&directory)?;
+    let mut reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
 
     if let Some(dst) = &opts.out {
         let out_file = dst
@@ -108,7 +109,7 @@ pub fn main() -> verneuil::Result<()> {
             .tempfile_in(out_dir)
             .map_err(|e| chain_error!(e, "failed to create temporary file", ?dst))?;
 
-        std::io::copy(&mut snapshot.as_read(), temp.as_file_mut()).map_err(|e| {
+        std::io::copy(&mut reader, temp.as_file_mut()).map_err(|e| {
             chain_error!(
                 e,
                 "failed to write snapshot contents to temporary file",
@@ -125,7 +126,7 @@ pub fn main() -> verneuil::Result<()> {
             )
         })?;
     } else {
-        std::io::copy(&mut snapshot.as_read(), &mut std::io::stdout())
+        std::io::copy(&mut reader, &mut std::io::stdout())
             .map_err(|e| chain_error!(e, "failed to write snapshot contents to stdout"))?;
     }
 

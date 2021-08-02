@@ -749,7 +749,7 @@ impl Tracker {
         );
 
         let snapshot = self.fetch_snapshot_or_die(buf, &directory, true);
-        std::io::copy(&mut snapshot.as_read(), &mut hasher).expect("should hash");
+        std::io::copy(&mut snapshot.as_read(0, u64::MAX), &mut hasher).expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())
     }

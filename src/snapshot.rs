@@ -21,10 +21,15 @@ pub struct Snapshot {
     chunks: BTreeMap<u64, Arc<Chunk>>,
 }
 
-/// A SnapshotReader implements `std::io::Read` for `Snapshot`.
-pub struct SnapshotReader<'a> {
-    current_chunk: Option<&'a [u8]>,
-    chunks: std::collections::btree_map::Iter<'a, u64, Arc<Chunk>>,
+/// A SnapshotReader implements `std::io::Read` for a parent `Snapshot`.
+pub struct SnapshotReader<'parent> {
+    // The current slice is either None, or non-empty.
+    current_chunk: Option<&'parent [u8]>,
+    // Byte offset where we want to stop reading (exclusive)
+    end_byte_offset: u64,
+    // Set to true once we have read up to `last_byte`.
+    exhausted: bool,
+    chunks: std::collections::btree_map::Range<'parent, u64, Arc<Chunk>>,
 }
 
 impl Snapshot {
@@ -122,13 +127,68 @@ impl Snapshot {
     }
 
     /// Returns a stateful wrapper for `Snapshot` that implements
-    /// `std::io::Read` for the snapshot's contents.
+    /// `std::io::Read` for the snapshot's contents at bytes
+    /// `[initial_offset, min(initial_offset + len, self.len()))`.
     #[inline]
-    pub fn as_read(&self) -> SnapshotReader {
-        SnapshotReader {
-            current_chunk: None,
-            chunks: self.chunks.iter(),
+    pub fn as_read(&self, initial_offset: u64, len: u64) -> SnapshotReader {
+        // Fast path empty ranges.
+        if initial_offset >= self.len() || len == 0 {
+            return SnapshotReader {
+                current_chunk: None,
+                end_byte_offset: 0,
+                exhausted: true,
+                chunks: self.chunks.range(0..0),
+            };
         }
+
+        let end_byte_offset = initial_offset.saturating_add(len).clamp(0, self.len());
+
+        // Find the first chunk that ends after `initial_offset`.
+        let mut chunks = self.chunks.range((initial_offset + 1)..=u64::MAX);
+        let current_chunk = chunks.next().and_then(|(end, x)| {
+            let bytes = &*x.payload;
+            let count = bytes.len() as u64;
+            // Figure out how many bytes we can to skip between `begin`
+            // and `initial_offset`.
+            let begin = end.checked_sub(count)?;
+            let skip = initial_offset.checked_sub(begin)?;
+            let chop_front = bytes.split_at(skip.clamp(0, count) as usize).1;
+
+            // And now drop any slop in the tail.
+            let chop_tail = SnapshotReader::drop_trailing_bytes(chop_front, *end, end_byte_offset);
+
+            // The remainder shouldn't be empty, because
+            // `end_byte_offset > initial_offset`.
+            debug_assert!(!chop_tail.is_empty());
+            Some(chop_tail)
+        });
+
+        // `current_chunk` shouldn't be `None` because the iterator
+        // shouldn't be empty: `initial_offset + 1 <= self.len()`, the
+        // max key in `self.chunks`.
+        debug_assert!(current_chunk.is_some());
+
+        SnapshotReader {
+            current_chunk,
+            end_byte_offset,
+            exhausted: false,
+            chunks,
+        }
+    }
+}
+
+impl SnapshotReader<'_> {
+    /// Let `data` be a chunk of snapshot bytes that ends at
+    /// `data_end` (exclusive); returns the prefix of `data` without
+    /// trailing bytes that go past `end_byte_offset`.
+    fn drop_trailing_bytes(data: &[u8], data_end: u64, end_byte_offset: u64) -> &[u8] {
+        if data_end <= end_byte_offset {
+            return data;
+        }
+
+        let to_drop = data_end - end_byte_offset;
+        data.split_at((data.len() as u64).saturating_sub(to_drop) as usize)
+            .0
     }
 }
 
@@ -139,7 +199,23 @@ impl<'a> std::io::Read for SnapshotReader<'a> {
         }
 
         if self.current_chunk.is_none() {
-            self.current_chunk = self.chunks.next().map(|(_, chunk)| &*chunk.payload);
+            if self.exhausted {
+                return Ok(0);
+            }
+
+            self.current_chunk = self.chunks.next().and_then(|(end, chunk)| {
+                let bytes = SnapshotReader::drop_trailing_bytes(
+                    &*chunk.payload,
+                    *end,
+                    self.end_byte_offset,
+                );
+                if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes)
+                }
+            });
+            self.exhausted = self.current_chunk.is_none()
         }
 
         match self.current_chunk.as_mut() {
@@ -164,6 +240,82 @@ fn create_chunk(bytes: Vec<u8>) -> Arc<Chunk> {
     Arc::new(Chunk::new(fingerprint_file_chunk(&bytes), bytes).expect("must build: fprint matches"))
 }
 
+/// Exercise all the ways to get an empty reader.
+#[test]
+fn test_empty_reader_boundaries() {
+    use std::io::Read;
+
+    let first = create_chunk((0..4).collect());
+    let second = create_chunk((4..10).collect());
+    let snapshot = Snapshot {
+        len: 10u64,
+        chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
+    };
+
+    let mut dst = Vec::new();
+    // Zero-length reads.
+    assert_eq!(
+        snapshot
+            .as_read(0, 0)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .as_read(10, 0)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .as_read(11, 0)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+
+    // Past-the-end reads
+    assert_eq!(
+        snapshot
+            .as_read(10, 1)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .as_read(11, 1)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+
+    // Overflowing end offsets, starting past the end of the snapshot's data.
+    assert_eq!(
+        snapshot
+            .as_read(10, u64::MAX)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .as_read(u64::MAX, 1)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .as_read(u64::MAX, u64::MAX)
+            .read_to_end(&mut dst)
+            .expect("read should never fail"),
+        0
+    );
+}
+
 /// Create a snapshot that consists of a single long (1MB) chunk.
 /// Make sure that we read it correctly, even when the copy loop makes
 /// multiple calls for the same chunk.
@@ -184,7 +336,7 @@ fn test_reader_simple() {
             .collect(),
     };
 
-    let mut read = snapshot.as_read();
+    let mut read = snapshot.as_read(0, u64::MAX);
     let mut dst = Vec::new();
     assert_eq!(
         std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
@@ -208,7 +360,7 @@ fn test_reader_short_sequence() {
         chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
     };
 
-    let mut read = snapshot.as_read();
+    let mut read = snapshot.as_read(0, u64::MAX);
     let mut dst = Vec::new();
     assert_eq!(
         std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
@@ -216,4 +368,43 @@ fn test_reader_short_sequence() {
     );
     assert_eq!(expected.len(), dst.len());
     assert_eq!(expected, dst);
+}
+
+/// Create a snapshot of 6x6 bytes (6 because that lets us exercise
+/// boundary handling, as well as fully internal ranges), and read
+/// from it at different offsets and lengths; make sure we get the
+/// correct bytes.
+#[test]
+fn test_reader_subseq() {
+    const FRAGMENT_COUNT: usize = 6;
+    const FRAGMENT_SIZE: usize = 6;
+    let flattened: Vec<u8> = (0..(FRAGMENT_COUNT * FRAGMENT_SIZE) as u8).collect();
+
+    let snapshot = Snapshot {
+        len: (FRAGMENT_COUNT * FRAGMENT_SIZE) as u64,
+        chunks: (0..FRAGMENT_COUNT)
+            .map(|i| {
+                let begin = (i * FRAGMENT_SIZE) as u64;
+                let end = begin + FRAGMENT_SIZE as u64;
+                (end, create_chunk(((begin as u8)..(end as u8)).collect()))
+            })
+            .collect(),
+    };
+
+    for begin in 0..=flattened.len() {
+        for end in begin..=(flattened.len() + 1) {
+            use std::io::Read;
+
+            let mut dst = Vec::new();
+
+            assert_eq!(
+                snapshot
+                    .as_read(begin as u64, (end - begin) as u64)
+                    .read_to_end(&mut dst)
+                    .expect("read never fails"),
+                flattened.len().min(end) - begin,
+            );
+            assert_eq!(&dst, &(&flattened)[begin..end.clamp(0, flattened.len())]);
+        }
+    }
 }
