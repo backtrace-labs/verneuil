@@ -5,18 +5,8 @@ use std::os::raw::c_char;
 use crate::chain_warn;
 use crate::drop_result;
 use crate::sqlite_code::SqliteCode;
+use crate::sqlite_lock_level::LockLevel;
 use crate::tracker::Tracker;
-
-#[allow(dead_code)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(i32)]
-enum LockLevel {
-    None,
-    Shared,
-    Reserved,
-    Pending,
-    Exclusive,
-}
 
 // See vfs.c
 #[derive(Debug)]
@@ -36,7 +26,6 @@ struct LinuxFile {
 impl LinuxFile {
     /// Returns a reference to this `LinuxFile`'s `Tracker`, if
     /// it is populated.
-    #[allow(dead_code)]
     #[inline]
     fn tracker(&self) -> Option<&mut Tracker> {
         unsafe { (self.tracker as *mut Tracker).as_mut() }
