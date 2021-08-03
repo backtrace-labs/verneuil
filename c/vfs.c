@@ -80,6 +80,7 @@ int sqlite3_current_time;
 #endif
 
 struct verneuil_tracker;
+struct verneuil_snapshot;
 
 struct linux_file {
         sqlite3_file base;
@@ -144,6 +145,12 @@ static_assert(sizeof(dev_t) == sizeof(uint64_t),
 static_assert(sizeof(ino_t) == sizeof(uint64_t),
     "vfs_ops.rs assumes ino_t as a u64.");
 
+struct snapshot_file {
+        sqlite3_file base;
+
+        struct verneuil_snapshot *snapshot;
+};
+
 static_assert(SQLITE_LOCK_NONE == 0, "vfs_ops.rs assumes NONE == 0");
 static_assert(SQLITE_LOCK_SHARED == 1, "vfs_ops.rs assumes SHARED == 1");
 static_assert(SQLITE_LOCK_RESERVED == 2, "vfs_ops.rs assumes RESERVED == 2");
@@ -180,6 +187,12 @@ static int linux_file_check_reserved_lock(sqlite3_file *, int *OUT_result);
 static int linux_file_control(sqlite3_file *, int op, void *arg);
 static int linux_file_sector_size(sqlite3_file *);
 static int linux_file_device_characteristics(sqlite3_file *);
+
+static int snapshot_open(sqlite3_vfs *, const char *name, sqlite3_file *,
+    int flags, int *OUT_flags);
+static int snapshot_check_reserved_lock(sqlite3_file *, int *OUT_result);
+static int snapshot_file_control(sqlite3_file *, int op, void *arg);
+static int snapshot_device_characteristics(sqlite3_file *);
 
 /*
  * The directory for temporary files.  It is lazily computed once,
@@ -236,6 +249,30 @@ static const struct sqlite3_io_methods verneuil_intercept_io_methods = {
         .xDeviceCharacteristics = linux_file_device_characteristics,
 };
 
+/*
+ * This vtable handles read-only snapshot files, where writes always fail,
+ * locking always succeeds, and nearly everything is serviced by Rust code.
+ */
+static const struct sqlite3_io_methods verneuil_snapshot_io_methods = {
+        .iVersion = 1,  /* No WAL or mmap method */
+        .xClose = verneuil__snapshot_close,
+
+        .xRead = verneuil__snapshot_read,
+        .xWrite = verneuil__snapshot_write,
+        .xTruncate = verneuil__snapshot_truncate,
+        .xSync = verneuil__snapshot_sync,
+
+        .xFileSize = verneuil__snapshot_size,
+
+        .xLock = verneuil__snapshot_lock,
+        .xUnlock = verneuil__snapshot_unlock,
+        .xCheckReservedLock = snapshot_check_reserved_lock,
+
+        .xFileControl = snapshot_file_control,
+        .xSectorSize = linux_file_sector_size,
+        .xDeviceCharacteristics = snapshot_device_characteristics,
+};
+
 static sqlite3_vfs verneuil_vfs = {
         .iVersion = 3,
         .szOsFile = sizeof(struct linux_file),
@@ -269,6 +306,39 @@ static sqlite3_vfs verneuil_vfs = {
         .xGetSystemCall = linux_get_syscall,
         .xNextSystemCall = linux_next_syscall,
 };
+
+static sqlite3_vfs verneuil_snapshot_vfs = {
+        .iVersion = 3,
+        /*
+         * The VFS uses snapshot_file for the main DB file, and
+         * linux_file for everything else.
+         */
+        .szOsFile = sizeof(struct linux_file),
+        .mxPathname = PATH_MAX,
+        .zName = "verneuil_snapshot",
+        .xOpen = snapshot_open,
+        .xDelete = linux_delete,
+        .xAccess = linux_access,
+
+        .xFullPathname = linux_full_pathname,
+
+        .xDlOpen = linux_dlopen,
+        .xDlError = linux_dlerror,
+        .xDlSym = linux_dlsym,
+        .xDlClose = linux_dlclose,
+
+        .xRandomness = linux_randomness,
+
+        .xSleep = linux_sleep,
+        /* CurrentTime isn't used when CurrentTimeInt64 is available. */
+
+        .xGetLastError = linux_get_last_error,
+
+        .xCurrentTimeInt64 = linux_current_time_int64,
+};
+
+static_assert(sizeof(struct linux_file) >= sizeof(struct snapshot_file),
+    "verneuil_snapshot_open assumes a snapshot_file fits in a linux_file");
 
 /**
  * Is `dir` currently a valid temporary directory?
@@ -650,6 +720,47 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
 
 fail:
         *file = (struct linux_file) { .fd = -1 };
+        return rc;
+}
+
+static int
+snapshot_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
+    int flags, int *OUT_flags)
+{
+        struct snapshot_file *file = (void *)vfile;
+        int rc;
+
+        (void)vfs;
+        /* Snapshots don't have journals. */
+        if ((flags & SQLITE_OPEN_MAIN_JOURNAL) != 0) {
+                errno = ENOENT;
+                return SQLITE_CANTOPEN;
+        }
+
+        /*
+         * Open a regular linux file unless the target is a persistent
+         * main db file.
+         */
+        if ((flags & SQLITE_OPEN_MAIN_DB) == 0 ||
+            name == NULL ||
+            (flags & SQLITE_OPEN_DELETEONCLOSE) != 0) {
+                return linux_open(vfs, name, vfile, flags, OUT_flags);
+        }
+
+        /*
+         * Simulate a read-only file.
+         */
+        flags &= ~(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+        flags |= SQLITE_OPEN_READONLY;
+
+        *file = (struct snapshot_file) {
+                .base.pMethods = &verneuil_snapshot_io_methods,
+        };
+
+        rc = verneuil__snapshot_open(file, name);
+        if (rc == SQLITE_OK && OUT_flags != NULL)
+                *OUT_flags = flags;
+
         return rc;
 }
 
@@ -1800,6 +1911,19 @@ linux_file_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
         return SQLITE_OK;
 }
 
+static int
+snapshot_check_reserved_lock(sqlite3_file *vfile, int *OUT_result)
+{
+
+        (void)vfile;
+        /*
+         * The reserved lock is always taken: we will never let sqlite
+         * acquire the write lock on a snapshot.
+         */
+        *OUT_result = 1;
+        return SQLITE_OK;
+}
+
 static bool
 linux_file_has_moved(const struct linux_file *file)
 {
@@ -1917,6 +2041,28 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
 }
 
 static int
+snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
+{
+
+        (void)vfile;
+        switch (op) {
+        case SQLITE_FCNTL_VFSNAME:
+                *(char**)arg = sqlite3_mprintf("%s", "verneuil_snapshot");
+                return SQLITE_OK;
+
+        case SQLITE_FCNTL_HAS_MOVED:
+                *(int *)arg = 0;
+                return SQLITE_OK;
+
+        case SQLITE_FCNTL_TEMPFILENAME:
+                return linux_tempfilename(arg);
+
+        default:
+                return SQLITE_NOTFOUND;
+        }
+}
+
+static int
 linux_file_sector_size(sqlite3_file *vfile)
 {
         enum {
@@ -2003,6 +2149,14 @@ linux_file_device_characteristics(sqlite3_file *vfile)
         return SQLITE_IOCAP_POWERSAFE_OVERWRITE;
 }
 
+static int
+snapshot_device_characteristics(sqlite3_file *vfile)
+{
+
+        (void)vfile;
+        return SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_IMMUTABLE;
+}
+
 int
 verneuil_configure_impl(const struct verneuil_options *options)
 {
@@ -2058,6 +2212,10 @@ verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
 #endif
 
         rc = sqlite3_vfs_register(&verneuil_vfs, make_default);
+        if (rc != SQLITE_OK)
+                return rc;
+
+        rc = sqlite3_vfs_register(&verneuil_snapshot_vfs, /*makeDflt=*/0);
         if (rc != SQLITE_OK)
                 return rc;
 

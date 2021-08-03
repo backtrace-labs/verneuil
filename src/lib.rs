@@ -9,6 +9,7 @@ mod replication_buffer;
 mod replication_target;
 pub mod result; // Must be exposed for the helper functions
 mod snapshot;
+mod snapshot_vfs_ops;
 mod sqlite_code;
 mod sqlite_lock_level;
 mod tracker;
