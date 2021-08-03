@@ -11,7 +11,6 @@ edition = "2018"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [features]
-default = ["verneuil_vendor_sqlite"]
 verneuil_vendor_sqlite = []
 verneuil_compat_no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
 verneuil_test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
