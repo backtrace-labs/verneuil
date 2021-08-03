@@ -277,7 +277,7 @@ pub(crate) fn tapped_meta_path_in_spool_prefix(
         )),
         Some(mut tap) => {
             tap.push(DOT_TAP);
-            tap.push(percent_encode_path_uri(source_db)?);
+            tap.push(percent_encode_local_path_uri(source_db)?);
             Ok(tap)
         }
     }
@@ -498,7 +498,7 @@ fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) 
 /// there will never be any double slash in `path` (it's a
 /// canonical path), so these URIs should not collide for
 /// different hosts.
-fn percent_encode_path_uri(path: &Path) -> Result<String> {
+fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
     // Per https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html,
     // safe characters are alphanumeric characters, and a few special characters:
     // - Forward slash (/)
@@ -835,7 +835,7 @@ impl ReplicationBuffer {
         target.pop();
         target.push(META);
         target.push(
-            &percent_encode_path_uri(db_path)
+            &percent_encode_local_path_uri(db_path)
                 .map_err(|e| chain_error!(e, "invalid manifest name", ?db_path))?,
         );
         temp.persist(&target)
@@ -849,7 +849,7 @@ impl ReplicationBuffer {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(META);
-        src.push(&percent_encode_path_uri(db_path)?);
+        src.push(&percent_encode_local_path_uri(db_path)?);
         read_manifest_at_path(&src)
     }
 
@@ -859,7 +859,7 @@ impl ReplicationBuffer {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
-        src.push(&percent_encode_path_uri(db_path)?);
+        src.push(&percent_encode_local_path_uri(db_path)?);
         read_manifest_at_path(&src)
     }
 
@@ -1164,7 +1164,7 @@ impl ReplicationBuffer {
 fn percent_encode_sample() {
     const SAMPLE_PATH: &str = "/a@<<sd!%-_/.asd/*'fdg(g/)\\~).db";
     assert_eq!(
-        percent_encode_path_uri(Path::new(SAMPLE_PATH)).expect("should convert"),
+        percent_encode_local_path_uri(Path::new(SAMPLE_PATH)).expect("should convert"),
         // We assume the test host's name doesn't need escaping.
         format!(
             "{}-verneuil%3A{}%3A634c%2F%2Fa%40%3C%3Csd!%25-_%2F.asd%2F*\'fdg(g%2F)%5C%7E).db",
