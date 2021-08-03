@@ -10,8 +10,14 @@ edition = "2018"
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
 
+[[example]]
+name = "verneuil_vfs"
+crate-type = ["cdylib"]
+required-features = ["verneuil_vfs"]
+
 [features]
 verneuil_vendor_sqlite = []
+verneuil_vfs = []  # Build the VFS shared object; conflicts with verneuil_vendor_sqlite.
 verneuil_compat_no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
 verneuil_test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
 verneuil_test_validate_writes = ["verneuil_test_vfs"]  # Validate snapshots after writes

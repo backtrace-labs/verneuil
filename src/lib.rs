@@ -14,7 +14,6 @@ mod sqlite_lock_level;
 mod tracker;
 mod vfs_ops;
 
-use std::ffi::c_void;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -64,7 +63,6 @@ pub struct ForeignOptions {
 // See `c/vfs.h`.
 extern "C" {
     fn verneuil_configure_impl(options: *const ForeignOptions) -> i32;
-    fn verneuil_init_impl(db: *mut c_void, errmsg: *mut *mut c_char, api: *const c_void) -> i32;
     #[cfg(feature = "verneuil_test_vfs")]
     fn verneuil_test_only_register() -> i32;
 }
@@ -232,24 +230,6 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
         Ok(()) => 0,
         Err(code) => code,
     }
-}
-
-/// Sqlite3 will invoke this function if Verneuil is loaded as a
-/// dynamic extension.  We define this wrapper in Rust because cargo
-/// hides C definitions in cdylib builds.
-///
-/// # Safety
-///
-/// The arguments must be valid, as defined by sqlite.  This function
-/// should only be called by sqlite, which is aware of its own
-/// preconditions.
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_verneuil_init(
-    db: *mut c_void,
-    err_msg: *mut *mut c_char,
-    api: *const c_void,
-) -> i32 {
-    verneuil_init_impl(db, err_msg, api)
 }
 
 /// This test-only registration callback is invoked by the sqlite test

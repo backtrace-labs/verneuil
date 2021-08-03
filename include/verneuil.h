@@ -81,13 +81,6 @@ struct verneuil_options {
 int verneuil_configure(const struct verneuil_options *options);
 
 /**
- * This initialisation function will be called by sqlite when the VFS
- * is loaded as a runtime extension.
- */
-int sqlite3_verneuil_init(sqlite3 *db, char **pzErrMsg,
-    const sqlite3_api_routines *pApi);
-
-/**
  * Information about the replication proto for a given sqlite db file.
  *
  * The `blob_name` is a C string and should always be available on

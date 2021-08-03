@@ -2071,7 +2071,7 @@ verneuil_test_only_register(void)
         char *error = NULL;
         int rc;
 
-        rc = sqlite3_verneuil_init(NULL, &error, NULL);
+        rc = verneuil_init_impl(NULL, &error, NULL);
         sqlite3_free(error);
 
         if (rc == SQLITE_OK_LOAD_PERMANENTLY)

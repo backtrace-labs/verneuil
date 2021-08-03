@@ -40,10 +40,11 @@ fn build_sqlite() {
 }
 
 fn main() {
-    // If we're testing the VFS, we do not want to vendor in our own
-    // sqlite.
+    // If we're building a VFS library for sqlite to load, we do not
+    // want to vendor in our own copy of sqlite.
     if cfg!(all(
         feature = "verneuil_vendor_sqlite",
+        not(feature = "verneuil_vfs"),
         not(feature = "verneuil_test_vfs")
     )) {
         build_sqlite();
@@ -63,21 +64,25 @@ fn main() {
         .include("include");
 
     if cfg!(feature = "verneuil_test_vfs") {
-        // Enable test-only code, and make sure to build for direct
-        // linking with sqlite, and not a runtime extension module:
-        // the test code only works with the former.
-        build
-            .define("TEST_VFS", None)
-            .define("SQLITE_CORE", None)
-            .define("SQLITE_TEST", None);
+        // Enable test-only code.
+        build.define("TEST_VFS", None).define("SQLITE_TEST", None);
+    }
+
+    if cfg!(feature = "verneuil_vfs") {
+        if cfg!(feature = "verneuil_vendor_sqlite") {
+            eprintln!(
+                "The Verneuil VFS cannot vendor sqlite: it would conflict with the loader process."
+            );
+        }
+    } else {
+        // We're linking this extension statically, without going
+        // through sqlite's dynamic loading mechanism.
+        build.define("SQLITE_CORE", None);
     }
 
     build
         // We want GNU extensions.
         .define("_GNU_SOURCE", None)
-        // We're linking this extension statically, without going
-        // through sqlite's dynamic loading mechanism.
-        .define("SQLITE_CORE", None)
         // We know the linuxvfs doesn't implement dirsync.
         .define("SQLITE_DISABLE_DIRSYNC", None)
         .file("c/file_ops.c")
