@@ -493,12 +493,15 @@ fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) 
     Ok(result)
 }
 
-/// Returns a conservatively percent-encoded URI for `path`.
-/// The URI is of the form `verneuil:${hostname}/${path}`;
-/// there will never be any double slash in `path` (it's a
-/// canonical path), so these URIs should not collide for
-/// different hosts.
-fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
+/// Returns a conservatively percent-encoded URI for `hostname_or` and
+/// `path`.  `hostname_or` defaults to the local machine's hostname.
+///
+/// The URI is of the form
+/// `${hostname_hash}-verneuil:${hostname}:${path_hash}/${path}`;
+/// there will never be any double slash in `path` (it should be a
+/// canonical path), so these URIs should not collide for different
+/// hosts.
+pub fn manifest_name_for_hostname_path(hostname_or: Option<&str>, path: &Path) -> Result<String> {
     // Per https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html,
     // safe characters are alphanumeric characters, and a few special characters:
     // - Forward slash (/)
@@ -527,6 +530,8 @@ fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
         static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil path params");
     }
 
+    let hostname: &str = hostname_or.unwrap_or_else(|| instance_id::hostname());
+
     let string = path
         .as_os_str()
         .to_str()
@@ -535,12 +540,17 @@ fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
 
     let name = format!(
         "{}-verneuil:{}:{:04x}/{}",
-        instance_id::hostname_hash(),
-        instance_id::hostname(),
+        &instance_id::hostname_hash(hostname),
+        hostname,
         path_hash % (1 << (4 * 4)),
         string
     );
     Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
+}
+
+/// Returns a conservatively percent-encoded URI for `path`.
+fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
+    manifest_name_for_hostname_path(None, path)
 }
 
 /// Returns the chunk name for a given fingerprint.  This name is

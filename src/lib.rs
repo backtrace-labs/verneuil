@@ -20,7 +20,9 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 
+pub use instance_id::hostname;
 pub use manifest_schema::Manifest;
+pub use replication_buffer::manifest_name_for_hostname_path;
 pub use result::Result;
 pub use snapshot::Snapshot;
 
@@ -452,4 +454,64 @@ pub unsafe extern "C" fn verneuil_replication_info_deinit(info_ptr: *mut Foreign
 
         *info = std::mem::zeroed();
     }
+}
+
+/// Returns the name of the manifest blob for `c_hostname` and `c_path`, as a C string.
+///
+/// # Safety
+///
+/// Assumes that `c_hostname` is NULL or a valid C string, and that
+/// `c_path` is a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn verneuil_manifest_name_for_hostname_path(
+    c_hostname: *const c_char,
+    c_path: *const c_char,
+) -> *mut c_char {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    let hostname = if c_hostname.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(c_hostname))
+    };
+
+    let path_str = if c_path.is_null() {
+        return std::ptr::null_mut();
+    } else {
+        CStr::from_ptr(c_path)
+    };
+
+    let path = PathBuf::from(OsStr::from_bytes(path_str.to_bytes()));
+
+    let hostname_str = match hostname.map(|cstr| cstr.to_str()).transpose() {
+        Ok(str_or) => str_or,
+        Err(e) => {
+            let _ = chain_error!(e, "hostname is invalid utf-8");
+            return std::ptr::null_mut();
+        }
+    };
+
+    match manifest_name_for_hostname_path(hostname_str, &path) {
+        Ok(name) => CString::new(name.into_bytes())
+            .expect("URI-encoded path should not contain NUL")
+            .into_raw(),
+        Err(e) => {
+            let _ = chain_error!(e, "failed to construct manifest name", ?hostname_str, ?path);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Releases the `CStr` that backs `name` if non-NULL.
+///
+/// # Safety
+///
+/// This function assumes that `name` is NULL, or was returned by
+/// `verneuil_manifest_name_for_hostname_path` and not destroyed
+/// since.
+#[no_mangle]
+pub unsafe extern "C" fn verneuil_manifest_name_destroy(name: *mut c_char) {
+    std::mem::drop(CString::from_raw(name));
 }

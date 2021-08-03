@@ -120,3 +120,19 @@ int verneuil_replication_info_for_db(struct verneuil_replication_info *dst,
  * Safe to call on zero-initialised or NULL `info`.
  */
 void verneuil_replication_info_deinit(struct verneuil_replication_info *info);
+
+/**
+ * Returns the manifest blob name for the db at `path` in `hostname`.
+ * If `hostname` is NULL, uses the current machine's hostname.
+ *
+ * Returns a string on success, NULL on failure.
+ */
+char *verneuil_manifest_name_for_hostname_path(const char *hostname,
+     const char *path);
+
+/**
+ * Releases a manifest blob name.
+ *
+ * Safe to call on NULL.
+ */
+void verneuil_manifest_name_destroy(char *name);

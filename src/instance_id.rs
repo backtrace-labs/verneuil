@@ -68,7 +68,7 @@ fn find_hostname() -> Result<&'static str> {
 }
 
 /// Returns the machine's hostname, or a default placeholder if none.
-pub(crate) fn hostname() -> &'static str {
+pub fn hostname() -> &'static str {
     lazy_static::lazy_static! {
         static ref NAME: &'static str = find_hostname().unwrap_or(DEFAULT_HOSTNAME);
     }
@@ -77,16 +77,13 @@ pub(crate) fn hostname() -> &'static str {
 }
 
 /// Returns a high-entropy short string hash of the hostname.
-pub(crate) fn hostname_hash() -> &'static str {
+pub(crate) fn hostname_hash(hostname: &str) -> String {
     lazy_static::lazy_static! {
         static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil hostname params");
-        static ref HASH: String = {
-            let hash = umash::full_str(&PARAMS, 0, 0, hostname());
-            format!("{:04x}", hash % (1 << (4 * 4)))
-        };
     }
 
-    &HASH
+    let hash = umash::full_str(&PARAMS, 0, 0, hostname);
+    format!("{:04x}", hash % (1 << (4 * 4)))
 }
 
 /// Returns the verneuil instance id for this incarnation of the
