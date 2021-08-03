@@ -32,8 +32,8 @@ pub struct S3ReplicationTarget {
     /// Bucket name for content-addressed chunks.
     pub chunk_bucket: String,
 
-    /// Bucket name for directory blobs.
-    pub directory_bucket: String,
+    /// Bucket name for manifest blobs.
+    pub manifest_bucket: String,
 
     /// If true, address buckets as subdomains (modern); otherwise,
     /// use the legacy bucket-as-path mode.

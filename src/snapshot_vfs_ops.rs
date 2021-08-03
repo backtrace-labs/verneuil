@@ -49,11 +49,11 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
             .to_owned();
 
         let bytes = std::fs::read(&string)
-            .map_err(|e| chain_error!(e, "failed to read directory file", path=%string))?;
+            .map_err(|e| chain_error!(e, "failed to read manifest file", path=%string))?;
 
-        let directory = crate::Directory::decode(&*bytes)
-            .map_err(|e| chain_error!(e, "failed to parse directory file", path=%string))?;
-        let snapshot = Snapshot::new_with_default_targets(&directory)?;
+        let manifest = crate::Manifest::decode(&*bytes)
+            .map_err(|e| chain_error!(e, "failed to parse manifest file", path=%string))?;
+        let snapshot = Snapshot::new_with_default_targets(&manifest)?;
 
         file.snapshot = Box::leak(Box::new(snapshot)) as *mut Snapshot as *mut _;
         Ok(())

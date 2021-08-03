@@ -7,7 +7,7 @@
 		"region": "minio",
 		"endpoint": "http://127.0.0.1:7777",
 		"chunk_bucket": "chunks",
-		"directory_bucket": "directories",
+		"manifest_bucket": "manifests",
 		"domain_addressing": false,
 		"create_buckets_on_demand": true
 	    }

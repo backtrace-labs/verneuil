@@ -45,7 +45,7 @@ int verneuil_test_only_register(void);
 int verneuil__file_post_open(struct linux_file *);
 
 /**
- * Attempts to open a snapshot file for the directory proto at `path`.
+ * Attempts to open a snapshot file for the manifest proto at `path`.
  */
 int verneuil__snapshot_open(struct snapshot_file *, const char *path);
 

@@ -1,4 +1,4 @@
-//! Replicated sqlite DBs are represented as protobuf "directory"
+//! Replicated sqlite DBs are represented as protobuf "manifest"
 //! metadata that refer to content-addressed chunks by fingerprint.
 use tracing::instrument;
 use umash::Fingerprint;
@@ -51,7 +51,7 @@ impl From<&Fprint> for Fingerprint {
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct DirectoryV1 {
+pub struct ManifestV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There
     // may be some rare collisions over long time periods (> 4 billion
     // transactions), or when the file is deleted and re-created, but
@@ -98,9 +98,9 @@ pub struct DirectoryV1 {
 }
 
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct Directory {
+pub struct Manifest {
     #[prost(message, tag = "1")]
-    pub v1: Option<DirectoryV1>,
+    pub v1: Option<ManifestV1>,
 }
 
 /// Computes the `header_fprint` for a sqlite database.  The 100-byte header
@@ -323,7 +323,8 @@ pub(crate) fn hash_file_chunk(bytes: &[u8]) -> u64 {
 /// result is fingerprinted.
 pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
     lazy_static::lazy_static! {
-        static ref DIRECTORY_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db directory params");
+    // Manifest files used to be called "directory" files.
+        static ref MANIFEST_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db directory params");
     }
 
     if cfg!(target_endian = "little") {
@@ -334,7 +335,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
             )
         };
 
-        return Fingerprint::generate(&DIRECTORY_PARAMS, 0, &slice);
+        return Fingerprint::generate(&MANIFEST_PARAMS, 0, &slice);
     }
 
     let mut bytes = Vec::with_capacity(chunks.len() * 8);
@@ -343,12 +344,12 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
         bytes.extend(&word.to_le_bytes());
     }
 
-    Fingerprint::generate(&DIRECTORY_PARAMS, 0, &bytes)
+    Fingerprint::generate(&MANIFEST_PARAMS, 0, &bytes)
 }
 
-/// Returns the header Fingerprint and ctime stored in the directory
+/// Returns the header Fingerprint and ctime stored in the manifest
 /// proto at `path`, or `(None, UNIX_EPOCH)` if there is no such file.
-pub(crate) fn parse_directory_info(
+pub(crate) fn parse_manifest_info(
     path: &std::path::Path,
 ) -> Result<(Option<Fingerprint>, std::time::SystemTime)> {
     use prost::Message;
@@ -356,9 +357,9 @@ pub(crate) fn parse_directory_info(
 
     match std::fs::read(path) {
         Ok(contents) => {
-            let directory = Directory::decode(&*contents)
-                .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
-            if let Some(v1) = directory.v1 {
+            let manifest = Manifest::decode(&*contents)
+                .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?path))?;
+            if let Some(v1) = manifest.v1 {
                 Ok((
                     v1.header_fprint.map(Into::into),
                     SystemTime::UNIX_EPOCH
@@ -369,17 +370,13 @@ pub(crate) fn parse_directory_info(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, SystemTime::UNIX_EPOCH)),
-        Err(e) => Err(chain_error!(
-            e,
-            "failed to open directory proto file",
-            ?path
-        )),
+        Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),
     }
 }
 
-/// Returns the list of chunks in `directory`.
-pub(crate) fn extract_directory_chunks(directory: &Directory) -> Result<Vec<Fingerprint>> {
-    match &directory.v1 {
+/// Returns the list of chunks in `manifest`.
+pub(crate) fn extract_manifest_chunks(manifest: &Manifest) -> Result<Vec<Fingerprint>> {
+    match &manifest.v1 {
         Some(v1)
             if v1.chunks.len() % 2 == 0
                 && Some(fingerprint_v1_chunk_list(&v1.chunks))
@@ -395,36 +392,32 @@ pub(crate) fn extract_directory_chunks(directory: &Directory) -> Result<Vec<Fing
 
             Ok(ret)
         }
-        _ => Err(fresh_warn!("invalid directory proto v1", ?directory)),
+        _ => Err(fresh_warn!("invalid manifest proto v1", ?manifest)),
     }
 }
 
-pub(crate) fn extract_directory_len(directory: &Directory) -> Result<u64> {
-    if let Some(v1) = &directory.v1 {
+pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
+    if let Some(v1) = &manifest.v1 {
         Ok(v1.len)
     } else {
-        Err(fresh_warn!("invalid directory proto v1", ?directory))
+        Err(fresh_warn!("invalid manifest proto v1", ?manifest))
     }
 }
 
-/// Returns the list of chunks in the directory proto at `Path`, or
+/// Returns the list of chunks in the manifest proto at `Path`, or
 /// an empty list if there is no such file.
 #[instrument]
-pub(crate) fn parse_directory_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
+pub(crate) fn parse_manifest_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
     use prost::Message;
 
     match std::fs::read(path) {
         Ok(contents) => {
-            let directory = Directory::decode(&*contents)
-                .map_err(|e| chain_error!(e, "failed to parse proto directory", ?path))?;
-            extract_directory_chunks(&directory)
+            let manifest = Manifest::decode(&*contents)
+                .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?path))?;
+            extract_manifest_chunks(&manifest)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(chain_error!(
-            e,
-            "failed to open directory proto file",
-            ?path
-        )),
+        Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),
     }
 }
 

@@ -29,13 +29,13 @@ use crate::chain_debug;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
-use crate::directory_schema::clear_version_id;
-use crate::directory_schema::parse_directory_chunks;
-use crate::directory_schema::parse_directory_info;
 use crate::drop_result;
 use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_warn;
+use crate::manifest_schema::clear_version_id;
+use crate::manifest_schema::parse_manifest_chunks;
+use crate::manifest_schema::parse_manifest_info;
 use crate::ofd_lock::OfdLock;
 use crate::racy_time::RacySystemTime;
 use crate::replication_buffer;
@@ -94,10 +94,10 @@ const COPY_LOCK_RESET_RATE: f64 = 0.01;
 /// worker threads to achieve that, with additional sleeping / backoff.
 const WORKER_COUNT: usize = 4;
 
-/// How many of the last directory files we have uploaded must we
+/// How many of the last manifest files we have uploaded must we
 /// remember?  This memory lets us avoid repeated uploads of the
-/// same "staged" directory file.
-const STAGED_DIRECTORY_MEMORY: usize = 2;
+/// same "staged" manifest file.
+const STAGED_MANIFEST_MEMORY: usize = 2;
 
 /// Try to identify lagging replication roughly at this period.
 const REPLICATION_LAG_REPORT_PERIOD: Duration = Duration::from_secs(61);
@@ -153,7 +153,7 @@ struct FileIdentifier {
 /// file.
 #[derive(Debug, Default)]
 struct CopierUploadState {
-    recent_staged_directories: uluru::LRUCache<FileIdentifier, STAGED_DIRECTORY_MEMORY>,
+    recent_staged_directories: uluru::LRUCache<FileIdentifier, STAGED_MANIFEST_MEMORY>,
 }
 
 /// The `CopierSpoolState` represent what we know about the spool for
@@ -186,7 +186,7 @@ struct CopierSpoolState {
     consecutive_failures: AtomicU64,
     last_failure: RacySystemTime,
 
-    // Incremented when we upload a new directory blob.
+    // Incremented when we upload a new manifest blob.
     consecutive_updates: AtomicU64,
     last_update: RacySystemTime,
 
@@ -208,7 +208,7 @@ struct CopierSpoolLagInfo {
     #[serde(skip_serializing_if = "is_epoch")]
     source_file_ctime: DateTime,
 
-    // ctime in the last replicated directory proto.
+    // ctime in the last replicated manifest proto.
     replicated_file_ctime: DateTime,
 
     // true if the source and replicated headers match.  This
@@ -765,7 +765,7 @@ fn force_full_snapshot(state: &CopierSpoolState) {
                      e => chain_error!(e, "failed to clear version id", ?path));
     }
 
-    // And now delete all (directory) files in staging/meta.
+    // And now delete all (manifest) files in staging/meta.
     let staging = replication_buffer::mutable_staging_directory(state.spool_path.to_path_buf());
     let meta_directory = replication_buffer::directory_meta(staging);
     drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
@@ -893,7 +893,7 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .collect::<Vec<_>>();
 
@@ -1021,7 +1021,7 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.directory_bucket, creds.clone()))
+                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
                 .collect::<Vec<_>>();
 
@@ -1035,7 +1035,7 @@ impl CopierWorker {
                 &mut |name: &OsStr, mut file| {
                     let identifier = FileIdentifier::new(&file)?;
 
-                    // This is a new directory file, we don't want to upload it.
+                    // This is a new manifest file, we don't want to upload it.
                     if initial_meta.get(name).map(|x| &x.0) != Some(&identifier) {
                         return Ok(());
                     }
@@ -1154,7 +1154,7 @@ impl CopierWorker {
         }
 
         // And now see if the ready directory was updated again.
-        // We only upload meta files (directory protos) if we
+        // We only upload meta files (manifest protos) if we
         // observed that the "ready" directory was empty while the
         // meta files had the same value as when we entered
         // "handle_staging_directory".  Anything we now find in
@@ -1177,7 +1177,7 @@ impl CopierWorker {
     }
 
     /// Attempts to touch a small pseudrandom subset of the chunks
-    /// referred by the latest uploaded directory.
+    /// referred by the latest uploaded manifest.
     ///
     /// Only errors out if we successfully connected to remote storage
     /// and failed to update one of the "touched" chunks.
@@ -1211,7 +1211,7 @@ impl CopierWorker {
             / PATROL_TOUCH_PERIOD.as_secs_f64())
         .clamp(0.0, 1.0);
         let tap_file = replication_buffer::construct_tapped_meta_path(spool_path, source)?;
-        let mut chunks = parse_directory_chunks(&tap_file)?;
+        let mut chunks = parse_manifest_chunks(&tap_file)?;
         let mut rng = rand::thread_rng();
 
         // Touch that fraction of the chunks list, with randomised
@@ -1358,10 +1358,10 @@ impl CopierSpoolState {
 
                 let tap_file =
                     replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
-                let (fprint, ctime) = parse_directory_info(&tap_file)?;
+                let (fprint, ctime) = parse_manifest_info(&tap_file)?;
 
                 let headers_match = match File::open(&path) {
-                    Ok(file) => crate::directory_schema::fingerprint_sqlite_header(&file) == fprint,
+                    Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
                     Err(e) => {
                         let _ = chain_info!(e, "failed to open source file", ?path);
                         false

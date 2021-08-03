@@ -1,13 +1,13 @@
-//! A Verneuil snapshot is constructed from a `Directory` object,
+//! A Verneuil snapshot is constructed from a `Manifest` object,
 //! by fetching all its constituent chunks.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::directory_schema::Directory;
 use crate::fresh_error;
 use crate::loader::Chunk;
 use crate::loader::Loader;
+use crate::manifest_schema::Manifest;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
 
@@ -33,22 +33,22 @@ pub struct SnapshotReader<'parent> {
 }
 
 impl Snapshot {
-    /// Constructs a `Snapshot` for `directory` by fetching chunks
+    /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from the global default replication targets.
-    pub fn new_with_default_targets(directory: &Directory) -> Result<Snapshot> {
+    pub fn new_with_default_targets(manifest: &Manifest) -> Result<Snapshot> {
         let targets = crate::replication_target::get_default_replication_targets();
 
-        Snapshot::new(Vec::new(), &targets.replication_targets, directory)
+        Snapshot::new(Vec::new(), &targets.replication_targets, manifest)
     }
 
-    /// Constructs a `Snapshot` for `directory` by fetching chunks
-    /// from `local_caches` directory and from `remote_sources`.
+    /// Constructs a `Snapshot` for `manifest` by fetching chunks
+    /// from `local_caches` directories and from `remote_sources`.
     pub fn new(
         local_caches: Vec<PathBuf>,
         remote_sources: &[ReplicationTarget],
-        directory: &Directory,
+        manifest: &Manifest,
     ) -> Result<Snapshot> {
-        let fprints = crate::directory_schema::extract_directory_chunks(directory)?;
+        let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
 
         let loader = Loader::new(local_caches, remote_sources)?;
         let fetched = loader.fetch_all_chunks(&fprints)?;
@@ -101,13 +101,13 @@ impl Snapshot {
             insert_chunk(chunk)?;
         }
 
-        let expected_len = crate::directory_schema::extract_directory_len(directory)?;
+        let expected_len = crate::manifest_schema::extract_manifest_len(manifest)?;
         if len != expected_len {
             return Err(fresh_error!(
                 "reconstructed file does not match source file length",
                 len,
                 expected_len,
-                ?directory
+                ?manifest
             ));
         }
 
@@ -235,7 +235,7 @@ impl<'a> std::io::Read for SnapshotReader<'a> {
 
 #[cfg(test)]
 fn create_chunk(bytes: Vec<u8>) -> Arc<Chunk> {
-    use crate::directory_schema::fingerprint_file_chunk;
+    use crate::manifest_schema::fingerprint_file_chunk;
 
     Arc::new(Chunk::new(fingerprint_file_chunk(&bytes), bytes).expect("must build: fprint matches"))
 }

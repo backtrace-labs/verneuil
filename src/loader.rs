@@ -15,9 +15,9 @@ use umash::Fingerprint;
 
 use crate::chain_error;
 use crate::chain_warn;
-use crate::directory_schema::fingerprint_file_chunk;
-use crate::directory_schema::hash_file_chunk;
 use crate::fresh_error;
+use crate::manifest_schema::fingerprint_file_chunk;
+use crate::manifest_schema::hash_file_chunk;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
 

@@ -1,7 +1,7 @@
 mod copier;
-mod directory_schema;
 mod instance_id;
 mod loader;
+mod manifest_schema;
 mod ofd_lock;
 mod process_id;
 mod racy_time;
@@ -20,7 +20,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 
-pub use directory_schema::Directory;
+pub use manifest_schema::Manifest;
 pub use result::Result;
 pub use snapshot::Snapshot;
 
@@ -270,11 +270,11 @@ pub struct ReplicationProtoData {
     // ctime of the snapshotted db file.
     pub ctime: std::time::SystemTime,
 
-    // Directory proto bytes.
+    // Manifest proto bytes.
     pub bytes: Vec<u8>,
 }
 
-/// Attempts to return the name for the directory proto blob associated
+/// Attempts to return the name for the manifest proto blob associated
 /// with `source_db`, and our local snapshot of that blob if available.
 ///
 /// The contents of the file are looked up in a subdirectory of
@@ -307,13 +307,13 @@ pub fn current_replication_proto_for_db(
             Ok(bytes) => bytes,
         };
 
-        let v1 = match directory_schema::Directory::decode(&*bytes) {
+        let v1 = match manifest_schema::Manifest::decode(&*bytes) {
             Err(e) => {
                 let _ = chain_error!(e, "failed to decode proto bytes", ?meta_path);
                 return Ok(None);
             }
-            Ok(directory) => {
-                if let Some(v1) = directory.v1 {
+            Ok(manifest) => {
+                if let Some(v1) = manifest.v1 {
                     v1
                 } else {
                     return Ok(None);

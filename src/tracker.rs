@@ -17,17 +17,17 @@ use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
 use crate::copier::Copier;
-use crate::directory_schema::clear_version_id;
-use crate::directory_schema::extract_version_id;
-use crate::directory_schema::fingerprint_file_chunk;
-use crate::directory_schema::fingerprint_sqlite_header;
-use crate::directory_schema::fingerprint_v1_chunk_list;
-use crate::directory_schema::update_version_id;
-use crate::directory_schema::Directory;
-use crate::directory_schema::DirectoryV1;
 use crate::drop_result;
 use crate::fresh_error;
 use crate::fresh_warn;
+use crate::manifest_schema::clear_version_id;
+use crate::manifest_schema::extract_version_id;
+use crate::manifest_schema::fingerprint_file_chunk;
+use crate::manifest_schema::fingerprint_sqlite_header;
+use crate::manifest_schema::fingerprint_v1_chunk_list;
+use crate::manifest_schema::update_version_id;
+use crate::manifest_schema::Manifest;
+use crate::manifest_schema::ManifestV1;
 use crate::replication_buffer::ReplicationBuffer;
 use crate::replication_target::ReplicationTargetList;
 use crate::result::Result;
@@ -407,9 +407,9 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let mut current_directory: Option<Directory> = buf
-            .read_staged_directory(&self.path)
-            .map_err(|e| chain_info!(e, "failed to read staged directory file"))
+        let mut current_manifest: Option<Manifest> = buf
+            .read_staged_manifest(&self.path)
+            .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
             .ok()
             .flatten();
 
@@ -420,13 +420,13 @@ impl Tracker {
         // file header after physical writes to the db file that aren't
         // yet relevant for readers (e.g., after a page cache flush).
         //
-        // We must also figure out whether we trust `current_directory`
+        // We must also figure out whether we trust `current_manifest`
         // enough to build our snapshot as a diff on top of that file.
         if self.backing_file_state == MutationState::Dirty {
             let mut up_to_date = false;
 
-            if let Some(directory) = &current_directory {
-                if let Some(v1) = &directory.v1 {
+            if let Some(manifest) = &current_manifest {
+                if let Some(v1) = &manifest.v1 {
                     // The current snapshot seems to have everything
                     // up to our last write transaction.  We can use that!
                     //
@@ -467,18 +467,18 @@ impl Tracker {
                 up_to_date = false;
             }
 
-            // If the directory isn't up to date, we can't use it.
+            // If the manifest isn't up to date, we can't use it.
             if !up_to_date {
-                current_directory = None;
+                current_manifest = None;
             }
         } else {
             // If we're doing this opportunistically (not after a write)
-            // and the staging directory seems up to date, there's nothing
+            // and the staging manifest seems up to date, there's nothing
             // to do.  We don't even have to update "ready": the `Copier`
             // will read from the staging directory when we don't change it.
             if !version_id.is_empty() {
-                if let Some(directory) = &current_directory {
-                    if matches!(&directory.v1, Some(v1) if v1.version_id == version_id) {
+                if let Some(manifest) = &current_manifest {
+                    if matches!(&manifest.v1, Some(v1) if v1.version_id == version_id) {
                         return Ok(());
                     }
                 }
@@ -487,7 +487,7 @@ impl Tracker {
             // If we think there's work to do after a read
             // transaction, assume the worst, and rebuild
             // the snapshot from scratch.
-            current_directory = None;
+            current_manifest = None;
         }
 
         // We don't *have* to overwrite the .metadata file, but we
@@ -500,8 +500,8 @@ impl Tracker {
 
         // Try to get an initial list of chunks to work off.
         let mut base_fprints = None;
-        if let Some(directory) = current_directory {
-            if let Some(v1) = directory.v1 {
+        if let Some(manifest) = current_manifest {
+            if let Some(v1) = manifest.v1 {
                 base_fprints = rebuild_chunk_fprints(&v1.chunks);
             }
         }
@@ -518,12 +518,12 @@ impl Tracker {
             };
 
             let flattened = flatten_chunk_fprints(&chunks);
-            let directory_fprint = fingerprint_v1_chunk_list(&flattened);
-            let directory = Directory {
-                v1: Some(DirectoryV1 {
+            let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
+            let manifest = Manifest {
+                v1: Some(ManifestV1 {
                     header_fprint: Some(header_fprint.into()),
                     version_id,
-                    contents_fprint: Some(directory_fprint.into()),
+                    contents_fprint: Some(manifest_fprint.into()),
                     len,
                     ctime,
                     ctime_ns,
@@ -531,16 +531,16 @@ impl Tracker {
                 }),
             };
 
-            buf.publish_directory(&self.path, &directory)?;
+            buf.publish_manifest(&self.path, &manifest)?;
 
             (copied, chunks)
         };
 
         let mut published = false;
-        // If we can publish a new ready directory, try to do so.
+        // If we can publish a new ready manifest, try to do so.
         if matches!(
-            buf.read_ready_directory(&self.path)
-                .map_err(|e| chain_info!(e, "failed to read ready directory", path=?self.path)),
+            buf.read_ready_manifest(&self.path)
+                .map_err(|e| chain_info!(e, "failed to read ready manifest", path=?self.path)),
             Ok(None)
         ) {
             let ready = buf.prepare_ready_buffer(&chunks)?;
@@ -660,7 +660,7 @@ impl Tracker {
     fn fetch_snapshot_or_die(
         &self,
         buf: &ReplicationBuffer,
-        directory: &Directory,
+        manifest: &Manifest,
         from_staging: bool,
     ) -> crate::snapshot::Snapshot {
         let mut local_chunk_dirs = Vec::new();
@@ -673,28 +673,28 @@ impl Tracker {
         crate::snapshot::Snapshot::new(
             local_chunk_dirs,
             &self.replication_targets.replication_targets,
-            directory,
+            manifest,
         )
         .expect("failed to instantiate snapshot")
     }
 
-    /// If the snapshot directory exists, confirms that we can get
+    /// If the snapshot manifest exists, confirms that we can get
     /// every chunk in that snapshot.
     fn validate_snapshot(
         &self,
         buf: &ReplicationBuffer,
-        directory_or: crate::result::Result<Option<Directory>>,
+        manifest_or: crate::result::Result<Option<Manifest>>,
         from_staging: bool,
-    ) -> crate::result::Result<()> {
-        let directory = match directory_or {
-            // If the directory file can't be found, assume it was
+    ) -> Result<()> {
+        let manifest = match manifest_or {
+            // If the manifest file can't be found, assume it was
             // replicated correctly, and checked earlier.
             Ok(None) => return Ok(()),
-            Ok(Some(directory)) => directory,
+            Ok(Some(manifest)) => manifest,
             Err(err) => return Err(err),
         };
 
-        self.fetch_snapshot_or_die(buf, &directory, from_staging);
+        self.fetch_snapshot_or_die(buf, &manifest, from_staging);
         Ok(())
     }
 
@@ -702,9 +702,9 @@ impl Tracker {
     /// sense (if they exist).
     #[cfg(feature = "test_validate_reads")]
     fn validate_all_snapshots(&self, buf: &ReplicationBuffer) {
-        self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
+        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), false)
             .expect("ready snapshot must be valid");
-        self.validate_snapshot(buf, buf.read_staged_directory(&self.path), true)
+        self.validate_snapshot(buf, buf.read_staged_manifest(&self.path), true)
             .expect("staged snapshot must be valid");
     }
 
@@ -714,7 +714,7 @@ impl Tracker {
         use blake2b_simd::Params;
         use std::os::unix::io::AsRawFd;
 
-        self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
+        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), false)
             .expect("ready snapshot must be valid");
 
         let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
@@ -731,24 +731,24 @@ impl Tracker {
         };
 
         let mut hasher = Params::new().hash_length(32).to_state();
-        let directory = buf
-            .read_staged_directory(&self.path)
-            .expect("directory must parse")
-            .expect("directory must exist");
+        let manifest = buf
+            .read_staged_manifest(&self.path)
+            .expect("manifest must parse")
+            .expect("manifest must exist");
 
-        let directory_v1 = directory
+        let manifest_v1 = manifest
             .v1
             .as_ref()
             .expect("v1 component must be populated.");
 
         // The header fingerprint must match the current header.
         assert_eq!(
-            directory_v1.header_fprint,
+            manifest_v1.header_fprint,
             fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
                 .map(|fp| fp.into())
         );
 
-        let snapshot = self.fetch_snapshot_or_die(buf, &directory, true);
+        let snapshot = self.fetch_snapshot_or_die(buf, &manifest, true);
         std::io::copy(&mut snapshot.as_read(0, u64::MAX), &mut hasher).expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())

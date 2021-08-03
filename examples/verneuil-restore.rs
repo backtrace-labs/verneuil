@@ -7,10 +7,10 @@ use verneuil::fresh_error;
 #[derive(Debug, StructOpt)]
 #[structopt(
     name = "verneuil-restore",
-    about = "Rebuilds a db snapshot from a verneuil directory file."
+    about = "Rebuilds a db snapshot from a verneuil manifest file."
 )]
 /// The verneuil-restore utility accepts the path to a verneuil
-/// directory file, and reconstructs its contents to the `--out`
+/// manifest file, and reconstructs its contents to the `--out`
 /// argument (or stdout by default).
 ///
 /// In order to recover the database's contents, verneuil-restore must
@@ -20,12 +20,12 @@ use verneuil::fresh_error;
 /// `VERNEUIL_CONFIG` environment variable; this can be overridden
 /// with the `--config` flag.
 struct Opt {
-    /// The directory file that describes the snapshot to restore.
+    /// The manifest file that describes the snapshot to restore.
     ///
     /// These are typically stored as objects in versioned buckets;
     /// it is up to the invoker to fish out the relevant version.
     #[structopt(parse(from_os_str))]
-    directory: PathBuf,
+    manifest: PathBuf,
 
     /// The Verneuil JSON configuration used when originally copying
     /// the database to remote storage.
@@ -89,11 +89,11 @@ pub fn main() -> verneuil::Result<()> {
     verneuil::configure_replication(config.clone())
         .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
 
-    let directory_contents = std::fs::read(&opts.directory)
-        .map_err(|e| chain_error!(e, "failed to read directory file", path=?opts.directory))?;
-    let directory = verneuil::Directory::decode(&*directory_contents)
-        .map_err(|e| chain_error!(e, "failed to parse directory file", path=?opts.directory))?;
-    let snapshot = verneuil::Snapshot::new_with_default_targets(&directory)?;
+    let manifest_contents = std::fs::read(&opts.manifest)
+        .map_err(|e| chain_error!(e, "failed to read manifest file", path=?opts.manifest))?;
+    let manifest = verneuil::Manifest::decode(&*manifest_contents)
+        .map_err(|e| chain_error!(e, "failed to parse manifest file", path=?opts.manifest))?;
+    let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
     let mut reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
 
     if let Some(dst) = &opts.out {

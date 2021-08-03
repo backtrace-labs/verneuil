@@ -10,7 +10,7 @@
 //! Finally, that subdirectory will include "spooling buffer"
 //! sub(sub-)directories (`$MANGLED_PATH/$DEV.$INODE/`) for each
 //! sqlite DB that is replicated.  The boot id directory also includes
-//! a ".tap" subdirectory, where we store "meta" (directory) files
+//! a ".tap" subdirectory, where we store "meta" (manifest) files
 //! once they have been copied to remote storage.
 //!
 //! Each spooling buffer is a directory that includes a "staging"
@@ -22,7 +22,7 @@
 //! metadata. Finally, there is also a "staging/scratch" directory,
 //! which holds named temporary files.
 //!
-//! The "ready" directory always contains a directory that's ready to
+//! The "ready" directory always contains a manifest that's ready to
 //! be consumed by the replication subsystem.
 //!
 //! The files are *not* fsynced before publishing them: the buffer
@@ -72,7 +72,7 @@
 //! still worry about ABA.
 //!
 //! For the "ready" directory, `Copier`s access a snapshot of the
-//! current directory via a file descriptor for that current directory
+//! current directory via a file descriptor for that directory
 //! structure.  The snapshot is mutable, but, once published, only
 //! `Copier`s update a "ready" directory, and only by removing files
 //! or subdirectory once they are useless.  This RCU-like protocol
@@ -143,8 +143,6 @@ use umash::Fingerprint;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
-use crate::directory_schema::fingerprint_v1_chunk_list;
-use crate::directory_schema::Directory;
 use crate::drop_result;
 use crate::error_from_os;
 use crate::filtered_io_error;
@@ -152,6 +150,8 @@ use crate::filtered_os_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::instance_id;
+use crate::manifest_schema::fingerprint_v1_chunk_list;
+use crate::manifest_schema::Manifest;
 use crate::ofd_lock::OfdLock;
 use crate::process_id::process_id;
 use crate::replication_target::ReplicationTargetList;
@@ -185,8 +185,8 @@ const DOT_METADATA: &str = ".metadata";
 
 /// The ".meta_copy_lock" file, at the toplevel of the buffer
 /// directory, lets copiers serialise their upload and consumption of
-/// directory blobs.  This serialisation prevents snapshots from going
-/// back in time when a copier is slow to upload an old directory blob.
+/// manifest blobs.  This serialisation prevents snapshots from going
+/// back in time when a copier is slow to upload an old manifest blob.
 const DOT_META_COPY_LOCK: &str = ".meta_copy_lock";
 
 const CHUNKS: &str = "chunks";
@@ -262,7 +262,7 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
     Ok((temp, scratch))
 }
 
-/// Returns the .tap path for `source_db`'s directory proto file,
+/// Returns the .tap path for `source_db`'s manifest proto file,
 /// given the path prefix for spooling directories (or None to use
 /// the global default).
 #[instrument(level = "debug")]
@@ -283,7 +283,7 @@ pub(crate) fn tapped_meta_path_in_spool_prefix(
     }
 }
 
-/// Returns the .tap path for `source_db`'s directory proto file, given the file's `spool_dir`.
+/// Returns the .tap path for `source_db`'s manifest proto file, given the file's `spool_dir`.
 #[instrument(level = "debug")]
 pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> Result<PathBuf> {
     // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to the prefix, `...`.
@@ -357,7 +357,7 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
 }
 
 /// Attempts to acquire the local lock around uploading "meta"
-/// directory blobs.
+/// manifest blobs.
 ///
 /// Returns a File object that owns the lock on success (dropping that
 /// file will release the lock), None on acquisition failure.
@@ -562,31 +562,31 @@ pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
     )
 }
 
-/// Attempts to read a valid Directory message from `file_path`.
+/// Attempts to read a valid Manifest message from `file_path`.
 /// Returns Ok(None) if the file does not exist.
 #[instrument(level = "trace")]
-fn read_directory_at_path(file_path: &Path) -> Result<Option<Directory>> {
+fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
     use prost::Message;
 
     let contents = match std::fs::read(file_path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(chain_error!(e, "failed to read directory", ?file_path)),
+        Err(e) => return Err(chain_error!(e, "failed to read manifest", ?file_path)),
     };
-    let directory = Directory::decode(&*contents)
-        .map_err(|e| chain_error!(e, "failed to parse proto directory", ?file_path))?;
+    let manifest = Manifest::decode(&*contents)
+        .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?file_path))?;
 
-    match &directory.v1 {
+    match &manifest.v1 {
         Some(v1)
             // We must have a v1 entry, the chunk fingerprints must match, and there
             // must be an even number of u64 in the list (we need two per fingerprint).
             if Some(fingerprint_v1_chunk_list(&v1.chunks).into()) == v1.contents_fprint
                 && (v1.chunks.len() % 2) == 0 =>
         {
-            Ok(Some(directory))
+            Ok(Some(manifest))
         },
-        Some(_) => Err(fresh_error!("invalid chunk list", ?directory)),
-        None => Err(fresh_error!("v1 format not found", ?directory)),
+        Some(_) => Err(fresh_error!("invalid chunk list", ?manifest)),
+        None => Err(fresh_error!("v1 format not found", ?manifest)),
     }
 }
 
@@ -811,16 +811,16 @@ impl ReplicationBuffer {
         })
     }
 
-    /// Attempts to overwrite the directory file for the replicated file.
+    /// Attempts to overwrite the manifest file for the replicated file.
     #[instrument]
-    pub fn publish_directory(&self, db_path: &Path, directory: &Directory) -> Result<()> {
+    pub fn publish_manifest(&self, db_path: &Path, manifest: &Manifest) -> Result<()> {
         use prost::Message;
         use std::io::Write;
 
         let mut encoded = Vec::<u8>::new();
-        directory
+        manifest
             .encode(&mut encoded)
-            .map_err(|e| chain_error!(e, "failed to serialize directory proto", ?directory))?;
+            .map_err(|e| chain_error!(e, "failed to serialize manifest proto", ?manifest))?;
 
         let (temp, mut target) = create_scratch_file(self.spooling_directory.clone())?;
         temp.as_file().write_all(&encoded).map_err(|e| {
@@ -836,10 +836,10 @@ impl ReplicationBuffer {
         target.push(META);
         target.push(
             &percent_encode_path_uri(db_path)
-                .map_err(|e| chain_error!(e, "invalid directory name", ?db_path))?,
+                .map_err(|e| chain_error!(e, "invalid manifest name", ?db_path))?,
         );
         temp.persist(&target)
-            .map_err(|e| chain_error!(e, "failed to publish directory", ?target))?;
+            .map_err(|e| chain_error!(e, "failed to publish manifest", ?target))?;
         Ok(())
     }
 
@@ -852,24 +852,24 @@ impl ReplicationBuffer {
         probe.exists()
     }
 
-    /// Attempts to parse the current ready directory file.
+    /// Attempts to parse the current ready manifest file.
     #[instrument(level = "trace")]
-    pub fn read_ready_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
+    pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
-        read_directory_at_path(&src)
+        read_manifest_at_path(&src)
     }
 
-    /// Attempts to parse the current staged directory file.
+    /// Attempts to parse the current staged manifest file.
     #[instrument(level = "trace")]
-    pub fn read_staged_directory(&self, db_path: &Path) -> Result<Option<Directory>> {
+    pub fn read_staged_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
         src.push(&percent_encode_path_uri(db_path)?);
-        read_directory_at_path(&src)
+        read_manifest_at_path(&src)
     }
 
     /// Returns the path prefix for staged chunks.
@@ -1002,7 +1002,7 @@ impl ReplicationBuffer {
                 filtered_io_error!(
                     e,
                     ErrorKind::NotFound => Level::DEBUG,
-                    "failed to link ready directory",
+                    "failed to link ready manifest",
                     ?staging,
                     ?temp_path
                 )
