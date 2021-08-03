@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use verneuil::chain_error;
 use verneuil::fresh_error;
+use verneuil::Result;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -43,6 +44,7 @@ struct Opt {
 #[derive(Debug, StructOpt)]
 enum Command {
     Restore(Restore),
+    ManifestName(ManifestName),
 }
 
 #[derive(Debug, StructOpt)]
@@ -64,7 +66,7 @@ struct Restore {
     out: Option<PathBuf>,
 }
 
-fn restore(cmd: Restore) -> verneuil::Result<()> {
+fn restore(cmd: Restore) -> Result<()> {
     let manifest_contents = std::fs::read(&cmd.manifest)
         .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))?;
     let manifest = verneuil::Manifest::decode(&*manifest_contents)
@@ -109,7 +111,34 @@ fn restore(cmd: Restore) -> verneuil::Result<()> {
     Ok(())
 }
 
-pub fn main() -> verneuil::Result<()> {
+#[derive(Debug, StructOpt)]
+/// The verneuilctl manifest-name utility accepts the path to a source
+/// replicated file and an optional hostname, and prints the name of
+/// the corresponding manifest file to stdout.
+struct ManifestName {
+    /// The path to the source file that was replicated by Verneuil.
+    #[structopt(parse(from_os_str))]
+    source: PathBuf,
+
+    /// The hostname (/etc/hostname) of the machine that replicated
+    /// that source file.  Defaults to the current hostname.
+    #[structopt(short, long)]
+    hostname: Option<String>,
+}
+
+fn manifest_name(cmd: ManifestName) -> Result<()> {
+    println!(
+        "{}",
+        verneuil::manifest_name_for_hostname_path(
+            cmd.hostname.as_ref().map(String::as_str),
+            &cmd.source
+        )
+        .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?
+    );
+    Ok(())
+}
+
+pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let opts = Opt::from_args();
@@ -129,21 +158,29 @@ pub fn main() -> verneuil::Result<()> {
         .compact()
         .init();
 
-    let config = if let Some(config) = &opts.config {
-        verneuil::parse_configuration_string(config)
-            .ok_or_else(|| fresh_error!("failed to parse --config"))?
-    } else {
-        let value = std::env::var(verneuil::VERNEUIL_CONFIG_ENV_VAR)
-            .map_err(|e| chain_error!(e, "failed to fetch the value of VERNEUIL_CONFIG"))?;
-        verneuil::parse_configuration_string(&value)
-            .ok_or_else(|| fresh_error!("failed to parse VERNEUIL_CONFIG", %value))?
+    let config_or = &opts.config;
+    let configure_replication = || {
+        let config = if let Some(config) = config_or {
+            verneuil::parse_configuration_string(config)
+                .ok_or_else(|| fresh_error!("failed to parse --config"))?
+        } else {
+            let value = std::env::var(verneuil::VERNEUIL_CONFIG_ENV_VAR)
+                .map_err(|e| chain_error!(e, "failed to fetch the value of VERNEUIL_CONFIG"))?;
+            verneuil::parse_configuration_string(&value)
+                .ok_or_else(|| fresh_error!("failed to parse VERNEUIL_CONFIG", %value))?
+        };
+
+        tracing::info!(?config, "parsed replication config");
+        verneuil::configure_replication(config.clone())
+            .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
+        Ok(())
     };
 
-    tracing::info!(?config, "parsed replication config");
-    verneuil::configure_replication(config.clone())
-        .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
-
     match opts.cmd {
-        Command::Restore(cmd) => restore(cmd),
+        Command::Restore(cmd) => {
+            configure_replication()?;
+            restore(cmd)
+        }
+        Command::ManifestName(cmd) => manifest_name(cmd),
     }
 }
