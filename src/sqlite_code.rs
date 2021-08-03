@@ -10,4 +10,9 @@ pub(crate) enum SqliteCode {
     Error = 1,
     Internal = 2,
     CantOpen = 14,
+    IoErrFstat = 1802,
+    IoErrRead = 266,
+    IoErrShortRead = 522,
+    Perm = 3,
+    ReadOnly = 8,
 }
