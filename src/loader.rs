@@ -19,6 +19,7 @@ use crate::fresh_error;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
 use crate::replication_target::ReplicationTarget;
+use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
 
 /// How many times do we retry on transient load errors?
@@ -140,7 +141,7 @@ impl Drop for Chunk {
 impl Loader {
     /// Creates a fresh `Loader` that looks for hits first in `local`,
     /// and then in `remote`.  The `Loader` always check the sources
-    /// in order: low-to-high index in `local`, and then similar in
+    /// in order: low-to-high index in `local`, and then similarly in
     /// `remote`.
     #[instrument]
     pub(crate) fn new(local: Vec<PathBuf>, remote: &[ReplicationTarget]) -> Result<Loader> {
@@ -150,8 +151,8 @@ impl Loader {
             let creds =
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
-            for target in remote {
-                remote_sources.push(create_chunk_source(&target, &creds)?);
+            for source in remote {
+                remote_sources.push(create_source(&source, &creds, |s3| &s3.chunk_bucket)?);
             }
         }
 
@@ -278,8 +279,12 @@ fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
     Some(upgraded)
 }
 
-#[instrument(level = "debug")]
-fn create_chunk_source(source: &ReplicationTarget, creds: &Credentials) -> Result<Bucket> {
+#[instrument(level = "debug", skip(creds, bucket_extractor))]
+fn create_source(
+    source: &ReplicationTarget,
+    creds: &Credentials,
+    bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
+) -> Result<Bucket> {
     use ReplicationTarget::*;
 
     match source {
@@ -295,7 +300,7 @@ fn create_chunk_source(source: &ReplicationTarget, creds: &Credentials) -> Resul
                     .map_err(|e| chain_error!(e, "failed to parse S3 region", ?s3))?
             };
 
-            let bucket_name = &s3.chunk_bucket;
+            let bucket_name = bucket_extractor(&s3);
             let mut bucket = Bucket::new(bucket_name, region, creds.clone())
                 .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
 
