@@ -224,7 +224,7 @@ struct Flush {
 }
 
 fn flush(cmd: Flush) -> Result<()> {
-    verneuil::copy_all_spool_paths(cmd.spooling)
+    verneuil::copy_all_spool_paths(cmd.spooling, /*best_effort*/ false)
 }
 
 pub fn main() -> Result<()> {

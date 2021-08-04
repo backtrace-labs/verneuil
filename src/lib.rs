@@ -384,13 +384,23 @@ pub fn manifest_bytes_for_hostname_path(
 
 /// Synchronously uploads all the data contained in the spooling
 /// directory prefix.
-pub fn copy_all_spool_paths(replication_spooling_dir: std::path::PathBuf) -> Result<()> {
+///
+/// If `best_effort`, succeed instead of erroring out when the
+/// spooling directory does not exist.
+pub fn copy_all_spool_paths(
+    replication_spooling_dir: std::path::PathBuf,
+    best_effort: bool,
+) -> Result<()> {
     use rand::prelude::SliceRandom;
     use rayon::prelude::*;
 
     let mut to_copy = Vec::new();
 
     let current = replication_buffer::current_spooling_dir(replication_spooling_dir);
+    if best_effort && !current.exists() {
+        return Ok(());
+    }
+
     for subdir in std::fs::read_dir(&current)
         .map_err(|e| chain_error!(e, "failed to list current spooling prefix", ?current))?
         .flatten()
