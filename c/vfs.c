@@ -2166,6 +2166,12 @@ verneuil_configure_impl(const struct verneuil_options *options)
         if (options == NULL)
                 options = &default_options;
 
+#ifdef SQLITE_CORE
+        rc = sqlite3_initialize();
+        if (rc != SQLITE_OK)
+                return rc;
+#endif
+
         rc = sqlite3_vfs_register(&verneuil_vfs, options->make_default ? 1 : 0);
         if (rc != SQLITE_OK)
                 return rc;

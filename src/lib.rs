@@ -150,8 +150,7 @@ pub fn configure_replication(options: Options) -> Result<()> {
     Ok(())
 }
 
-/// Configures the Verneuil VFS.  Sqlite must be initialised when
-/// this function is called.
+/// Configures the Verneuil VFS.
 pub fn configure(options: Options) -> std::result::Result<(), i32> {
     let c_path;
     let mut foreign_options = ForeignOptions {
