@@ -843,15 +843,6 @@ impl ReplicationBuffer {
         Ok(())
     }
 
-    /// Returns whether the "ready" subdirectory definitely exists.
-    #[allow(dead_code)]
-    pub fn ready_directory_present(&self) -> bool {
-        let mut probe = self.spooling_directory.clone();
-        probe.push(READY);
-
-        probe.exists()
-    }
-
     /// Attempts to parse the current ready manifest file.
     #[instrument(level = "trace")]
     pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
