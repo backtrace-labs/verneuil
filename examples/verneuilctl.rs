@@ -47,34 +47,9 @@ enum Command {
     ManifestName(ManifestName),
 }
 
-#[derive(Debug, StructOpt)]
-/// The verneuilctl restore utility accepts the path to a verneuil
-/// manifest file, and reconstructs its contents to the `--out`
-/// argument (or stdout by default).
-struct Restore {
-    /// The manifest file that describes the snapshot to restore.
-    ///
-    /// These are typically stored as objects in versioned buckets;
-    /// it is up to the invoker to fish out the relevant version.
-    #[structopt(parse(from_os_str))]
-    manifest: PathBuf,
-
-    /// The path to the reconstructed output file.
-    ///
-    /// Defaults to stdout.
-    #[structopt(short, long, parse(from_os_str))]
-    out: Option<PathBuf>,
-}
-
-fn restore(cmd: Restore) -> Result<()> {
-    let manifest_contents = std::fs::read(&cmd.manifest)
-        .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))?;
-    let manifest = verneuil::Manifest::decode(&*manifest_contents)
-        .map_err(|e| chain_error!(e, "failed to parse manifest file", path=?cmd.manifest))?;
-    let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
-    let mut reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
-
-    if let Some(dst) = &cmd.out {
+// Writes the contents of `reader` to `out`, or stdout if `None`.
+fn output_reader(mut reader: impl std::io::Read, out: &Option<PathBuf>) -> Result<()> {
+    if let Some(dst) = out {
         let out_file = dst
             .file_name()
             .ok_or_else(|| fresh_error!("no file name in output path", ?dst))?;
@@ -83,7 +58,7 @@ fn restore(cmd: Restore) -> Result<()> {
             .ok_or_else(|| fresh_error!("output path has no file name", ?dst))?;
         let mut temp = tempfile::Builder::new()
             .prefix(out_file)
-            .suffix(&format!(".{}.verneuilctl-restore-tmp", std::process::id()))
+            .suffix(&format!(".{}.verneuilctl-tmp", std::process::id()))
             .tempfile_in(out_dir)
             .map_err(|e| chain_error!(e, "failed to create temporary file", ?dst))?;
 
@@ -109,6 +84,35 @@ fn restore(cmd: Restore) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, StructOpt)]
+/// The verneuilctl restore utility accepts the path to a verneuil
+/// manifest file, and reconstructs its contents to the `--out`
+/// argument (or stdout by default).
+struct Restore {
+    /// The manifest file that describes the snapshot to restore.
+    ///
+    /// These are typically stored as objects in versioned buckets;
+    /// it is up to the invoker to fish out the relevant version.
+    #[structopt(parse(from_os_str))]
+    manifest: PathBuf,
+
+    /// The path to the reconstructed output file.
+    ///
+    /// Defaults to stdout.
+    #[structopt(short, long, parse(from_os_str))]
+    out: Option<PathBuf>,
+}
+
+fn restore(cmd: Restore) -> Result<()> {
+    let manifest_contents = std::fs::read(&cmd.manifest)
+        .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))?;
+    let manifest = verneuil::Manifest::decode(&*manifest_contents)
+        .map_err(|e| chain_error!(e, "failed to parse manifest file", path=?cmd.manifest))?;
+    let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
+    let reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
+    output_reader(reader, &cmd.out)
 }
 
 #[derive(Debug, StructOpt)]
