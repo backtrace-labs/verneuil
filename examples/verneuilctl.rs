@@ -47,6 +47,7 @@ enum Command {
     Restore(Restore),
     ManifestName(ManifestName),
     Manifest(Manifest),
+    Flush(Flush),
 }
 
 // Writes the contents of `reader` to `out`, or stdout if `None`.
@@ -212,6 +213,20 @@ fn manifest(cmd: Manifest, config: Options) -> Result<()> {
     output_reader(&*bytes, &cmd.out)
 }
 
+#[derive(Debug, StructOpt)]
+/// The verneuilctl flush utility accepts the path to a spooling directory,
+/// (i.e., a value for `verneuil::Options::replication_spooling_dir`), and
+/// attempts to upload all the files pending replication in that directory.
+struct Flush {
+    /// The replication spooling directory prefix.
+    #[structopt(parse(from_os_str))]
+    spooling: PathBuf,
+}
+
+fn flush(cmd: Flush) -> Result<()> {
+    verneuil::copy_all_spool_paths(cmd.spooling)
+}
+
 pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -256,5 +271,6 @@ pub fn main() -> Result<()> {
         Command::Restore(cmd) => restore(cmd, replication_config(true)?),
         Command::ManifestName(cmd) => manifest_name(cmd),
         Command::Manifest(cmd) => manifest(cmd, replication_config(false)?),
+        Command::Flush(cmd) => flush(cmd),
     }
 }

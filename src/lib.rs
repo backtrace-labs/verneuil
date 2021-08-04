@@ -20,6 +20,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::path::Path;
 
+pub use copier::copy_spool_path;
 pub use instance_id::hostname;
 pub use manifest_schema::Manifest;
 pub use replication_buffer::manifest_name_for_hostname_path;
@@ -380,6 +381,49 @@ pub fn manifest_bytes_for_hostname_path(
     };
 
     loader::fetch_manifest(&manifest_name, &[], targets)
+}
+
+/// Synchronously uploads all the data contained in the spooling
+/// directory prefix.
+pub fn copy_all_spool_paths(replication_spooling_dir: std::path::PathBuf) -> Result<()> {
+    use rand::prelude::SliceRandom;
+    use rayon::prelude::*;
+
+    let mut to_copy = Vec::new();
+
+    let current = replication_buffer::current_spooling_dir(replication_spooling_dir);
+    for subdir in std::fs::read_dir(&current)
+        .map_err(|e| chain_error!(e, "failed to list current spooling prefix", ?current))?
+        .flatten()
+    {
+        if subdir.file_name().to_string_lossy().starts_with('#') {
+            let mut spools: Vec<_> = std::fs::read_dir(subdir.path())
+                .map_err(|e| chain_error!(e, "failed to list spooling directory", ?subdir))?
+                .flatten()
+                .map(|entry| Ok((entry.metadata()?.modified()?, entry.path())))
+                .collect::<std::io::Result<_>>()
+                .map_err(|e| chain_error!(e, "failed to stat subdirectory", parent=?subdir))?;
+
+            // If there are multiple spool directories (for different
+            // inodes), use the one that was modified most recently.
+            spools.sort_unstable();
+
+            if spools.len() > 1 {
+                tracing::warn!(?spools, path=?subdir.path(), "found multiple inodes for the same source db.");
+            }
+
+            if let Some(spool) = spools.pop() {
+                to_copy.push(spool.1);
+            }
+        }
+    }
+
+    to_copy.shuffle(&mut rand::thread_rng());
+    to_copy
+        .into_par_iter()
+        .map(|path| copy_spool_path(&path))
+        .collect::<Result<_>>()?;
+    Ok(())
 }
 
 #[repr(C)]

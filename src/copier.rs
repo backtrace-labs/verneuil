@@ -55,6 +55,15 @@ const COPY_RATE_QUOTA: governor::Quota =
     governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(2) })
         .allow_burst(unsafe { NonZeroU32::new_unchecked(100) });
 
+/// Rate limit when copying synchronously.
+///
+/// We allow a much higher rate because synchronous upload isn't a
+/// background task.  If it's user-initiated, it should complete ASAP:
+/// someone actively decided they want to that data copied.
+const SYNCHRONOUS_COPY_RATE_QUOTA: governor::Quota =
+    governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(1000) })
+        .allow_burst(unsafe { NonZeroU32::new_unchecked(1000) });
+
 /// Whenever we are rate-limited, add up to this fraction of the base
 /// delay to our sleep duration.
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
@@ -354,6 +363,30 @@ impl Copier {
                                           path=?parent_directory));
         }
     }
+}
+
+/// Synchronously copies any pending replication data in `path`.
+#[instrument]
+pub fn copy_spool_path(path: &Path) -> Result<()> {
+    lazy_static::lazy_static! {
+        static ref WORKER: CopierWorker = {
+            let governor = Arc::new(governor::RateLimiter::direct_with_clock(
+                SYNCHRONOUS_COPY_RATE_QUOTA,
+                &Default::default(),
+            ));
+
+            let (_send, recv) = crossbeam_channel::bounded(1);
+            CopierWorker {
+                work: recv,
+                governor,
+            }
+        };
+    }
+
+    // Assume the replication target is behind: someone asked for a
+    // synchronous copy.
+    WORKER.handle_spooling_directory(&mut Default::default(), /*stale=*/ true, path)?;
+    Ok(())
 }
 
 /// Ensures the directory at `target` does not exist.

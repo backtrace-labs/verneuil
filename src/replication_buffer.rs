@@ -689,6 +689,18 @@ pub(crate) fn directory_meta(parent: PathBuf) -> PathBuf {
     meta
 }
 
+/// Appends the current instance id to the replication spooling
+/// `prefix`.
+pub(crate) fn current_spooling_dir(mut prefix: PathBuf) -> PathBuf {
+    // Add an instance id.
+    prefix.push(format!(
+        "verneuil-{}",
+        replace_slashes(instance_id::instance_id())
+    ));
+
+    prefix
+}
+
 impl ReplicationBuffer {
     /// Attempts to create a replication buffer for a file `fd` at
     /// `db_path`.
@@ -709,10 +721,7 @@ impl ReplicationBuffer {
     pub fn new(db_path: &Path, fd: &File) -> Result<Option<ReplicationBuffer>> {
         if let Some(mut spooling) = DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
             // Add an instance id.
-            spooling.push(format!(
-                "verneuil-{}",
-                replace_slashes(instance_id::instance_id())
-            ));
+            spooling = current_spooling_dir(spooling);
             // And now add the unique local key for the db file.
             spooling.push(mangle_path(db_path)?);
             spooling.push(db_file_key(fd)?);
