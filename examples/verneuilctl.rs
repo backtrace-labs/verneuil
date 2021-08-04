@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use structopt::StructOpt;
 use verneuil::chain_error;
 use verneuil::fresh_error;
+use verneuil::Options;
 use verneuil::Result;
 
 #[derive(Debug, StructOpt)]
@@ -45,6 +46,7 @@ struct Opt {
 enum Command {
     Restore(Restore),
     ManifestName(ManifestName),
+    Manifest(Manifest),
 }
 
 // Writes the contents of `reader` to `out`, or stdout if `None`.
@@ -142,6 +144,40 @@ fn manifest_name(cmd: ManifestName) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, StructOpt)]
+/// The verneuilctl manifest utility accepts the path to a source
+/// replicated file and an optional hostname, and outputs the contents
+/// of the corresponding manifest file to `--out`, or stdout by default.
+struct Manifest {
+    /// The path to the source file that was replicated by Verneuil.
+    #[structopt(parse(from_os_str))]
+    source: PathBuf,
+
+    /// The hostname (/etc/hostname) of the machine that replicated
+    /// that source file.  Defaults to the current hostname.
+    #[structopt(short, long)]
+    hostname: Option<String>,
+
+    /// The path to the output manifest file.
+    ///
+    /// Defaults to stdout.
+    #[structopt(short, long, parse(from_os_str))]
+    out: Option<PathBuf>,
+}
+
+fn manifest(cmd: Manifest, config: Options) -> Result<()> {
+    let bytes = match verneuil::manifest_bytes_for_hostname_path(
+        Some(&config),
+        cmd.hostname.as_ref().map(String::as_str),
+        &cmd.source,
+    )? {
+        Some(bytes) => bytes,
+        None => return Err(fresh_error!("unable to fetch manifest", ?cmd, ?config)),
+    };
+
+    output_reader(&*bytes, &cmd.out)
+}
+
 pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -163,7 +199,7 @@ pub fn main() -> Result<()> {
         .init();
 
     let config_or = &opts.config;
-    let configure_replication = || {
+    let replication_config = |apply: bool| {
         let config = if let Some(config) = config_or {
             verneuil::parse_configuration_string(config)
                 .ok_or_else(|| fresh_error!("failed to parse --config"))?
@@ -175,16 +211,19 @@ pub fn main() -> Result<()> {
         };
 
         tracing::info!(?config, "parsed replication config");
-        verneuil::configure_replication(config.clone())
-            .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
-        Ok(())
+        if apply {
+            verneuil::configure_replication(config.clone())
+                .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
+        }
+        Ok(config)
     };
 
     match opts.cmd {
         Command::Restore(cmd) => {
-            configure_replication()?;
+            replication_config(true)?;
             restore(cmd)
         }
         Command::ManifestName(cmd) => manifest_name(cmd),
+        Command::Manifest(cmd) => manifest(cmd, replication_config(false)?),
     }
 }

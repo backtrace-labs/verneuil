@@ -138,6 +138,34 @@ impl Drop for Chunk {
     }
 }
 
+/// Returns the bytes for manifest proto file `name`, after looking in
+/// `local`, and then in `remote`'s manifest bucket.
+pub(crate) fn fetch_manifest(
+    name: &str,
+    local: &[&Path],
+    remote: &[ReplicationTarget],
+) -> Result<Option<Vec<u8>>> {
+    for path in local {
+        if let Some(cached) = load_from_cache(path, name)? {
+            return Ok(Some(cached));
+        }
+    }
+
+    if !remote.is_empty() {
+        let creds =
+            Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
+
+        for source in remote {
+            let bucket = create_source(source, &creds, |s3| &s3.manifest_bucket)?;
+            if let Some(fetched) = load_from_source(&bucket, name)? {
+                return Ok(Some(fetched));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 impl Loader {
     /// Creates a fresh `Loader` that looks for hits first in `local`,
     /// and then in `remote`.  The `Loader` always check the sources

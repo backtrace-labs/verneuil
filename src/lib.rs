@@ -358,6 +358,30 @@ pub fn current_replication_proto_for_db(
     Ok((blob_name, proto_data))
 }
 
+/// Attempts to fetch the latest manifest for the sqlite database at
+/// `path` on `hostname_or` (on the current machine if None).
+///
+/// Fetches data from the replication targets in `config`, or from the
+/// global list of of targets if None.
+pub fn manifest_bytes_for_hostname_path(
+    config: Option<&Options>,
+    hostname_or: Option<&str>,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let manifest_name = manifest_name_for_hostname_path(hostname_or, path)?;
+
+    let default_targets;
+    let targets = match config {
+        Some(options) => &options.replication_targets,
+        None => {
+            default_targets = replication_target::get_default_replication_targets();
+            &default_targets.replication_targets
+        }
+    };
+
+    loader::fetch_manifest(&manifest_name, &[], targets)
+}
+
 #[repr(C)]
 pub struct ForeignReplicationInfo {
     blob_name: *mut c_char,
