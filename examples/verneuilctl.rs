@@ -248,7 +248,13 @@ pub fn main() -> Result<()> {
         .init();
 
     let config_or = &opts.config;
-    let replication_config = |apply: bool| {
+    enum ApplyConfig {
+        No,
+        Replication,
+        All,
+    }
+
+    let replication_config = |apply: ApplyConfig| {
         let config = if let Some(config) = config_or {
             verneuil::parse_configuration_string(config)
                 .ok_or_else(|| fresh_error!("failed to parse --config"))?
@@ -260,17 +266,24 @@ pub fn main() -> Result<()> {
         };
 
         tracing::info!(?config, "parsed replication config");
-        if apply {
-            verneuil::configure_replication(config.clone())
-                .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?;
+        match apply {
+            ApplyConfig::No => {}
+            ApplyConfig::Replication => {
+                verneuil::configure_replication(config.clone()).map_err(|e| {
+                    chain_error!(e, "failed to configure verneuil replication", ?config)
+                })?
+            }
+            ApplyConfig::All => verneuil::configure(config.clone())
+                .map_err(|e| chain_error!(e, "failed to configure verneuil", ?config))?,
         }
+
         Ok(config)
     };
 
     match opts.cmd {
-        Command::Restore(cmd) => restore(cmd, replication_config(true)?),
+        Command::Restore(cmd) => restore(cmd, replication_config(ApplyConfig::Replication)?),
         Command::ManifestName(cmd) => manifest_name(cmd),
-        Command::Manifest(cmd) => manifest(cmd, replication_config(false)?),
+        Command::Manifest(cmd) => manifest(cmd, replication_config(ApplyConfig::No)?),
         Command::Flush(cmd) => flush(cmd),
     }
 }

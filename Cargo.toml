@@ -15,6 +15,11 @@ name = "verneuil_vfs"
 crate-type = ["cdylib"]
 required-features = ["dynamic_vfs"]
 
+[[example]]
+name = "verneuilctl"
+crate-type = ["bin"]
+required-features = ["vendor_sqlite"]
+
 [features]
 vendor_sqlite = []
 dynamic_vfs = []  # Build the runtime-loadable VFS shared object; conflicts with vendor_sqlite.
