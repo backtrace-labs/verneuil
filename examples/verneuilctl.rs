@@ -48,6 +48,7 @@ enum Command {
     ManifestName(ManifestName),
     Manifest(Manifest),
     Flush(Flush),
+    Sync(Sync),
 }
 
 // Writes the contents of `reader` to `out`, or stdout if `None`.
@@ -227,6 +228,72 @@ fn flush(cmd: Flush) -> Result<()> {
     verneuil::copy_all_spool_paths(cmd.spooling, /*best_effort*/ false)
 }
 
+#[derive(Debug, StructOpt)]
+/// The verneuilctl sync utility accepts the path to a sqlite db, and
+/// uploads a fresh snapshot to the configured replication targets.
+///
+/// On success, prints the manifest name to stdout.
+struct Sync {
+    /// The source sqlite database file.
+    #[structopt(parse(from_os_str))]
+    source: PathBuf,
+
+    /// Whether to optimize the database before uploading it.
+    ///
+    /// Databases are currently optimized by fixing the sqlite page
+    /// size to 64 KB (ideal for Verneuil), and vacuuming the
+    /// database.  Vacuuming makes the updated page size actually take
+    /// effect, and garbage collects the database's contents.
+    #[structopt(short, long)]
+    optimize: bool,
+}
+
+fn sync(cmd: Sync, config: Options) -> Result<()> {
+    extern "C" {
+        fn verneuil__cycle_db(path: *const std::os::raw::c_char, vacuum: bool) -> i32;
+    }
+
+    let dir: PathBuf = match &config.replication_spooling_dir {
+        Some(dir) => dir.into(),
+        None => {
+            return Err(fresh_error!(
+                "Replication must be enabled (replication_spooling_dir must be set).",
+                ?config
+            ))
+        }
+    };
+
+    let cstr = std::ffi::CString::new(
+        cmd.source
+            .to_str()
+            .ok_or_else(|| fresh_error!("--source is not a valid utf-8 string", ?cmd))?,
+    )
+    .map_err(|e| chain_error!(e, "--source could not be converted to a C string", ?cmd))?;
+
+    tracing::info!(?dir, "flushing all spooled replication data");
+    verneuil::copy_all_spool_paths(dir.clone(), /*best_effort*/ true)?;
+
+    tracing::info!(?cmd.source, %cmd.optimize, "cycling a transaction on source db");
+    let code = unsafe { verneuil__cycle_db(cstr.as_ptr(), cmd.optimize) };
+    if code != 0 {
+        return Err(fresh_error!("Failed to force a transaction on database", ?cmd.source, code));
+    }
+
+    tracing::info!(
+        ?dir,
+        "flushing all spooled replication data, with new snapshot"
+    );
+    verneuil::copy_all_spool_paths(dir, /*best_effort*/ false)?;
+
+    let path = std::fs::canonicalize(&cmd.source)
+        .map_err(|e| chain_error!(e, "failed to canonicalize database path", ?cmd))?;
+    let manifest_name = verneuil::manifest_name_for_hostname_path(None, &path)
+        .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?;
+
+    println!("{}", manifest_name);
+    Ok(())
+}
+
 pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -285,5 +352,6 @@ pub fn main() -> Result<()> {
         Command::ManifestName(cmd) => manifest_name(cmd),
         Command::Manifest(cmd) => manifest(cmd, replication_config(ApplyConfig::No)?),
         Command::Flush(cmd) => flush(cmd),
+        Command::Sync(cmd) => sync(cmd, replication_config(ApplyConfig::All)?),
     }
 }

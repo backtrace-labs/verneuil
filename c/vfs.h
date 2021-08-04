@@ -37,6 +37,17 @@ int verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
 int verneuil_test_only_register(void);
 
 /**
+ * Opens and closes a transaction on the sqlite database at `path`,
+ * with the verneuil VFS.
+ *
+ * If `vacuum`, opens a write transaction and vacuums the database;
+ * otherwise, opens a dummy read transaction.
+ *
+ * Returns 0 on success, non-zero on error.
+ */
+int verneuil__cycle_db(const char *path, bool vacuum);
+
+/**
  * Performs additional Rust-side initialisation on a fully-initialised
  * linux_file for a main db.
  *

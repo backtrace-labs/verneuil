@@ -2243,3 +2243,42 @@ verneuil_test_only_register(void)
         return rc;
 }
 #endif
+
+/*
+ * We pass this dummy result callback to sqlite3 to make it obvious
+ * our SQL statements must be executed.
+ */
+static int
+dummy_cb(void *vsize, int ncol, char **values, char **columns)
+{
+
+        (void)vsize;
+        (void)ncol;
+        (void)values;
+        (void)columns;
+        return 0;
+}
+
+int
+verneuil__cycle_db(const char *path, bool vacuum)
+{
+        sqlite3 *db;
+        const char *statement;
+        int rc;
+
+        rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, "verneuil");
+        if (rc != SQLITE_OK)
+                return rc;
+
+        if (vacuum == true) {
+                statement =
+                    "PRAGMA page_size = 65536; "
+                    "VACUUM;";
+        } else {
+                statement = "SELECT COUNT(*) FROM sqlite_schema;";
+        }
+
+        rc = sqlite3_exec(db, statement, dummy_cb, NULL, NULL);
+        (void)sqlite3_close_v2(db);
+        return rc;
+}
