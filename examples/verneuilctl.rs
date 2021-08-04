@@ -97,8 +97,22 @@ struct Restore {
     ///
     /// These are typically stored as objects in versioned buckets;
     /// it is up to the invoker to fish out the relevant version.
-    #[structopt(parse(from_os_str))]
-    manifest: PathBuf,
+    ///
+    /// If missing, verneuilctl restore will attempt to download it
+    /// from remote storage, based on `--hostname` and `--source_path`.
+    #[structopt(short, long, parse(from_os_str))]
+    manifest: Option<PathBuf>,
+
+    /// The hostname of the machine that generated the snapshot.
+    ///
+    /// Defaults to the current machine's hostname.
+    #[structopt(short, long)]
+    hostname: Option<String>,
+
+    /// The path to the source file that was replicated by Verneuil,
+    /// when it ran on `--hostname`.
+    #[structopt(short, long, parse(from_os_str))]
+    source_path: Option<PathBuf>,
 
     /// The path to the reconstructed output file.
     ///
@@ -107,9 +121,29 @@ struct Restore {
     out: Option<PathBuf>,
 }
 
-fn restore(cmd: Restore) -> Result<()> {
-    let manifest_contents = std::fs::read(&cmd.manifest)
-        .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))?;
+fn restore(cmd: Restore, config: Options) -> Result<()> {
+    let read_manifest = || {
+        if let Some(path) = &cmd.manifest {
+            std::fs::read(path)
+                .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))
+        } else if let Some(path) = &cmd.source_path {
+            match verneuil::manifest_bytes_for_hostname_path(
+                Some(&config),
+                cmd.hostname.as_ref().map(String::as_str),
+                path,
+            )? {
+                Some(bytes) => Ok(bytes),
+                None => Err(fresh_error!("unable to fetch manifest", ?cmd, ?config)),
+            }
+        } else {
+            Err(fresh_error!(
+                "One of `--manifest` or `--source_path` must be provided to `verneuilctl restore`",
+                ?cmd
+            ))
+        }
+    };
+
+    let manifest_contents = read_manifest()?;
     let manifest = verneuil::Manifest::decode(&*manifest_contents)
         .map_err(|e| chain_error!(e, "failed to parse manifest file", path=?cmd.manifest))?;
     let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
@@ -219,10 +253,7 @@ pub fn main() -> Result<()> {
     };
 
     match opts.cmd {
-        Command::Restore(cmd) => {
-            replication_config(true)?;
-            restore(cmd)
-        }
+        Command::Restore(cmd) => restore(cmd, replication_config(true)?),
         Command::ManifestName(cmd) => manifest_name(cmd),
         Command::Manifest(cmd) => manifest(cmd, replication_config(false)?),
     }
