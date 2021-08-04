@@ -63,7 +63,7 @@ pub struct ForeignOptions {
 // See `c/vfs.h`.
 extern "C" {
     fn verneuil_configure_impl(options: *const ForeignOptions) -> i32;
-    #[cfg(feature = "verneuil_test_vfs")]
+    #[cfg(feature = "test_vfs")]
     fn verneuil_test_only_register() -> i32;
 }
 
@@ -242,7 +242,7 @@ pub unsafe extern "C" fn verneuil_configure(options_ptr: *const ForeignOptions) 
 /// This function must only be called in `-DSQLITE_CORE` builds, and is
 /// only expected to be invoked by sqlite's test harness.
 #[no_mangle]
-#[cfg(feature = "verneuil_test_vfs")]
+#[cfg(feature = "test_vfs")]
 pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -> i32 {
     // Send tracing calls to stdout, and converts any log! call to
     // traces.

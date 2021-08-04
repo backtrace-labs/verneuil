@@ -83,7 +83,7 @@ impl Snapshot {
                 let chunk = find_chunk(fprint)?;
 
                 // All but the last chunk must be exactly snapshot-sized.
-                #[cfg(feature = "verneuil_test_vfs")]
+                #[cfg(feature = "test_vfs")]
                 assert_eq!(
                     chunk.payload.len(),
                     crate::tracker::SNAPSHOT_GRANULARITY as usize
@@ -95,7 +95,7 @@ impl Snapshot {
             let chunk = find_chunk(last)?;
 
             // The last chunk may be short.
-            #[cfg(feature = "verneuil_test_vfs")]
+            #[cfg(feature = "test_vfs")]
             assert!(chunk.payload.len() <= crate::tracker::SNAPSHOT_GRANULARITY as usize);
 
             insert_chunk(chunk)?;

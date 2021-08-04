@@ -96,7 +96,7 @@ impl Chunk {
     pub(crate) fn new(fprint: Fingerprint, payload: Vec<u8>) -> Result<Chunk> {
         // The contents of a content-addressed chunk must have the same
         // fingerprint as the chunk's name.
-        #[cfg(feature = "verneuil_test_vfs")]
+        #[cfg(feature = "test_vfs")]
         assert_eq!(fprint, fingerprint_file_chunk(&payload));
 
         // In production, only check the first 64-bit half of the
@@ -206,7 +206,7 @@ impl Loader {
         let mut contents = fetch_from_cache(fprint);
 
         // Don't fast path in tests.
-        #[cfg(not(feature = "verneuil_test_vfs"))]
+        #[cfg(not(feature = "test_vfs"))]
         if contents.is_some() {
             return Ok(contents);
         }
@@ -215,7 +215,7 @@ impl Loader {
             // If we already know the chunk's contents, the new ones
             // must match.
             if let Some(_old) = &contents {
-                #[cfg(feature = "verneuil_test_vfs")]
+                #[cfg(feature = "test_vfs")]
                 assert_eq!(&*_old.payload, new_contents.as_slice());
                 return Ok(());
             }
@@ -230,7 +230,7 @@ impl Loader {
         for path in &self.local_caches {
             if let Some(cached) = load_from_cache(&path, &name)? {
                 update_contents(cached)?;
-                #[cfg(not(feature = "verneuil_test_vfs"))]
+                #[cfg(not(feature = "test_vfs"))]
                 return Ok(contents);
             }
         }
@@ -238,7 +238,7 @@ impl Loader {
         for source in &self.remote_sources {
             if let Some(remote) = load_from_source(&source, &name)? {
                 update_contents(remote)?;
-                #[cfg(not(feature = "verneuil_test_vfs"))]
+                #[cfg(not(feature = "test_vfs"))]
                 return Ok(contents);
             }
         }

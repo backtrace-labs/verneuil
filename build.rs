@@ -43,9 +43,9 @@ fn main() {
     // If we're building a VFS library for sqlite to load, we do not
     // want to vendor in our own copy of sqlite.
     if cfg!(all(
-        feature = "verneuil_vendor_sqlite",
-        not(feature = "verneuil_vfs"),
-        not(feature = "verneuil_test_vfs")
+        feature = "vendor_sqlite",
+        not(feature = "dynamic_vfs"),
+        not(feature = "test_vfs")
     )) {
         build_sqlite();
     }
@@ -63,13 +63,13 @@ fn main() {
         .flag_if_supported("-Wundef")
         .include("include");
 
-    if cfg!(feature = "verneuil_test_vfs") {
+    if cfg!(feature = "test_vfs") {
         // Enable test-only code.
         build.define("TEST_VFS", None).define("SQLITE_TEST", None);
     }
 
-    if cfg!(feature = "verneuil_vfs") {
-        if cfg!(feature = "verneuil_vendor_sqlite") {
+    if cfg!(feature = "dynamic_vfs") {
+        if cfg!(feature = "vendor_sqlite") {
             eprintln!(
                 "The Verneuil VFS cannot vendor sqlite: it would conflict with the loader process."
             );

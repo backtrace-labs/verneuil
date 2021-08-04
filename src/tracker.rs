@@ -257,7 +257,7 @@ impl Tracker {
         // recover from silent desynchronisation.  That's good for
         // robustness in production, but we should disable that in
         // tests to catch logic bugs.
-        if cfg!(not(feature = "verneuil_test_vfs"))
+        if cfg!(not(feature = "test_vfs"))
             && (self.dirty_chunks.len() as u64) >= rng.gen_range(0..=num_chunks / 2)
         {
             base = None;
@@ -324,7 +324,7 @@ impl Tracker {
             let fprint = fingerprint_file_chunk(slice);
 
             if let Some(expected) = expected_fprint {
-                #[cfg(feature = "verneuil_test_validate_writes")]
+                #[cfg(feature = "test_validate_writes")]
                 assert_eq!(fprint, expected);
 
                 // Outside tests, trigger a full rescan if the chunk
@@ -361,7 +361,7 @@ impl Tracker {
             // This is optional, so don't do it in tests: we don't
             // want to randomly paper over test failures.
             let random_index = rng.gen_range(0..backfill_begin);
-            if cfg!(not(feature = "verneuil_test_vfs"))
+            if cfg!(not(feature = "test_vfs"))
                 && !self
                     .dirty_chunks
                     .contains_key(&(random_index * SNAPSHOT_GRANULARITY))
@@ -551,7 +551,7 @@ impl Tracker {
                 .is_ok();
         }
 
-        #[cfg(feature = "verneuil_test_validate_reads")]
+        #[cfg(feature = "test_validate_reads")]
         self.validate_all_snapshots(buf);
 
         // We did something.  Tell the copier.
@@ -599,7 +599,7 @@ impl Tracker {
         drop_result!(buf.cleanup_scratch_directory(),
                      e => chain_info!(e, "failed to clear scratch directory", path=?self.path));
 
-        #[cfg(feature = "verneuil_test_validate_writes")]
+        #[cfg(feature = "test_validate_writes")]
         self.compare_snapshot(&buf).expect("snapshots must match");
         Ok(())
     }
@@ -612,7 +612,7 @@ impl Tracker {
     pub fn snapshot(&mut self) -> Result<()> {
         let ret = (|| {
             if let Some(buffer) = &self.buffer {
-                #[cfg(feature = "verneuil_test_validate_reads")]
+                #[cfg(feature = "test_validate_reads")]
                 self.validate_all_snapshots(&buffer);
                 // Nothing to do if we know we're clean.
                 if self.backing_file_state != MutationState::Clean {
@@ -648,14 +648,14 @@ impl Tracker {
     #[inline]
     #[instrument]
     pub fn pre_lock_checks(&self) {
-        #[cfg(feature = "verneuil_test_validate_reads")]
+        #[cfg(feature = "test_validate_reads")]
         if let Some(buffer) = &self.buffer {
             self.validate_all_snapshots(&buffer);
         }
     }
 }
 
-#[cfg(feature = "verneuil_test_vfs")]
+#[cfg(feature = "test_vfs")]
 impl Tracker {
     fn fetch_snapshot_or_die(
         &self,
@@ -700,7 +700,7 @@ impl Tracker {
 
     /// Assert that the contents of ready and staged snapshots make
     /// sense (if they exist).
-    #[cfg(feature = "verneuil_test_validate_reads")]
+    #[cfg(feature = "test_validate_reads")]
     fn validate_all_snapshots(&self, buf: &ReplicationBuffer) {
         self.validate_snapshot(buf, buf.read_ready_directory(&self.path), false)
             .expect("ready snapshot must be valid");

@@ -161,9 +161,9 @@ pub(crate) fn extract_version_id(
 
     buf.resize(XATTR_MAX_VALUE_SIZE, 0u8);
 
-    #[cfg(feature = "verneuil_compat_no_xattr")]
+    #[cfg(feature = "no_xattr")]
     let ret = -1;
-    #[cfg(not(feature = "verneuil_compat_no_xattr"))]
+    #[cfg(not(feature = "no_xattr"))]
     let ret = unsafe {
         verneuil__getxattr(
             file.as_raw_fd(),
@@ -253,9 +253,9 @@ pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>)
         .to_hyphenated()
         .encode_lower(&mut buf);
 
-    #[cfg(feature = "verneuil_compat_no_xattr")]
+    #[cfg(feature = "no_xattr")]
     let ret = 1;
-    #[cfg(not(feature = "verneuil_compat_no_xattr"))]
+    #[cfg(not(feature = "no_xattr"))]
     let ret = unsafe {
         verneuil__setxattr(
             file.as_raw_fd(),

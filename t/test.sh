@@ -12,25 +12,25 @@ HERE=$(dirname $(readlink -f "$0"))
 # Default test features: validate after read and write transactions,
 # and publish data to a local minio server.  That gives us a lot of
 # coverage, but can be slow.
-FEATURES="verneuil_test_validate_all"
+FEATURES="test_validate_all"
 
 # Other options:
 #
 # Maximise test speed, no assertion.  Useful for mptest.
-# FEATURES="verneuil_test_vfs"
+# FEATURES="test_vfs"
 #
 # Slightly lower test speed, some assertions.  Also useful for mptest,
 # especially with minio disabled in VERNEUIL_CONFIG below.
-# FEATURES="verneuil_test_validate_writes"
+# FEATURES="test_validate_writes"
 #
 # Restore some assertions.  Useful for soaktest.
-# FEATURES="verneuil_test_validate_writes"
+# FEATURES="test_validate_writes"
 #
 # Run full assertions, without xattr support.
-# FEATURES="verneuil_test_validate_all,verneuil_compat_no_xattr"
+# FEATURES="test_validate_all,no_xattr"
 #
 # Make sure that we behave usefully without replication targets.
-# FEATURES="verneuil_test_validate_all"
+# FEATURES="test_validate_all"
 
 (cd "$HERE/..";
  cargo build  --release --target-dir "$CURRENT" --no-default-features --features "$FEATURES")
