@@ -276,51 +276,23 @@ pub struct ReplicationProtoData {
     pub bytes: Vec<u8>,
 }
 
-/// Attempts to return the name for the manifest proto blob associated
-/// with `source_db`, and our local snapshot of that blob if available.
-///
-/// The contents of the file are looked up in a subdirectory of
-/// `spool_prefix`, or in the default prefix if None.
-pub fn current_replication_proto_for_db(
-    source_db: &std::path::Path,
-    spool_prefix: Option<std::path::PathBuf>,
-) -> Result<(String, Option<ReplicationProtoData>)> {
-    let meta_path = replication_buffer::tapped_meta_path_in_spool_prefix(spool_prefix, source_db)?;
-
-    let blob_name = meta_path
-        .file_name()
-        .expect("meta_path must have file name")
-        .to_str()
-        .expect("url-encoded blob name must be valid utf-8")
-        .to_string();
-
-    let proto_data = (|| {
+impl ReplicationProtoData {
+    /// Attempts to parse the replication proto in `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the bytes could not be parsed.  Returns
+    /// `Ok(None)` if the bytes encode protobuf data, but fail
+    /// application-level validation.
+    fn new(bytes: Vec<u8>) -> Result<Option<ReplicationProtoData>> {
         use prost::Message;
 
-        let bytes = match std::fs::read(&meta_path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(chain_error!(
-                    e,
-                    "failed to read tapped meta file",
-                    ?meta_path
-                ))
-            }
-            Ok(bytes) => bytes,
-        };
-
-        let v1 = match manifest_schema::Manifest::decode(&*bytes) {
-            Err(e) => {
-                let _ = chain_error!(e, "failed to decode proto bytes", ?meta_path);
-                return Ok(None);
-            }
-            Ok(manifest) => {
-                if let Some(v1) = manifest.v1 {
-                    v1
-                } else {
-                    return Ok(None);
-                }
-            }
+        let v1 = match manifest_schema::Manifest::decode(&*bytes)
+            .map_err(|e| chain_error!(e, "failed to decode proto bytes"))?
+            .v1
+        {
+            Some(v1) => v1,
+            None => return Ok(None),
         };
 
         let header_fprint = if let Some(fprint) = v1.header_fprint {
@@ -346,6 +318,41 @@ pub fn current_replication_proto_for_db(
             ctime,
             bytes,
         }))
+    }
+}
+
+/// Attempts to return the name for the manifest proto blob associated
+/// with `source_db`, and our local snapshot of that blob if available.
+///
+/// The contents of the file are looked up in a subdirectory of
+/// `spool_prefix`, or in the default prefix if None.
+pub fn current_replication_proto_for_db(
+    source_db: &std::path::Path,
+    spool_prefix: Option<std::path::PathBuf>,
+) -> Result<(String, Option<ReplicationProtoData>)> {
+    let meta_path = replication_buffer::tapped_meta_path_in_spool_prefix(spool_prefix, source_db)?;
+
+    let blob_name = meta_path
+        .file_name()
+        .expect("meta_path must have file name")
+        .to_str()
+        .expect("url-encoded blob name must be valid utf-8")
+        .to_string();
+
+    let proto_data = (|| {
+        let bytes = match std::fs::read(&meta_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(chain_error!(
+                    e,
+                    "failed to read tapped meta file",
+                    ?meta_path
+                ))
+            }
+            Ok(bytes) => bytes,
+        };
+
+        ReplicationProtoData::new(bytes)
     })()?;
 
     Ok((blob_name, proto_data))
