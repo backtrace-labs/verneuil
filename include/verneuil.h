@@ -115,6 +115,15 @@ int verneuil_replication_info_for_db(struct verneuil_replication_info *dst,
     const char *db, const char *spool_prefix);
 
 /**
+ * Populates `dst` with the remote replication information for manifest
+ * `manifest_name`.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int verneuil_replication_info_for_manifest(struct verneuil_replication_info *dst,
+    const char *manifest_name);
+
+/**
  * Releases resources owned by `info`.
  *
  * Safe to call on zero-initialised or NULL `info`.

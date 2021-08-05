@@ -474,6 +474,58 @@ pub unsafe extern "C" fn verneuil_replication_info_for_db(
     0
 }
 
+/// Populates `dst_ptr` with the replication information for
+/// manifest `manifest_name` in our remote replication targets.
+///
+/// # Safety
+///
+/// This function assumes its arguments are valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn verneuil_replication_info_for_manifest(
+    dst_ptr: *mut ForeignReplicationInfo,
+    c_manifest_name: *const c_char,
+) -> i32 {
+    if dst_ptr.is_null() {
+        tracing::error!("invalid dst (null)");
+        return -1;
+    }
+
+    let dst = dst_ptr.as_mut().expect("should be non-null");
+    *dst = std::mem::zeroed();
+
+    if c_manifest_name.is_null() {
+        tracing::error!("invalid manifest_name (null)");
+        return -1;
+    }
+
+    let manifest_name = match CStr::from_ptr(c_manifest_name).to_str() {
+        Ok(name) => name.to_string(),
+        Err(e) => {
+            let _ = chain_error!(e, "hostname is invalid utf-8");
+            return -1;
+        }
+    };
+
+    let targets = replication_target::get_default_replication_targets();
+    let info_or = match loader::fetch_manifest(&manifest_name, &[], &targets.replication_targets) {
+        Ok(Some(bytes)) => match ReplicationProtoData::new(bytes) {
+            Ok(info_or) => info_or,
+            Err(e) => {
+                let _ = chain_error!(e, "failed to parse manifest bytes", %manifest_name, ?targets);
+                return -1;
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            let _ = chain_error!(e, "failed to fetch manifest bytes", %manifest_name, ?targets);
+            return -1;
+        }
+    };
+
+    populate_replication_info(dst, manifest_name, info_or);
+    0
+}
+
 /// Releases resources owned by `info_ptr`
 ///
 /// # Safety
