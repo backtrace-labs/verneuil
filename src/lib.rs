@@ -371,6 +371,34 @@ pub struct ForeignReplicationInfo {
     bytes: *mut c_char,
 }
 
+fn populate_replication_info(
+    dst: &mut ForeignReplicationInfo,
+    blob_name: String,
+    info_or: Option<ReplicationProtoData>,
+) {
+    dst.blob_name = unsafe { CString::from_vec_unchecked(blob_name.into_bytes()) }.into_raw();
+
+    if let Some(info) = info_or {
+        dst.header_fprint = info.header_fprint.hash;
+        dst.contents_fprint = info.contents_fprint.hash;
+
+        let ctime = info
+            .ctime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        dst.ctime = ctime.as_secs();
+        dst.ctime_ns = ctime.subsec_nanos();
+
+        let mut bytes = info.bytes.into_boxed_slice();
+        dst.num_bytes = bytes.len();
+        dst.bytes = bytes.as_mut_ptr() as *mut _;
+
+        // Leak `bytes`: we will reconstruct it in
+        // `verneuil_replication_info_deinit`.
+        let _ = Box::into_raw(bytes);
+    }
+}
+
 /// Populates `dst_ptr` with the replication information for
 /// sqlite file `c_db`, inside the `c_prefix` spooling directory
 /// (or `NULL` for the global default).
@@ -418,27 +446,7 @@ pub unsafe extern "C" fn verneuil_replication_info_for_db(
         Ok(ret) => ret,
     };
 
-    dst.blob_name = CString::from_vec_unchecked(blob_name.into_bytes()).into_raw();
-    if let Some(info) = info_or {
-        dst.header_fprint = info.header_fprint.hash;
-        dst.contents_fprint = info.contents_fprint.hash;
-
-        let ctime = info
-            .ctime
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        dst.ctime = ctime.as_secs();
-        dst.ctime_ns = ctime.subsec_nanos();
-
-        let mut bytes = info.bytes.into_boxed_slice();
-        dst.num_bytes = bytes.len();
-        dst.bytes = bytes.as_mut_ptr() as *mut _;
-
-        // Leak `bytes`: we will reconstruct it in
-        // `verneuil_replication_info_deinit`.
-        let _ = Box::into_raw(bytes);
-    }
-
+    populate_replication_info(dst, blob_name, info_or);
     0
 }
 
