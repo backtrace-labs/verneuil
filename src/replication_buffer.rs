@@ -1178,7 +1178,7 @@ fn percent_encode_sample() {
         // We assume the test host's name doesn't need escaping.
         format!(
             "{}-verneuil%3A{}%3A634c%2F%2Fa%40%3C%3Csd!%25-_%2F.asd%2F*\'fdg(g%2F)%5C%7E).db",
-            instance_id::hostname_hash(),
+            instance_id::hostname_hash(instance_id::hostname()),
             instance_id::hostname()
         )
     );

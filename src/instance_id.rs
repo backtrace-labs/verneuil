@@ -118,5 +118,9 @@ fn print_instance_id() {
 #[test]
 fn print_hostname() {
     assert_ne!(hostname(), DEFAULT_HOSTNAME);
-    println!("hostname = '{}', hash = '{}'", hostname(), hostname_hash());
+    println!(
+        "hostname = '{}', hash = '{}'",
+        hostname(),
+        hostname_hash(hostname())
+    );
 }

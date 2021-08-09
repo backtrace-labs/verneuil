@@ -86,13 +86,13 @@ fn test_serialization_smoke_test() {
             region: "minio".into(),
             endpoint: Some("http://127.0.0.1:9000".into()),
             chunk_bucket: "chunks".into(),
-            directory_bucket: "directories".into(),
+            manifest_bucket: "manifests".into(),
             domain_addressing: true,
             create_buckets_on_demand: false,
         })],
     };
 
-    let expected = "{\"replication_targets\":[{\"s3\":{\"region\":\"minio\",\"endpoint\":\"http://127.0.0.1:9000\",\"chunk_bucket\":\"chunks\",\"directory_bucket\":\"directories\",\"domain_addressing\":true,\"create_buckets_on_demand\":false}}]}";
+    let expected = "{\"replication_targets\":[{\"s3\":{\"region\":\"minio\",\"endpoint\":\"http://127.0.0.1:9000\",\"chunk_bucket\":\"chunks\",\"manifest_bucket\":\"manifests\",\"domain_addressing\":true,\"create_buckets_on_demand\":false}}]}";
 
     assert_eq!(
         serde_json::to_string(&targets).expect("should serialize"),
