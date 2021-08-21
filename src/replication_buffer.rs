@@ -347,13 +347,16 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
         );
     }
 
-    std::fs::rename(&scratch, &tap).map_err(|e| {
-        // If we failed to rename `scratch` away, try to clean up
-        // before erroring out.
-        drop_result!(std::fs::remove_file(&scratch),
-                     e => chain_warn!(e, "failed to remove scratch file", ?scratch));
-        chain_warn!(e, "failed to tap update meta file")
-    })
+    let result = std::fs::rename(&scratch, &tap)
+        .map_err(|e| chain_warn!(e, "failed to tap update meta file"));
+
+    // Unconditionally try to clean up before returning: `rename(2)`
+    // no-ops successfully when `tap` and `scratch` point to the same
+    // file.
+    drop_result!(std::fs::remove_file(&scratch),
+                 e if e.kind() == ErrorKind::NotFound => (),
+                 e => chain_warn!(e, "failed to remove scratch file", ?scratch));
+    result
 }
 
 /// Attempts to acquire the local lock around uploading "meta"
