@@ -131,8 +131,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -193,13 +191,6 @@ const CHUNKS: &str = "chunks";
 const META: &str = "meta";
 const SCRATCH: &str = "scratch";
 const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
-
-/// If this flag is set to true, stale replication directories that
-/// look like they refer to overwritten databases will be deleted.
-///
-/// This is potentially lossy, since our path-mangling scheme isn't
-/// invertible, so only enabled for sqlite tests.
-pub(crate) static ENABLE_AUTO_CLEANUP: AtomicBool = AtomicBool::new(false);
 
 /// Only delete scratch files when they're older than this grace
 /// period.
@@ -745,15 +736,9 @@ impl ReplicationBuffer {
             spooling.push(db_file_key(fd)?);
 
             // Attempt to delete directories that refer to the same
-            // path, but different inode.  This will do weird things
-            // when two different paths look the same once slashes
-            // are replaced with '#', so this logic is only enabled
-            // for sqlite tests, which create a lot of dbs, none of
-            // which have colliding names.
-            if ENABLE_AUTO_CLEANUP.load(Ordering::Relaxed) {
-                drop_result!(delete_stale_directories(&spooling),
-                             e => chain_info!(e, "failed to delete stale directories"));
-            }
+            // path, but different inode.
+            drop_result!(delete_stale_directories(&spooling),
+                         e => chain_info!(e, "failed to delete stale directories"));
 
             std::fs::create_dir_all(&spooling).map_err(|e| {
                 chain_error!(

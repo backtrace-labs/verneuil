@@ -252,9 +252,6 @@ pub unsafe extern "C" fn sqlite3_verneuil_test_only_register(_: *const c_char) -
     let _ = tracing_subscriber::fmt::try_init();
     tracing::info!("tracing initialized");
 
-    crate::replication_buffer::ENABLE_AUTO_CLEANUP
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
     if let Err(code) =
         configure(load_configuration_from_env(None).expect("VERNEUIL_CONFIG must be populated"))
     {
