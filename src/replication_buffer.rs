@@ -389,7 +389,6 @@ fn replace_slashes(input: &str) -> String {
 }
 
 /// Reverses `replace_slashes`.
-#[cfg(test)]
 fn restore_slashes(input: &str) -> Result<String> {
     let slashified = input.replace("#", "/");
 
@@ -446,6 +445,56 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
                     tracing::info!(?parent, %error, "failed to remove sibling");
                 }
             }
+            parent.pop();
+        }
+    }
+
+    Ok(())
+}
+
+/// Attempts to delete all directories in `parent` that refer to a file
+/// that does not exist anymore.
+#[instrument]
+fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
+    for subdir in std::fs::read_dir(&parent)
+        .map_err(|e| chain_info!(e, "failed to list parent directory", ?parent))?
+        .flatten()
+    {
+        // We're only interested in percent-encoded paths, and those
+        // are always(?) valid utf-8.
+        let name = match subdir.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+
+        // Skip dot files/directories.
+        if name.starts_with('.') {
+            continue;
+        }
+
+        // Skip non-directories.
+        if !matches!(subdir.file_type(), Ok(typ) if typ.is_dir()) {
+            continue;
+        }
+
+        let base_file = match restore_slashes(&name) {
+            Ok(base_file) => base_file,
+            // If we couldn't decode the file name, it's probably
+            // not ours?
+            Err(_) => continue,
+        };
+
+        // If the file definitely does not exist, delete the
+        // replication directory.
+        if matches!(std::fs::symlink_metadata(&base_file),
+                    Err(e) if e.kind() == ErrorKind::NotFound)
+        {
+            parent.push(subdir.file_name());
+            tracing::info!(%base_file, victim=?parent,
+                           "deleting dangling replication directory");
+            drop_result!(std::fs::remove_dir_all(&parent),
+                         e => chain_info!(e, "failed to delete replication directory for missing db",
+                                          %base_file, victim=?parent));
             parent.pop();
         }
     }
@@ -728,9 +777,25 @@ impl ReplicationBuffer {
     /// created.
     #[instrument]
     pub fn new(db_path: &Path, fd: &File) -> Result<Option<ReplicationBuffer>> {
+        use std::sync::atomic::AtomicBool;
+
+        static CLEAN_ONCE_FLAG: AtomicBool = AtomicBool::new(true);
+
         if let Some(mut spooling) = DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
             // Add an instance id.
             spooling = current_spooling_dir(spooling);
+
+            // Once per process, try to scan for replication
+            // directories that refer to inexistent database files.
+            // Obviously, this logic only works because we only have
+            // the default spooling directory, but it's better than
+            // nothing.
+            if CLEAN_ONCE_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                drop_result!(delete_dangling_replication_directories(spooling.clone()),
+                             e => chain_info!(e, "failed to scan for dangling replication directories",
+                                              ?spooling));
+            }
+
             // And now add the unique local key for the db file.
             spooling.push(mangle_path(db_path)?);
             spooling.push(db_file_key(fd)?);
@@ -738,7 +803,7 @@ impl ReplicationBuffer {
             // Attempt to delete directories that refer to the same
             // path, but different inode.
             drop_result!(delete_stale_directories(&spooling),
-                         e => chain_info!(e, "failed to delete stale directories"));
+                         e => chain_info!(e, "failed to delete stale directories", ?spooling));
 
             std::fs::create_dir_all(&spooling).map_err(|e| {
                 chain_error!(
