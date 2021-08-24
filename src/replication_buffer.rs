@@ -386,17 +386,31 @@ pub(crate) fn reset_meta_copy_lock(spool_dir: PathBuf) -> Result<()> {
     })
 }
 
-/// Removes directory separators from the input, and replaces them
-/// with `#`. Either the input is not expected to ever include
-/// slashes, or the result is allowed to collide for different inputs.
+/// Percent-encodes control characters and `#` away, and replaces
+/// slashes with `#`.  The result is invertible, and is the same as
+/// just replacing `/` with `#` for most paths.
 fn replace_slashes(input: &str) -> String {
-    input.replace("/", "#")
+    const ESCAPED: percent_encoding::AsciiSet = percent_encoding::CONTROLS.add(b'#').add(b'%');
+
+    percent_encoding::utf8_percent_encode(&input, &ESCAPED)
+        .map(|fragment| fragment.replace("/", "#"))
+        .collect()
+}
+
+/// Reverses `replace_slashes`.
+#[cfg(test)]
+fn restore_slashes(input: &str) -> Result<String> {
+    let slashified = input.replace("#", "/");
+
+    Ok(percent_encoding::percent_decode_str(&slashified)
+        .decode_utf8()
+        .map_err(|e| chain_info!(e, "invalid utf-8 bytes"))?
+        .to_string())
 }
 
 /// Mangles a path to an extent database into a directory name:
-/// forward slashes are turned into `#`.  By itself, this encoding is
-/// ambiguous, but this mangled path will be combined with device and
-/// inode ids.
+/// control characters and `#` (and `%`) are percent-encoded away, and
+/// forward slashes are turned into `#`.
 fn mangle_path(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| chain_error!(e, "failed to canonicalize path", ?path))?;
@@ -566,7 +580,8 @@ pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
         // everything left of the last slash.  Without that separator,
         // our data might end up hashing to the same shard, despite
         // the high amount of entropy spread everywhere.
-        static ref SEPARATOR: String = percent_encoding::utf8_percent_encode("/", percent_encoding::NON_ALPHANUMERIC).to_string();
+        static ref SEPARATOR: String =
+            percent_encoding::utf8_percent_encode("/", percent_encoding::NON_ALPHANUMERIC).to_string();
     }
 
     format!(
@@ -1193,5 +1208,20 @@ fn percent_encode_sample() {
             instance_id::hostname_hash(instance_id::hostname()),
             instance_id::hostname()
         )
+    );
+}
+
+#[test]
+fn replace_slashes_invertible() {
+    const HARD_STRING: &str = "/%asd#//%60";
+
+    let converted = replace_slashes(HARD_STRING);
+    // There must not be any slash in the result.
+    assert_eq!(converted.find("/"), None);
+
+    // And it must be invertible.
+    assert_eq!(
+        HARD_STRING,
+        &restore_slashes(&converted).expect("must decode")
     );
 }
