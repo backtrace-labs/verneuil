@@ -82,6 +82,12 @@ const COPY_RETRY_MULTIPLIER: f64 = 10.0;
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
+/// When we fail to find credentials, sleep for at least this long
+/// before trying again: it's not particularly useful to log that we
+/// couldn't acquire credentials multiple times a second, especially
+/// when the fix usually involves manual action.
+const FAILED_CREDENTIALS_SLEEP: Duration = Duration::from_secs(60);
+
 /// Wait at least this long (and more for random jitter) when we
 /// fail to acquire the copy lock for a spooling directory.
 ///
@@ -385,7 +391,12 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
 
     // Assume the replication target is behind: someone asked for a
     // synchronous copy.
-    WORKER.handle_spooling_directory(&mut Default::default(), /*stale=*/ true, path)?;
+    WORKER.handle_spooling_directory(
+        &mut Default::default(),
+        /*stale=*/ true,
+        path,
+        /*sleep_on_credential_failure=*/ false,
+    )?;
     Ok(())
 }
 
@@ -1115,10 +1126,21 @@ impl CopierWorker {
         state: &mut CopierUploadState,
         stale: bool,
         spool: &Path,
+        sleep_on_credential_failure: bool,
     ) -> Result<bool> {
         let mut did_something = false;
-        let creds =
-            Credentials::default().map_err(|e| chain_error!(e, "failed to get S3 credentials"))?;
+        let creds = Credentials::default().map_err(|e| {
+            use rand::Rng;
+
+            let backoff = FAILED_CREDENTIALS_SLEEP.mul_f64(rand::thread_rng().gen_range(1.0..2.0));
+            // Log before sleeping.
+            let err = chain_error!(e, "failed to get S3 credentials", ?backoff);
+            if sleep_on_credential_failure {
+                std::thread::sleep(backoff);
+            }
+
+            err
+        })?;
 
         // Try to read the metadata JSON, which tells us where to
         // replicate the chunks and meta files.  If we can't do
@@ -1328,7 +1350,12 @@ impl CopierWorker {
                 state.signaled.store(false, Ordering::Relaxed);
                 state.last_scanned.store_now();
                 let stale = state.stale.swap(false, Ordering::Relaxed);
-                match self.handle_spooling_directory(&mut upload_state, stale, &state.spool_path) {
+                match self.handle_spooling_directory(
+                    &mut upload_state,
+                    stale,
+                    &state.spool_path,
+                    /*sleep_on_credential_failure=*/ true,
+                ) {
                     Ok(true) => {
                         state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
                         state.consecutive_failures.store(0, Ordering::Relaxed);
