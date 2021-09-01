@@ -69,10 +69,10 @@ const SYNCHRONOUS_COPY_RATE_QUOTA: governor::Quota =
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 
 /// How many times do we retry on transient errors?
-const COPY_RETRY_LIMIT: i32 = 2;
+const COPY_RETRY_LIMIT: i32 = 3;
 
 /// Initial back-off delay (+/- jitter).
-const COPY_RETRY_BASE_WAIT: Duration = Duration::from_secs(1);
+const COPY_RETRY_BASE_WAIT: Duration = Duration::from_millis(100);
 
 /// Grow the back-off delay by `COPY_RETRY_MULTIPLIER` after
 /// consecutive failures.
@@ -114,8 +114,10 @@ const WORKER_COUNT: usize = 4;
 /// same "staged" manifest file.
 const STAGED_MANIFEST_MEMORY: usize = 2;
 
-/// Try to identify lagging replication roughly at this period.
-const REPLICATION_LAG_REPORT_PERIOD: Duration = Duration::from_secs(61);
+/// Try to identify lagging replication roughly at this period; we
+/// want a small offset from exactly one minute to avoid synchronising
+/// with other processes that trigger behaviour every minute.
+const REPLICATION_LAG_REPORT_PERIOD: Duration = Duration::from_millis(60_325);
 
 /// Warn about DB files for which replication is this far behind.
 const REPLICATION_LAG_REPORT_THRESHOLD: Duration = Duration::from_secs(120);
