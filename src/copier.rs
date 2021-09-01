@@ -48,11 +48,11 @@ const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// Rate limit for individual blob uploads.
 ///
-/// We want to guarantee a low average rate (e.g., 2 per second)
+/// We want to guarantee a low average rate (e.g., 30 per second)
 /// to bound our costs, but also avoid slowing down replication in
 /// the common case, when write transactions are rare.
 const COPY_RATE_QUOTA: governor::Quota =
-    governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(2) })
+    governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(30) })
         .allow_burst(unsafe { NonZeroU32::new_unchecked(100) });
 
 /// Rate limit when copying synchronously.
@@ -105,9 +105,9 @@ const COPY_LOCK_CONTENTION_WAIT: Duration = Duration::from_secs(2);
 /// is misbehaving.
 const COPY_LOCK_RESET_RATE: f64 = 0.01;
 
-/// We aim for ~2 requests / second.  We shouldn't need more than four
+/// We aim for ~30 requests / second.  We shouldn't need more than five
 /// worker threads to achieve that, with additional sleeping / backoff.
-const WORKER_COUNT: usize = 4;
+const WORKER_COUNT: usize = 5;
 
 /// How many of the last manifest files we have uploaded must we
 /// remember?  This memory lets us avoid repeated uploads of the
