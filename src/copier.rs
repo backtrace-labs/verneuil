@@ -82,6 +82,10 @@ const COPY_RETRY_MULTIPLIER: f64 = 10.0;
 /// once per BACKGROUND_SCAN_PERIOD.
 const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 
+/// Let at least this much time elapse between copies for a given
+/// spooling directory (background or otherwise).
+const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
+
 /// When we fail to find credentials, sleep for at least this long
 /// before trying again: it's not particularly useful to log that we
 /// couldn't acquire credentials multiple times a second, especially
@@ -1349,6 +1353,23 @@ impl CopierWorker {
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 let last_scanned = state.last_scanned.load();
 
+                // Check if we have to pause because we're scanning
+                // the same directory too frequently.
+                if let Ok(elapsed) = last_scanned.elapsed() {
+                    if let Some(remaining) = MIN_COPY_PERIOD.checked_sub(elapsed) {
+                        use rand::Rng;
+
+                        // Time hasn't gone backward, and we have to
+                        // wait at least for the `remaining` duration
+                        // to elapse.  Do that, plus a random
+                        // additional delay of up to `MIN_COPY_PERIOD`
+                        // to jitter things a bit.
+                        let jitter =
+                            MIN_COPY_PERIOD.mul_f64(rand::thread_rng().gen_range(0.0..1.0));
+                        std::thread::sleep(remaining + jitter);
+                    }
+                }
+
                 state.signaled.store(false, Ordering::Relaxed);
                 state.last_scanned.store_now();
                 let stale = state.stale.swap(false, Ordering::Relaxed);
@@ -1363,7 +1384,7 @@ impl CopierWorker {
                         state.consecutive_failures.store(0, Ordering::Relaxed);
                         state.consecutive_updates.fetch_add(1, Ordering::Relaxed);
 
-                        let now = std::time::SystemTime::now();
+                        let now = SystemTime::now();
                         state.last_success.store(now);
                         state.last_update.store(now);
                     }
