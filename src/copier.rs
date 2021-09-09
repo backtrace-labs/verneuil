@@ -1186,14 +1186,6 @@ impl CopierWorker {
             did_something |= self
                 .handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
                 .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))?;
-
-            // We've done some work here (handled a non-empty
-            // "ready" directory).  If the governor isn't
-            // immediately ready for us, bail and let another
-            // directory make progress.
-            if self.governor.check().is_err() {
-                return Ok(did_something);
-            }
         }
 
         // Opportunistically try to copy from the "staging"
