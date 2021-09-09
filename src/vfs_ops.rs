@@ -60,7 +60,7 @@ extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> SqliteCode {
     // If the file doesn't have a name, or the fd is invalid, we can't
     // track it.  Assume that's by design, and let the caller handle
     // that state itself.
-    if file.path == std::ptr::null() || file.fd < 0 {
+    if file.path.is_null() || file.fd < 0 {
         return SqliteCode::Ok;
     }
 
