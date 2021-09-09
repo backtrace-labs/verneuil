@@ -39,6 +39,7 @@ blake2b_simd = { version = "0.5", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 governor = { version = "0.3", default-features = false, features = ["std", "jitter"] }  # 0.3 doesn't build without "jitter"
+itertools = "0.10"
 lazy_static = "1"
 lru = { version = "0.6", default-features = false }  # Disable hashbrown
 percent-encoding = "2"

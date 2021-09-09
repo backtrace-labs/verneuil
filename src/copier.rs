@@ -109,6 +109,12 @@ const COPY_LOCK_CONTENTION_WAIT: Duration = Duration::from_secs(2);
 /// is misbehaving.
 const COPY_LOCK_RESET_RATE: f64 = 0.01;
 
+/// List this many files in a directory before trying to consume them
+/// all.  That's helpful because consuming files is much slower than
+/// adding new ones, so it's easy for a copier to get stuck consuming
+/// from an apparently neverending directory of files.
+const CONSUME_DIRECTORY_BATCH_SIZE: usize = 10;
+
 /// We aim for ~30 requests / second.  We shouldn't need more than five
 /// worker threads to achieve that, with additional sleeping / backoff.
 const WORKER_COUNT: usize = 5;
@@ -449,31 +455,40 @@ fn consume_directory(
 
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
     let mut consume_files = |dirents: std::fs::ReadDir, to_consume: &mut PathBuf| {
-        for name in dirents.flatten().map(|dirent| dirent.file_name()) {
-            to_consume.push(&name);
-            let file_or = File::open(&to_consume).map_err(|e| {
-                filtered_io_error!(e,
+        use itertools::Itertools;
+
+        for names in &dirents
+            .flatten()
+            .map(|dirent| dirent.file_name())
+            .chunks(CONSUME_DIRECTORY_BATCH_SIZE)
+        {
+            // Force eager evaluation for each chunk of files
+            for name in names.collect::<Vec<_>>() {
+                to_consume.push(&name);
+                let file_or = File::open(&to_consume).map_err(|e| {
+                    filtered_io_error!(e,
                                        ErrorKind::NotFound => Level::DEBUG,
                                        "failed to open file to copy", path=?to_consume)
-            });
-            if let Ok(contents) = file_or {
-                if consumer(&name, contents)
-                    .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
-                    .is_ok()
-                    && delete_file
-                {
-                    // Attempt to remove the file.  It's ok if
-                    // this fails: either someone else removed
-                    // the file, or `ensure_directory_removed`
-                    // will fail, correctly signaling failure.
-                    drop_result!(std::fs::remove_file(&to_consume),
+                });
+                if let Ok(contents) = file_or {
+                    if consumer(&name, contents)
+                        .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
+                        .is_ok()
+                        && delete_file
+                    {
+                        // Attempt to remove the file.  It's ok if
+                        // this fails: either someone else removed
+                        // the file, or `ensure_directory_removed`
+                        // will fail, correctly signaling failure.
+                        drop_result!(std::fs::remove_file(&to_consume),
                                      e => filtered_io_error!(
                                          e, ErrorKind::NotFound => Level::DEBUG,
                                          "failed to remove consumed file", path=?to_consume));
+                    }
                 }
-            }
 
-            to_consume.pop();
+                to_consume.pop();
+            }
         }
     };
 
