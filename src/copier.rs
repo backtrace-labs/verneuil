@@ -1022,6 +1022,7 @@ impl CopierWorker {
 
         let _span = info_span!("handle_staging_directory", ?targets, ?parent);
 
+        let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
         let chunks_directory = replication_buffer::directory_chunks(staging.clone());
         let meta_directory = replication_buffer::directory_meta(staging);
@@ -1057,7 +1058,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
-                None,
+                Some(&ready_directory),
             )?;
         }
 
@@ -1089,12 +1090,9 @@ impl CopierWorker {
         // exist, either that didn't happen, or another copier already
         // replicated its contents.  Either way, it's safe to copy the
         // meta files (unless they have changed).
-        {
-            let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
-            if !directory_is_empty_or_absent(&ready_directory)? {
-                tracing::info!(?ready_directory, "ready directory exists");
-                return Ok(false);
-            }
+        if !directory_is_empty_or_absent(&ready_directory)? {
+            tracing::info!(?ready_directory, "ready directory exists");
+            return Ok(false);
         }
 
         let mut did_something = false;
