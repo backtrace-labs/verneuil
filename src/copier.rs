@@ -1175,18 +1175,11 @@ impl CopierWorker {
             drop_result!(std::fs::remove_dir(&ready),
                          e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                                  "failed to remove ready directory", ?ready));
-        } else {
-            // Failures are expected when concurrent processes
-            // or copiers work on the same `path`.  Even when
-            // `handle_directory` fails, we're either making
-            // progress, or `path` is in a bad state and we
-            // choose to keep it untouched rather than drop
-            // data that we have failed to copy to the
-            // replication targets.
-            did_something |= self
-                .handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
-                .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))?;
         }
+
+        did_something |= self
+            .handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
+            .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))?;
 
         // Opportunistically try to copy from the "staging"
         // directory.  That's never staler than "ready", so we do
