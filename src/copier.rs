@@ -444,10 +444,15 @@ enum ConsumeDirectoryPolicy {
 /// Finally, ensures the `to_consume` directory is gone if the policy
 /// is `RemoveFilesAndDirectory`; on success, this implies that every
 /// file in it has been consumed.
+///
+/// When `stop_if_exists` is provided, periodically checks whether
+/// that directory exists and contains files.  If it does, stops
+/// consuming files.
 fn consume_directory(
     mut to_consume: PathBuf,
     mut consumer: impl FnMut(&OsStr, File) -> Result<()>,
     policy: ConsumeDirectoryPolicy,
+    stop_if_exists: Option<&Path>,
 ) -> Result<()> {
     use ConsumeDirectoryPolicy::*;
 
@@ -488,6 +493,13 @@ fn consume_directory(
                 }
 
                 to_consume.pop();
+            }
+
+            // Break out early if the `stop_if_exists` path contains files.
+            if let Some(path) = stop_if_exists {
+                if !matches!(directory_is_empty_or_absent(path), Ok(true)) {
+                    break;
+                }
             }
         }
     };
@@ -835,7 +847,7 @@ fn force_full_snapshot(state: &CopierSpoolState) {
     let staging = replication_buffer::mutable_staging_directory(state.spool_path.to_path_buf());
     let meta_directory = replication_buffer::directory_meta(staging);
     drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
-                                   ConsumeDirectoryPolicy::RemoveFiles),
+                                   ConsumeDirectoryPolicy::RemoveFiles, None),
                  e => chain_error!(e, "failed to delete staged meta files", ?state.spool_path));
 }
 
@@ -950,6 +962,7 @@ impl CopierWorker {
                     copy_file(name, &mut file, &chunks_buckets)
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
+                None,
             )?;
         }
 
@@ -980,6 +993,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
+                None,
             )?;
         }
 
@@ -1043,6 +1057,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
+                None,
             )?;
         }
 
@@ -1056,6 +1071,7 @@ impl CopierWorker {
                 Ok(())
             },
             ConsumeDirectoryPolicy::KeepAll,
+            None,
         )?;
 
         // We must now make sure that we have published all the chunks
@@ -1131,6 +1147,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::KeepAll,
+                None,
             )?;
         }
 
