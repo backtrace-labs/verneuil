@@ -450,9 +450,10 @@ fn consume_directory(
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
     match std::fs::read_dir(&to_consume) {
         Ok(dirents) => {
-            for file in dirents.flatten() {
-                let name = file.file_name();
-
+            for name in dirents
+                .flatten()
+                .map(|dirent| dirent.file_name().to_owned())
+            {
                 to_consume.push(&name);
                 let file_or = File::open(&to_consume).map_err(|e| {
                     filtered_io_error!(e,
