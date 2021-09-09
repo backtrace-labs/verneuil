@@ -448,38 +448,38 @@ fn consume_directory(
     let _span = debug_span!("consume_directory", ?to_consume, ?policy);
 
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
-    match std::fs::read_dir(&to_consume) {
-        Ok(dirents) => {
-            for name in dirents
-                .flatten()
-                .map(|dirent| dirent.file_name().to_owned())
-            {
-                to_consume.push(&name);
-                let file_or = File::open(&to_consume).map_err(|e| {
-                    filtered_io_error!(e,
+    let mut consume_files = |dirents: std::fs::ReadDir, to_consume: &mut PathBuf| {
+        for name in dirents.flatten().map(|dirent| dirent.file_name()) {
+            to_consume.push(&name);
+            let file_or = File::open(&to_consume).map_err(|e| {
+                filtered_io_error!(e,
                                        ErrorKind::NotFound => Level::DEBUG,
                                        "failed to open file to copy", path=?to_consume)
-                });
-                if let Ok(contents) = file_or {
-                    if consumer(&name, contents)
-                        .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
-                        .is_ok()
-                        && delete_file
-                    {
-                        // Attempt to remove the file.  It's ok if
-                        // this fails: either someone else removed
-                        // the file, or `ensure_directory_removed`
-                        // will fail, correctly signaling failure.
-                        drop_result!(std::fs::remove_file(&to_consume),
+            });
+            if let Ok(contents) = file_or {
+                if consumer(&name, contents)
+                    .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
+                    .is_ok()
+                    && delete_file
+                {
+                    // Attempt to remove the file.  It's ok if
+                    // this fails: either someone else removed
+                    // the file, or `ensure_directory_removed`
+                    // will fail, correctly signaling failure.
+                    drop_result!(std::fs::remove_file(&to_consume),
                                      e => filtered_io_error!(
                                          e, ErrorKind::NotFound => Level::DEBUG,
                                          "failed to remove consumed file", path=?to_consume));
-                    }
                 }
-
-                to_consume.pop();
             }
 
+            to_consume.pop();
+        }
+    };
+
+    match std::fs::read_dir(&to_consume) {
+        Ok(dirents) => {
+            consume_files(dirents, &mut to_consume);
             if policy == RemoveFilesAndDirectory {
                 // If we can't get rid of that directory, it must be
                 // non-empty, which means we failed to consume some
