@@ -274,7 +274,8 @@ struct CopierBackend {
         Receiver<Arc<CopierSpoolState>>,
     ),
     maintenance: Receiver<ActiveSetMaintenance>,
-    workers: Sender<Arc<CopierSpoolState>>,
+    // Channel for edge-triggered work units.
+    edge_workers: Sender<Arc<CopierSpoolState>>,
     periodic_lag_scan: Receiver<std::time::Instant>,
     // Map from PathBuf for spool directories to their state.
     // The key is always equal to the value's `path` field.
@@ -395,7 +396,7 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
 
             let (_send, recv) = crossbeam_channel::bounded(1);
             CopierWorker {
-                work: recv,
+                edge_work: recv,
                 governor,
             }
         };
@@ -812,7 +813,9 @@ impl FileIdentifier {
 
 #[derive(Debug)]
 struct CopierWorker {
-    work: Receiver<Arc<CopierSpoolState>>,
+    // Edge-triggered work units, enqueued at the end of a sqlite
+    // transaction.
+    edge_work: Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
 }
 
@@ -1355,7 +1358,7 @@ impl CopierWorker {
     fn worker_loop(&self) {
         use std::time::SystemTime;
 
-        while let Ok(state) = self.work.recv() {
+        while let Ok(state) = self.edge_work.recv() {
             // This variable will be populated with `Some(closure)` if
             // we want to touch replicated chunks with a patrol scan,
             // outside the critical section.
@@ -1516,10 +1519,10 @@ impl CopierBackend {
             &Default::default(),
         ));
 
-        let (worker_send, worker_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (edge_send, edge_recv) = crossbeam_channel::bounded(channel_capacity);
         for _ in 0..worker_count.max(1) {
             let worker = CopierWorker {
-                work: worker_recv.clone(),
+                edge_work: edge_recv.clone(),
                 governor: governor.clone(),
             };
 
@@ -1533,7 +1536,7 @@ impl CopierBackend {
             ready_buffers: buf_recv,
             stale_buffers: crossbeam_channel::bounded(channel_capacity),
             maintenance: maintenance_recv,
-            workers: worker_send,
+            edge_workers: edge_send,
             periodic_lag_scan: crossbeam_channel::tick(REPLICATION_LAG_REPORT_PERIOD),
             active_spool_paths: HashMap::new(),
         };
@@ -1547,7 +1550,7 @@ impl CopierBackend {
     #[instrument]
     fn send_work(&self, work: Arc<CopierSpoolState>) -> Option<Arc<CopierSpoolState>> {
         use crossbeam_channel::TrySendError::*;
-        match self.workers.try_send(work) {
+        match self.edge_workers.try_send(work) {
             Ok(_) => None,
             Err(Full(work)) => Some(work),
             Err(Disconnected(_)) => panic!("workers disconnected"),
