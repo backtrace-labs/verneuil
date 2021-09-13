@@ -264,15 +264,6 @@ struct CopierSpoolLagInfo {
 #[derive(Debug)]
 struct CopierBackend {
     ready_buffers: Receiver<Arc<PathBuf>>,
-    // When the backend newly detects that replicated data is late, it
-    // queues it up for a copy in the `stale_buffers` channel.  We use
-    // dedicated channels instead of overloading `ready_buffer` to
-    // preserve fairness: we don't want currently up-to-date replicas
-    // to keep falling behind until they're detected as stale.
-    stale_buffers: (
-        Sender<Arc<CopierSpoolState>>,
-        Receiver<Arc<CopierSpoolState>>,
-    ),
     maintenance: Receiver<ActiveSetMaintenance>,
     // Channel for edge-triggered work units.
     edge_workers: Sender<Arc<CopierSpoolState>>,
@@ -1557,7 +1548,6 @@ impl CopierBackend {
 
         let backend = CopierBackend {
             ready_buffers: buf_recv,
-            stale_buffers: crossbeam_channel::bounded(channel_capacity),
             maintenance: maintenance_recv,
             edge_workers,
             lag_workers,
@@ -1709,10 +1699,6 @@ impl CopierBackend {
                 },
                 // Errors only happen when there is no more sender.
                 // That means the worker should shut down.
-                Err(_) => return false,
-            },
-            recv(self.stale_buffers.1) -> stale => match stale {
-                Ok(stale) => self.queue_active_state(&stale),
                 Err(_) => return false,
             },
             recv(self.maintenance) -> maintenance => match maintenance {
