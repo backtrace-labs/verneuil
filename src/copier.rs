@@ -1360,6 +1360,84 @@ impl CopierWorker {
     fn worker_loop(&self) {
         use std::time::SystemTime;
 
+        let handle = |state: &CopierSpoolState, upload_state: &mut CopierUploadState| {
+            let last_scanned = state.last_scanned.load();
+
+            // Check if we have to pause because we're scanning
+            // the same directory too frequently.
+            if let Ok(elapsed) = last_scanned.elapsed() {
+                if let Some(remaining) = MIN_COPY_PERIOD.checked_sub(elapsed) {
+                    use rand::Rng;
+
+                    // Time hasn't gone backward, and we have to
+                    // wait at least for the `remaining` duration
+                    // to elapse.  Do that, plus a random
+                    // additional delay of up to `MIN_COPY_PERIOD`
+                    // to jitter things a bit.
+                    let jitter = MIN_COPY_PERIOD.mul_f64(rand::thread_rng().gen_range(0.0..1.0));
+                    std::thread::sleep(remaining + jitter);
+                }
+            }
+
+            state.signaled.store(false, Ordering::Relaxed);
+            state.last_scanned.store_now();
+            let stale = state.stale.swap(false, Ordering::Relaxed);
+            match self.handle_spooling_directory(
+                upload_state,
+                stale,
+                &state.spool_path,
+                /*sleep_on_credential_failure=*/ true,
+            ) {
+                Ok(true) => {
+                    state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
+                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                    state.consecutive_updates.fetch_add(1, Ordering::Relaxed);
+
+                    let now = SystemTime::now();
+                    state.last_success.store(now);
+                    state.last_update.store(now);
+                }
+                Ok(false) => {
+                    state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
+                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                    state.consecutive_updates.store(0, Ordering::Relaxed);
+
+                    state.last_success.store_now();
+                }
+                Err(e) => {
+                    let _ =
+                        chain_info!(e, "failed to handle spooling directory", ?state.spool_path);
+                    state.consecutive_successes.store(0, Ordering::Relaxed);
+                    state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                    state.consecutive_updates.store(0, Ordering::Relaxed);
+
+                    state.last_failure.store_now();
+                }
+            }
+
+            if last_scanned > SystemTime::UNIX_EPOCH {
+                let spool_path = state.spool_path.clone();
+                let source = state.source.clone();
+
+                Some(move |this: &CopierWorker| {
+                    if let Err(e) = this.patrol_touch_chunks(
+                        &spool_path,
+                        &source,
+                        SystemTime::now()
+                            .duration_since(last_scanned)
+                            .unwrap_or_default(),
+                    ) {
+                        let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
+                                                db=?source, ?spool_path);
+
+                        force_full_snapshot(&spool_path, &source);
+                    }
+                })
+            } else {
+                None
+            }
+        };
+
         let get = || {
             crossbeam_channel::select! {
                 recv(self.edge_work) -> ret => ret,
@@ -1375,79 +1453,7 @@ impl CopierWorker {
             let mut follow_up_work = None;
 
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
-                let last_scanned = state.last_scanned.load();
-
-                // Check if we have to pause because we're scanning
-                // the same directory too frequently.
-                if let Ok(elapsed) = last_scanned.elapsed() {
-                    if let Some(remaining) = MIN_COPY_PERIOD.checked_sub(elapsed) {
-                        use rand::Rng;
-
-                        // Time hasn't gone backward, and we have to
-                        // wait at least for the `remaining` duration
-                        // to elapse.  Do that, plus a random
-                        // additional delay of up to `MIN_COPY_PERIOD`
-                        // to jitter things a bit.
-                        let jitter =
-                            MIN_COPY_PERIOD.mul_f64(rand::thread_rng().gen_range(0.0..1.0));
-                        std::thread::sleep(remaining + jitter);
-                    }
-                }
-
-                state.signaled.store(false, Ordering::Relaxed);
-                state.last_scanned.store_now();
-                let stale = state.stale.swap(false, Ordering::Relaxed);
-                match self.handle_spooling_directory(
-                    &mut upload_state,
-                    stale,
-                    &state.spool_path,
-                    /*sleep_on_credential_failure=*/ true,
-                ) {
-                    Ok(true) => {
-                        state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-                        state.consecutive_failures.store(0, Ordering::Relaxed);
-                        state.consecutive_updates.fetch_add(1, Ordering::Relaxed);
-
-                        let now = SystemTime::now();
-                        state.last_success.store(now);
-                        state.last_update.store(now);
-                    }
-                    Ok(false) => {
-                        state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-                        state.consecutive_failures.store(0, Ordering::Relaxed);
-                        state.consecutive_updates.store(0, Ordering::Relaxed);
-
-                        state.last_success.store_now();
-                    }
-                    Err(e) => {
-                        let _ = chain_info!(e, "failed to handle spooling directory", ?state.spool_path);
-                        state.consecutive_successes.store(0, Ordering::Relaxed);
-                        state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
-                        state.consecutive_updates.store(0, Ordering::Relaxed);
-
-                        state.last_failure.store_now();
-                    }
-                }
-
-                if last_scanned > SystemTime::UNIX_EPOCH {
-                    let spool_path = state.spool_path.clone();
-                    let source = state.source.clone();
-
-                    follow_up_work = Some(move |this: &CopierWorker| {
-                        if let Err(e) = this.patrol_touch_chunks(
-                            &spool_path,
-                            &source,
-                            SystemTime::now()
-                                .duration_since(last_scanned)
-                                .unwrap_or_default(),
-                        ) {
-                            let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
-                                                db=?source, ?spool_path);
-
-                            force_full_snapshot(&spool_path, &source);
-                        }
-                    });
-                }
+                follow_up_work = handle(&state, &mut *upload_state);
             }
 
             if let Some(work) = follow_up_work {
