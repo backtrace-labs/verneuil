@@ -1360,6 +1360,10 @@ impl CopierWorker {
     fn worker_loop(&self) {
         use std::time::SystemTime;
 
+        // We remember the last buffer we failed to copy, and retry it
+        // roughly every RETRY_PERIOD if there's nothing else to do.
+        const RETRY_PERIOD: Duration = Duration::from_secs(1);
+
         let handle = |state: &CopierSpoolState, upload_state: &mut CopierUploadState| {
             let last_scanned = state.last_scanned.load();
 
@@ -1438,22 +1442,47 @@ impl CopierWorker {
             }
         };
 
-        let get = || {
+        // We remember the last state that we failed to copy because
+        // we couldn't get its copy lock, and retry until success.
+        let mut queued: Option<Arc<CopierSpoolState>> = None;
+        let mut rng = rand::thread_rng();
+        let mut get = |queued: &mut Option<Arc<CopierSpoolState>>| {
+            use rand::Rng;
+
+            let queued_channel = if queued.is_none() {
+                crossbeam_channel::never()
+            } else {
+                // This is an internal retry that's not really
+                // observable externally.  Make sure to jitter, but
+                // not worth parameterising.
+                crossbeam_channel::after(RETRY_PERIOD.mul_f64(rng.gen_range(1.0..2.0)))
+            };
             crossbeam_channel::select! {
                 recv(self.edge_work) -> ret => ret,
                 recv(self.lag_work) -> ret => ret,
                 recv(self.maintenance_work) -> ret => ret,
+                // `queued_channel` is `never()` when `queued == None`,
+                // so the body must be successful.
+                recv(queued_channel) -> _ => Ok(queued.take().expect("must have data")),
             }
         };
 
-        while let Ok(state) = get() {
+        while let Ok(state) = get(&mut queued) {
             // This variable will be populated with `Some(closure)` if
             // we want to touch replicated chunks with a patrol scan,
             // outside the critical section.
             let mut follow_up_work = None;
+            let mut success = false;
 
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 follow_up_work = handle(&state, &mut *upload_state);
+                success = true;
+            }
+
+            if !success {
+                // If we failed to acquire the copy lock, we'll keep
+                // retrying the last failure.
+                queued = Some(state);
             }
 
             if let Some(work) = follow_up_work {
