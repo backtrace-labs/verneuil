@@ -1356,6 +1356,11 @@ impl CopierWorker {
         use std::time::SystemTime;
 
         while let Ok(state) = self.work.recv() {
+            // This variable will be populated with `Some(closure)` if
+            // we want to touch replicated chunks with a patrol scan,
+            // outside the critical section.
+            let mut follow_up_work = None;
+
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
                 let last_scanned = state.last_scanned.load();
 
@@ -1412,21 +1417,28 @@ impl CopierWorker {
                 }
 
                 if last_scanned > SystemTime::UNIX_EPOCH {
-                    let spool_path = &state.spool_path;
-                    let source = &state.source;
-                    if let Err(e) = self.patrol_touch_chunks(
-                        spool_path,
-                        source,
-                        SystemTime::now()
-                            .duration_since(last_scanned)
-                            .unwrap_or_default(),
-                    ) {
-                        let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
-                                            db=?source, ?spool_path);
+                    let spool_path = state.spool_path.clone();
+                    let source = state.source.clone();
 
-                        force_full_snapshot(spool_path, source);
-                    }
+                    follow_up_work = Some(move |this: &CopierWorker| {
+                        if let Err(e) = this.patrol_touch_chunks(
+                            &spool_path,
+                            &source,
+                            SystemTime::now()
+                                .duration_since(last_scanned)
+                                .unwrap_or_default(),
+                        ) {
+                            let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
+                                                db=?source, ?spool_path);
+
+                            force_full_snapshot(&spool_path, &source);
+                        }
+                    });
                 }
+            }
+
+            if let Some(work) = follow_up_work {
+                work(self);
             }
         }
     }
