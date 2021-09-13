@@ -1450,21 +1450,21 @@ impl CopierSpoolState {
         use std::time::SystemTime;
 
         let (key, source_file_ctime, replicated_file_ctime, sqlite_headers_match) = {
-            let path = &self.source;
-            let stat = path.metadata().map_err(|e| {
+            let key = self.source.clone();
+            let stat = key.metadata().map_err(|e| {
                 filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                        "failed to stat source db file")
             })?;
             let source_ctime = SystemTime::UNIX_EPOCH
                 + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
 
-            let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
+            let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, &key)?;
             let (fprint, ctime) = parse_manifest_info(&tap_file)?;
 
-            let headers_match = match File::open(&path) {
+            let headers_match = match File::open(&key) {
                 Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
                 Err(e) => {
-                    let _ = chain_info!(e, "failed to open source file", ?path);
+                    let _ = chain_info!(e, "failed to open source file", ?key);
                     false
                 }
             };
@@ -1473,7 +1473,7 @@ impl CopierSpoolState {
                 self.stale.store(true, Ordering::Relaxed);
             }
 
-            (path.clone(), source_ctime, ctime, headers_match)
+            (key, source_ctime, ctime, headers_match)
         };
 
         Ok((
