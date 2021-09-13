@@ -389,7 +389,7 @@ fn replace_slashes(input: &str) -> String {
 }
 
 /// Reverses `replace_slashes`.
-fn restore_slashes(input: &str) -> Result<String> {
+pub(crate) fn restore_slashes(input: &str) -> Result<String> {
     let slashified = input.replace("#", "/");
 
     Ok(percent_encoding::percent_decode_str(&slashified)

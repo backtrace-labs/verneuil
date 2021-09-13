@@ -188,7 +188,7 @@ struct CopierUploadState {
 #[derive(Debug, Default)]
 struct CopierSpoolState {
     spool_path: Arc<PathBuf>,
-    source: Option<PathBuf>,
+    source: PathBuf,
     // Refcount for this spool state.
     count: AtomicUsize,
 
@@ -838,10 +838,8 @@ fn force_full_snapshot(state: &CopierSpoolState) {
     }
 
     // Mess with the sqlite file's version id if we can.
-    if let Some(path) = &state.source {
-        drop_result!(reset_db_file_id(&path),
-                     e => chain_error!(e, "failed to clear version id", ?path));
-    }
+    drop_result!(reset_db_file_id(&state.source),
+                 e => chain_error!(e, "failed to clear version id", ?state.source));
 
     // And now delete all (manifest) files in staging/meta.
     let staging = replication_buffer::mutable_staging_directory(state.spool_path.to_path_buf());
@@ -1268,13 +1266,7 @@ impl CopierWorker {
         use rand::Rng;
 
         let spool_path = &*spool_state.spool_path;
-        let source = match &spool_state.source {
-            Some(source) => source,
-            None => {
-                tracing::debug!(?spool_path, ?spool_state, "source db file unknown");
-                return Ok(());
-            }
-        };
+        let source = &spool_state.source;
 
         // Stop touching the dependencies once the source file has
         // been deleted.
@@ -1439,6 +1431,17 @@ impl CopierWorker {
     }
 }
 
+/// Returns the path for the source db given the spool directory path.
+fn source_db_for_spool(spool_path: &Path) -> Result<PathBuf> {
+    let file_name = spool_path
+        .file_name()
+        .ok_or_else(|| fresh_warn!("Spool path does not have a final component", ?spool_path))?
+        .to_str()
+        .ok_or_else(|| fresh_warn!("Final spool path component is not valid utf-8", ?spool_path))?;
+
+    Ok(replication_buffer::restore_slashes(file_name)?.into())
+}
+
 impl CopierSpoolState {
     /// Returns a pair of (key, lag info).  The key is the source db
     /// file if it is known, and the mangled replication path otherwise.
@@ -1446,40 +1449,32 @@ impl CopierSpoolState {
         use std::os::unix::fs::MetadataExt;
         use std::time::SystemTime;
 
-        let (key, source_file_ctime, replicated_file_ctime, sqlite_headers_match) =
-            if let Some(path) = &self.source {
-                let stat = path.metadata().map_err(|e| {
-                    filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+        let (key, source_file_ctime, replicated_file_ctime, sqlite_headers_match) = {
+            let path = &self.source;
+            let stat = path.metadata().map_err(|e| {
+                filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                        "failed to stat source db file")
-                })?;
-                let source_ctime = SystemTime::UNIX_EPOCH
-                    + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
+            })?;
+            let source_ctime = SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
 
-                let tap_file =
-                    replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
-                let (fprint, ctime) = parse_manifest_info(&tap_file)?;
+            let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, path)?;
+            let (fprint, ctime) = parse_manifest_info(&tap_file)?;
 
-                let headers_match = match File::open(&path) {
-                    Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
-                    Err(e) => {
-                        let _ = chain_info!(e, "failed to open source file", ?path);
-                        false
-                    }
-                };
-
-                if source_ctime > ctime && !headers_match {
-                    self.stale.store(true, Ordering::Relaxed);
+            let headers_match = match File::open(&path) {
+                Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
+                Err(e) => {
+                    let _ = chain_info!(e, "failed to open source file", ?path);
+                    false
                 }
-
-                (path.clone(), source_ctime, ctime, headers_match)
-            } else {
-                (
-                    Path::new(self.spool_path.file_name().unwrap_or_default()).to_path_buf(),
-                    SystemTime::UNIX_EPOCH,
-                    SystemTime::UNIX_EPOCH,
-                    false,
-                )
             };
+
+            if source_ctime > ctime && !headers_match {
+                self.stale.store(true, Ordering::Relaxed);
+            }
+
+            (path.clone(), source_ctime, ctime, headers_match)
+        };
 
         Ok((
             key,
@@ -1671,6 +1666,23 @@ impl CopierBackend {
             },
             recv(self.maintenance) -> maintenance => match maintenance {
                 Ok(Join(spool_path, source_or)) => {
+                    let mut source = match source_db_for_spool(&spool_path) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            tracing::warn!(?spool_path, ?err, "failed to decode source db path");
+                            return true;
+                        }
+                    };
+
+                    if let Some(path) = &source_or {
+                        if path != &source {
+                            tracing::warn!(?spool_path, ?source, ?path, "registering a new CopierSpoolState with a mismatching source path");
+                            // Override with what the caller says, but
+                            // this shouldn't happen.
+                            source = path.to_owned();
+                        }
+                    }
+
                     self.active_spool_paths
                         .entry(spool_path.clone())
                         .or_insert_with(|| {
@@ -1679,13 +1691,13 @@ impl CopierBackend {
                             // always have a source.  It's only later
                             // clones that lack the source path.
                             if source_or.is_none() {
-                                tracing::warn!(?spool_path,
+                                tracing::warn!(?spool_path, ?source,
                                                "registering a new CopierSpoolState without a source path.");
                             }
 
                             Arc::new(CopierSpoolState{
                                 spool_path,
-                                source: source_or,
+                                source,
                                 ..Default::default()
                             })
                         })
