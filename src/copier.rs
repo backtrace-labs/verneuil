@@ -276,6 +276,8 @@ struct CopierBackend {
     maintenance: Receiver<ActiveSetMaintenance>,
     // Channel for edge-triggered work units.
     edge_workers: Sender<Arc<CopierSpoolState>>,
+    // Channel for work units triggered by replication lag.
+    lag_workers: Sender<Arc<CopierSpoolState>>,
     // Channel for background maintenance work units.
     maintenance_workers: Sender<Arc<CopierSpoolState>>,
     periodic_lag_scan: Receiver<std::time::Instant>,
@@ -399,6 +401,7 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
             let (_send, recv) = crossbeam_channel::bounded(1);
             CopierWorker {
                 edge_work: recv.clone(),
+                lag_work: recv.clone(),
                 maintenance_work: recv,
                 governor,
             }
@@ -819,6 +822,8 @@ struct CopierWorker {
     // Edge-triggered work units, enqueued at the end of a sqlite
     // transaction.
     edge_work: Receiver<Arc<CopierSpoolState>>,
+    // Work units in reaction to noticing replication lag.
+    lag_work: Receiver<Arc<CopierSpoolState>>,
     // Maintenance work units, enqueued periodically, for background
     // scans.
     maintenance_work: Receiver<Arc<CopierSpoolState>>,
@@ -1367,6 +1372,7 @@ impl CopierWorker {
         let get = || {
             crossbeam_channel::select! {
                 recv(self.edge_work) -> ret => ret,
+                recv(self.lag_work) -> ret => ret,
                 recv(self.maintenance_work) -> ret => ret,
             }
         };
@@ -1533,10 +1539,12 @@ impl CopierBackend {
         ));
 
         let (edge_workers, edge_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (lag_workers, lag_recv) = crossbeam_channel::bounded(channel_capacity);
         let (maintenance_workers, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
         for _ in 0..worker_count.max(1) {
             let worker = CopierWorker {
                 edge_work: edge_recv.clone(),
+                lag_work: lag_recv.clone(),
                 maintenance_work: maintenance_recv.clone(),
                 governor: governor.clone(),
             };
@@ -1552,6 +1560,7 @@ impl CopierBackend {
             stale_buffers: crossbeam_channel::bounded(channel_capacity),
             maintenance: maintenance_recv,
             edge_workers,
+            lag_workers,
             maintenance_workers,
             periodic_lag_scan: crossbeam_channel::tick(REPLICATION_LAG_REPORT_PERIOD),
             active_spool_paths: HashMap::new(),
@@ -1599,7 +1608,7 @@ impl CopierBackend {
 
                 // Accumulate states that are newly detected as stale
                 // in the `newly_stale` vector: we want to push them to
-                // the `stale_buffers` channel.
+                // the `lag_workers` channel.
                 if !old_stale && spool_state.stale.load(Ordering::Relaxed) {
                     newly_stale.push(spool_state.clone());
                 }
@@ -1614,7 +1623,7 @@ impl CopierBackend {
             // Sending only fails because the queue is full.  That's
             // not worth complaining about: in the worst case, the
             // background scan will get to this spool directory.
-            let _ = self.stale_buffers.0.try_send(state);
+            let _ = self.lag_workers.try_send(state);
         }
 
         let mut num_maybe_stale = 0usize;
