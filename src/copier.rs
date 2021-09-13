@@ -276,6 +276,8 @@ struct CopierBackend {
     maintenance: Receiver<ActiveSetMaintenance>,
     // Channel for edge-triggered work units.
     edge_workers: Sender<Arc<CopierSpoolState>>,
+    // Channel for background maintenance work units.
+    maintenance_workers: Sender<Arc<CopierSpoolState>>,
     periodic_lag_scan: Receiver<std::time::Instant>,
     // Map from PathBuf for spool directories to their state.
     // The key is always equal to the value's `path` field.
@@ -396,7 +398,8 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
 
             let (_send, recv) = crossbeam_channel::bounded(1);
             CopierWorker {
-                edge_work: recv,
+                edge_work: recv.clone(),
+                maintenance_work: recv,
                 governor,
             }
         };
@@ -816,6 +819,9 @@ struct CopierWorker {
     // Edge-triggered work units, enqueued at the end of a sqlite
     // transaction.
     edge_work: Receiver<Arc<CopierSpoolState>>,
+    // Maintenance work units, enqueued periodically, for background
+    // scans.
+    maintenance_work: Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
 }
 
@@ -1358,7 +1364,14 @@ impl CopierWorker {
     fn worker_loop(&self) {
         use std::time::SystemTime;
 
-        while let Ok(state) = self.edge_work.recv() {
+        let get = || {
+            crossbeam_channel::select! {
+                recv(self.edge_work) -> ret => ret,
+                recv(self.maintenance_work) -> ret => ret,
+            }
+        };
+
+        while let Ok(state) = get() {
             // This variable will be populated with `Some(closure)` if
             // we want to touch replicated chunks with a patrol scan,
             // outside the critical section.
@@ -1519,10 +1532,12 @@ impl CopierBackend {
             &Default::default(),
         ));
 
-        let (edge_send, edge_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (edge_workers, edge_recv) = crossbeam_channel::bounded(channel_capacity);
+        let (maintenance_workers, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
         for _ in 0..worker_count.max(1) {
             let worker = CopierWorker {
                 edge_work: edge_recv.clone(),
+                maintenance_work: maintenance_recv.clone(),
                 governor: governor.clone(),
             };
 
@@ -1536,7 +1551,8 @@ impl CopierBackend {
             ready_buffers: buf_recv,
             stale_buffers: crossbeam_channel::bounded(channel_capacity),
             maintenance: maintenance_recv,
-            edge_workers: edge_send,
+            edge_workers,
+            maintenance_workers,
             periodic_lag_scan: crossbeam_channel::tick(REPLICATION_LAG_REPORT_PERIOD),
             active_spool_paths: HashMap::new(),
         };
@@ -1548,9 +1564,12 @@ impl CopierBackend {
     /// Returns None on success, `work` if the channel is full, and
     /// panics if the workers disconnected.
     #[instrument]
-    fn send_work(&self, work: Arc<CopierSpoolState>) -> Option<Arc<CopierSpoolState>> {
+    fn send_work(
+        dst: &Sender<Arc<CopierSpoolState>>,
+        work: Arc<CopierSpoolState>,
+    ) -> Option<Arc<CopierSpoolState>> {
         use crossbeam_channel::TrySendError::*;
-        match self.edge_workers.try_send(work) {
+        match dst.try_send(work) {
             Ok(_) => None,
             Err(Full(work)) => Some(work),
             Err(Disconnected(_)) => panic!("workers disconnected"),
@@ -1645,7 +1664,7 @@ impl CopierBackend {
             // Flip the flag to true before the worker can
             // reset it.
             state.signaled.store(true, Ordering::Relaxed);
-            if self.send_work(state.clone()).is_some() {
+            if Self::send_work(&self.edge_workers, state.clone()).is_some() {
                 // If we failed to send work, clear
                 // the flag ourself and try again.
                 state.signaled.store(false, Ordering::Relaxed);
@@ -1781,7 +1800,7 @@ impl CopierBackend {
                     // and the background scan is our catch-all fix for such
                     // liveness bugs.
                     state.signaled.store(true, Ordering::Relaxed);
-                    if let Some(state) = self.send_work(state) {
+                    if let Some(state) = Self::send_work(&self.maintenance_workers, state) {
                         state.signaled.store(false, Ordering::Relaxed);
                         // Push pack to the `active_set` on failure.
                         active_set.push(state);
@@ -1808,7 +1827,7 @@ impl CopierBackend {
             // to scan directories twice during shutdown.
             if let Some(state) = self.active_spool_paths.remove(&ready) {
                 if !state.signaled.load(Ordering::Relaxed) {
-                    self.send_work(state);
+                    Self::send_work(&self.edge_workers, state);
                 }
             }
         }
@@ -1817,7 +1836,7 @@ impl CopierBackend {
         for state in shuffle_active_set(&self.active_spool_paths, &mut rng) {
             let _span = info_span!("handle_requests_shutdown_bg_scan", ?state);
             if !state.signaled.load(Ordering::Relaxed) {
-                self.send_work(state);
+                Self::send_work(&self.maintenance_workers, state);
             }
         }
     }
