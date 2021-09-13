@@ -1449,37 +1449,28 @@ impl CopierSpoolState {
         use std::os::unix::fs::MetadataExt;
         use std::time::SystemTime;
 
-        let (key, source_file_ctime, replicated_file_ctime, sqlite_headers_match) = {
-            let key = self.source.clone();
-            let stat = key.metadata().map_err(|e| {
-                filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
-                                       "failed to stat source db file")
-            })?;
-            let source_file_ctime = SystemTime::UNIX_EPOCH
-                + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
+        let key = self.source.clone();
+        let stat = key.metadata().map_err(|e| {
+            filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+                               "failed to stat source db file")
+        })?;
+        let source_file_ctime = SystemTime::UNIX_EPOCH
+            + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
 
-            let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, &key)?;
-            let (fprint, replicated_file_ctime) = parse_manifest_info(&tap_file)?;
+        let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, &key)?;
+        let (fprint, replicated_file_ctime) = parse_manifest_info(&tap_file)?;
 
-            let sqlite_headers_match = match File::open(&key) {
-                Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
-                Err(e) => {
-                    let _ = chain_info!(e, "failed to open source file", ?key);
-                    false
-                }
-            };
-
-            if source_file_ctime > replicated_file_ctime && !sqlite_headers_match {
-                self.stale.store(true, Ordering::Relaxed);
+        let sqlite_headers_match = match File::open(&key) {
+            Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
+            Err(e) => {
+                let _ = chain_info!(e, "failed to open source file", ?key);
+                false
             }
-
-            (
-                key,
-                source_file_ctime,
-                replicated_file_ctime,
-                sqlite_headers_match,
-            )
         };
+
+        if source_file_ctime > replicated_file_ctime && !sqlite_headers_match {
+            self.stale.store(true, Ordering::Relaxed);
+        }
 
         Ok((
             key,
