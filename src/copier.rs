@@ -1703,7 +1703,7 @@ impl CopierBackend {
                 },
                 Err(_) => return false,
             },
-        recv(self.periodic_lag_scan) -> _ => self.scan_for_replication_lag(),
+            recv(self.periodic_lag_scan) -> _ => self.scan_for_replication_lag(),
             default(timeout) => {},
         }
 
