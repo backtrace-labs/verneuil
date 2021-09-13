@@ -819,7 +819,7 @@ struct CopierWorker {
 /// Attempts to force a full snapshot the next time a change `Tracker`
 /// synchronises the db file.
 #[instrument]
-fn force_full_snapshot(state: &CopierSpoolState) {
+fn force_full_snapshot(spool_path: &Path, source: &Path) {
     fn reset_db_file_id(path: &Path) -> Result<()> {
         use std::fs::OpenOptions;
 
@@ -838,15 +838,15 @@ fn force_full_snapshot(state: &CopierSpoolState) {
     }
 
     // Mess with the sqlite file's version id if we can.
-    drop_result!(reset_db_file_id(&state.source),
-                 e => chain_error!(e, "failed to clear version id", ?state.source));
+    drop_result!(reset_db_file_id(source),
+                 e => chain_error!(e, "failed to clear version id", ?source));
 
     // And now delete all (manifest) files in staging/meta.
-    let staging = replication_buffer::mutable_staging_directory(state.spool_path.to_path_buf());
+    let staging = replication_buffer::mutable_staging_directory(spool_path.to_owned());
     let meta_directory = replication_buffer::directory_meta(staging);
     drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
                                    ConsumeDirectoryPolicy::RemoveFiles, None),
-                 e => chain_error!(e, "failed to delete staged meta files", ?state.spool_path));
+                 e => chain_error!(e, "failed to delete staged meta files", ?spool_path));
 }
 
 /// Waits for the meta copy lock on the spooling directory at
@@ -1259,14 +1259,12 @@ impl CopierWorker {
     #[instrument]
     fn patrol_touch_chunks(
         &self,
-        spool_state: &CopierSpoolState,
+        spool_path: &Path,
+        source: &Path,
         time_since_last_patrol: Duration,
     ) -> Result<()> {
         use rand::seq::SliceRandom;
         use rand::Rng;
-
-        let spool_path = &*spool_state.spool_path;
-        let source = &spool_state.source;
 
         // Stop touching the dependencies once the source file has
         // been deleted.
@@ -1414,16 +1412,19 @@ impl CopierWorker {
                 }
 
                 if last_scanned > SystemTime::UNIX_EPOCH {
+                    let spool_path = &state.spool_path;
+                    let source = &state.source;
                     if let Err(e) = self.patrol_touch_chunks(
-                        &state,
+                        spool_path,
+                        source,
                         SystemTime::now()
                             .duration_since(last_scanned)
                             .unwrap_or_default(),
                     ) {
                         let _ = chain_warn!(e, "failed to touch chunks. forcing a full snapshot.",
-                                            db=?state.source, ?state.spool_path);
+                                            db=?source, ?spool_path);
 
-                        force_full_snapshot(&state);
+                        force_full_snapshot(spool_path, source);
                     }
                 }
             }
