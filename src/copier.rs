@@ -1595,6 +1595,7 @@ impl CopierBackend {
         use rand::prelude::SliceRandom;
 
         let mut newly_stale = Vec::new();
+        let mut consistently_stale = Vec::new();
 
         let stats: BTreeMap<String, CopierSpoolLagInfo> = self
             .active_spool_paths
@@ -1606,11 +1607,14 @@ impl CopierBackend {
                     chain_error!(e, "failed to extract replication lag info", ?spool_state)
                 })?;
 
-                // Accumulate states that are newly detected as stale
-                // in the `newly_stale` vector: we want to push them to
-                // the `lag_workers` channel.
-                if !old_stale && spool_state.stale.load(Ordering::Relaxed) {
-                    newly_stale.push(spool_state.clone());
+                // Accumulate stale states in vectors: we want to push
+                // them to the `lag_workers` channel.
+                if spool_state.stale.load(Ordering::Relaxed) {
+                    if old_stale {
+                        consistently_stale.push(spool_state.clone());
+                    } else {
+                        newly_stale.push(spool_state.clone());
+                    }
                 }
 
                 Ok((k.to_string_lossy().into_owned(), v))
@@ -1623,6 +1627,13 @@ impl CopierBackend {
             // Sending only fails because the queue is full.  That's
             // not worth complaining about: in the worst case, the
             // background scan will get to this spool directory.
+            let _ = self.lag_workers.try_send(state);
+        }
+
+        // Queue up states that have been stale for a while if there's
+        // still room.
+        consistently_stale.shuffle(&mut rand::thread_rng());
+        for state in consistently_stale {
             let _ = self.lag_workers.try_send(state);
         }
 
