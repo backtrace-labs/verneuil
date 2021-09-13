@@ -1455,13 +1455,13 @@ impl CopierSpoolState {
                 filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                        "failed to stat source db file")
             })?;
-            let source_ctime = SystemTime::UNIX_EPOCH
+            let source_file_ctime = SystemTime::UNIX_EPOCH
                 + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
 
             let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, &key)?;
-            let (fprint, ctime) = parse_manifest_info(&tap_file)?;
+            let (fprint, replicated_file_ctime) = parse_manifest_info(&tap_file)?;
 
-            let headers_match = match File::open(&key) {
+            let sqlite_headers_match = match File::open(&key) {
                 Ok(file) => crate::manifest_schema::fingerprint_sqlite_header(&file) == fprint,
                 Err(e) => {
                     let _ = chain_info!(e, "failed to open source file", ?key);
@@ -1469,11 +1469,16 @@ impl CopierSpoolState {
                 }
             };
 
-            if source_ctime > ctime && !headers_match {
+            if source_file_ctime > replicated_file_ctime && !sqlite_headers_match {
                 self.stale.store(true, Ordering::Relaxed);
             }
 
-            (key, source_ctime, ctime, headers_match)
+            (
+                key,
+                source_file_ctime,
+                replicated_file_ctime,
+                sqlite_headers_match,
+            )
         };
 
         Ok((
