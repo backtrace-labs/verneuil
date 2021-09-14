@@ -352,7 +352,10 @@ impl Copier {
     pub fn new_with_capacity(channel_capacity: usize) -> Copier {
         let (mut backend, buf_send, maintenance_send) =
             CopierBackend::new(WORKER_COUNT, channel_capacity);
-        std::thread::spawn(move || backend.handle_requests());
+        std::thread::Builder::new()
+            .name("verneuil-copier-backend".to_string())
+            .spawn(move || backend.handle_requests())
+            .expect("failed to spawn copier backend thread");
 
         let ret = Copier {
             ready_buffers: buf_send,
@@ -1567,7 +1570,7 @@ impl CopierBackend {
         let (edge_workers, edge_recv) = crossbeam_channel::bounded(channel_capacity);
         let (lag_workers, lag_recv) = crossbeam_channel::bounded(channel_capacity);
         let (maintenance_workers, maintenance_recv) = crossbeam_channel::bounded(channel_capacity);
-        for _ in 0..worker_count.max(1) {
+        for i in 0..worker_count.max(1) {
             let worker = CopierWorker {
                 edge_work: edge_recv.clone(),
                 lag_work: lag_recv.clone(),
@@ -1575,7 +1578,10 @@ impl CopierBackend {
                 governor: governor.clone(),
             };
 
-            std::thread::spawn(move || worker.worker_loop());
+            std::thread::Builder::new()
+                .name(format!("verneuil-copier-worker/{}", i))
+                .spawn(move || worker.worker_loop())
+                .expect("failed to spawn copier worker thread");
         }
 
         let (buf_send, buf_recv) = crossbeam_channel::bounded(channel_capacity);

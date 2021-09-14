@@ -62,6 +62,7 @@ pub(crate) struct Loader {
 lazy_static::lazy_static! {
     static ref LOADER_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
         .num_threads(LOADER_POOL_SIZE)
+        .thread_name(|i| format!("verneuil-load-worker/{}", i))
         .build()
         .expect("failed to build global loader pool");
 }
