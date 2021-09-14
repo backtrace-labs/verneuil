@@ -1498,8 +1498,10 @@ impl CopierWorker {
 /// Returns the path for the source db given the spool directory path.
 fn source_db_for_spool(spool_path: &Path) -> Result<PathBuf> {
     let file_name = spool_path
+        .parent()
+        .ok_or_else(|| fresh_warn!("Spool path does not have an inode component", ?spool_path))?
         .file_name()
-        .ok_or_else(|| fresh_warn!("Spool path does not have a final component", ?spool_path))?
+        .ok_or_else(|| fresh_warn!("Spool path does not have a path component", ?spool_path))?
         .to_str()
         .ok_or_else(|| fresh_warn!("Final spool path component is not valid utf-8", ?spool_path))?;
 
