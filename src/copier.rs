@@ -819,8 +819,10 @@ struct CopierWorker {
     edge_work: Receiver<Arc<CopierSpoolState>>,
     // Work units in reaction to noticing replication lag.
     lag_work: Receiver<Arc<CopierSpoolState>>,
-    // Maintenance work units, enqueued periodically, for background
-    // scans.
+    // Maintenance work units, enqueued periodically for background
+    // scans.  Some workers should not process maintenance work, and
+    // are instead dedicated to edge and lag triggered work.  For such
+    // workers, `maintenance_work` is `crossbeam_channel::never()`.
     maintenance_work: Receiver<Arc<CopierSpoolState>>,
     governor: Arc<Governor>,
 }
@@ -1577,7 +1579,14 @@ impl CopierBackend {
             let worker = CopierWorker {
                 edge_work: edge_recv.clone(),
                 lag_work: lag_recv.clone(),
-                maintenance_work: maintenance_recv.clone(),
+                // Don't look for background maintenance work in 1/2
+                // (arbitrary fraction) of the workers: let them focus
+                // on edge- or lag-triggered work we know has value.
+                maintenance_work: if i < worker_count / 2 {
+                    crossbeam_channel::never()
+                } else {
+                    maintenance_recv.clone()
+                },
                 governor: governor.clone(),
             };
 
