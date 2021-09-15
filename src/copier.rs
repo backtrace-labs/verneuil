@@ -115,9 +115,10 @@ const COPY_LOCK_RESET_RATE: f64 = 0.01;
 /// from an apparently neverending directory of files.
 const CONSUME_DIRECTORY_BATCH_SIZE: usize = 10;
 
-/// We aim for ~30 requests / second.  We shouldn't need more than five
-/// worker threads to achieve that, with additional sleeping / backoff.
-const WORKER_COUNT: usize = 5;
+/// We aim for ~30 requests / second.  We've seen a p99 of ~300 ms per
+/// PUT, so 10 workers should be enough, even with additional sleeping
+/// and backoff.
+const WORKER_COUNT: usize = 10;
 
 /// How many of the last manifest files we have uploaded must we
 /// remember?  This memory lets us avoid repeated uploads of the
