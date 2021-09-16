@@ -22,6 +22,9 @@ use crate::replication_target::ReplicationTarget;
 use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
 
+/// How long to wait for a request before giving up and trying again.
+const LOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How many times do we retry on transient load errors?
 const LOAD_RETRY_LIMIT: i32 = 3;
 
@@ -339,6 +342,7 @@ fn create_source(
                 bucket.set_path_style();
             }
 
+            bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
             Ok(bucket)
         }
     }
@@ -356,13 +360,36 @@ fn load_from_cache(prefix: &Path, name: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Invokes `timed` and checks how long that call took.  If the time
+/// exceeds the time limit, invokes `slow_logger` before returning as
+/// usual.
+fn call_with_slow_logging<T>(
+    limit: Duration,
+    timed: impl FnOnce() -> T,
+    slow_logger: impl FnOnce(Duration),
+) -> T {
+    let start = std::time::Instant::now();
+    let ret = timed();
+
+    let elapsed = start.elapsed();
+    if elapsed >= limit {
+        slow_logger(elapsed);
+    }
+
+    ret
+}
+
 /// Attempts to load the blob `name` from `source`.
 fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
     use rand::Rng;
 
     let mut rng = rand::thread_rng();
     for i in 0..=LOAD_RETRY_LIMIT {
-        match source.get_object(name) {
+        match call_with_slow_logging(
+            LOAD_REQUEST_TIMEOUT,
+            || source.get_object(name),
+            |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
+        ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
             Ok((_, 404)) => return Ok(None),
             Ok((body, code)) if code < 500 && code != 429 => {
