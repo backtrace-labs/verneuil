@@ -86,6 +86,11 @@ const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 /// spooling directory (background or otherwise).
 const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
 
+/// Wait up to this long for credentials HTTP requests.  The limit
+/// doesn't really matter, as long as we eventually stop waiting:
+/// we usually get a response in milliseconds.
+const CREDENTIALS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// When we fail to find credentials, sleep for at least this long
 /// before trying again: it's not particularly useful to log that we
 /// couldn't acquire credentials multiple times a second, especially
@@ -1202,6 +1207,8 @@ impl CopierWorker {
         sleep_on_credential_failure: bool,
     ) -> Result<bool> {
         let mut did_something = false;
+
+        s3::creds::set_request_timeout(Some(CREDENTIALS_REQUEST_TIMEOUT));
         let creds = Credentials::default().map_err(|e| {
             use rand::Rng;
 
