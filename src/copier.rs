@@ -254,6 +254,11 @@ struct CopierSpoolLagInfo {
     // to the source file, although its bytes might differ.
     sqlite_headers_match: bool,
 
+    // true if the `CopierSpoolState::upload_lock` is currently taken.
+    // This indicates that the spool directory is currently being
+    // copied.
+    locked: bool,
+
     // time of the last copier scan
     #[serde(skip_serializing_if = "is_epoch")]
     last_scanned: DateTime,
@@ -1623,6 +1628,8 @@ impl CopierSpoolState {
                 source_file_ctime: source_file_ctime.into(),
                 replicated_file_ctime: replicated_file_ctime.into(),
                 sqlite_headers_match,
+
+                locked: self.upload_lock.try_lock().is_err(),
                 last_scanned: self.last_scanned.load().into(),
 
                 consecutive_successes: self.consecutive_successes.load(Ordering::Relaxed),
