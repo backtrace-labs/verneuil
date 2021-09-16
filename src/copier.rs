@@ -611,6 +611,25 @@ fn create_target(
     }
 }
 
+/// Invokes `timed` and checks how long that call took.  If the time
+/// exceeds the time limit, invokes `slow_logger` before returning as
+/// usual.
+fn call_with_slow_logging<T>(
+    limit: Duration,
+    timed: impl FnOnce() -> T,
+    slow_logger: impl FnOnce(Duration),
+) -> T {
+    let start = std::time::Instant::now();
+    let ret = timed();
+
+    let elapsed = start.elapsed();
+    if elapsed >= limit {
+        slow_logger(elapsed);
+    }
+
+    ret
+}
+
 /// Attempts to publish the `contents` to `name` in all `targets`.
 #[instrument(level = "debug")]
 fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
@@ -631,7 +650,11 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
 
     for target in targets {
         for i in 0..=COPY_RETRY_LIMIT {
-            match target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE) {
+            match call_with_slow_logging(
+                Duration::from_secs(10),
+                || target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE),
+                |duration| tracing::info!(?duration, ?blob_name, len = bytes.len(), "slow S3 PUT"),
+            ) {
                 Ok((_, code)) if (200..300).contains(&code) => {
                     break;
                 }
@@ -713,7 +736,11 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
         target.add_header(METADATA_DIRECTIVE, METADATA_DIRECTIVE_VALUE);
 
         for i in 0..=COPY_RETRY_LIMIT {
-            match target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE) {
+            match call_with_slow_logging(
+                Duration::from_secs(10),
+                || target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE),
+                |duration| tracing::info!(?duration, ?blob_name, "slow S3 COPY"),
+            ) {
                 Ok((_, code)) if (200..300).contains(&code) => {
                     break;
                 }
@@ -1217,19 +1244,30 @@ impl CopierWorker {
                                                  "failed to remove ready directory", ?ready));
         }
 
-        did_something |= self
-            .handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
-            .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))?;
+        did_something |= call_with_slow_logging(
+            Duration::from_secs(60),
+            || {
+                self.handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
+                    .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))
+            },
+            |duration| tracing::info!(?duration, ?spool, "slow handle_ready_directory"),
+        )?;
 
         // Opportunistically try to copy from the "staging"
         // directory.  That's never staler than "ready", so we do
         // not go backward in our replication.
-        match self.handle_staging_directory(
-            state,
-            stale,
-            &targets,
-            creds.clone(),
-            spool.to_path_buf(),
+        match call_with_slow_logging(
+            Duration::from_secs(60),
+            || {
+                self.handle_staging_directory(
+                    state,
+                    stale,
+                    &targets,
+                    creds.clone(),
+                    spool.to_path_buf(),
+                )
+            },
+            |duration| tracing::info!(?duration, ?spool, "slow handle_staging_directory"),
         ) {
             Ok(ret) => did_something |= ret,
             Err(e) => {
@@ -1247,7 +1285,11 @@ impl CopierWorker {
         // the "ready" directory must be at least as recent as
         // what we found in staging, so, again, replication
         // cannot go backwards.
-        match self.handle_ready_directory(&targets, creds, spool.to_path_buf()) {
+        match call_with_slow_logging(
+            Duration::from_secs(60),
+            || self.handle_ready_directory(&targets, creds, spool.to_path_buf()),
+            |duration| tracing::info!(?duration, ?spool, "slow re-handle_ready_directory"),
+        ) {
             Ok(ret) => did_something |= ret,
             Err(e) => {
                 if !did_something {
@@ -1392,11 +1434,17 @@ impl CopierWorker {
             state.signaled.store(false, Ordering::Relaxed);
             state.last_scanned.store_now();
             let stale = state.stale.swap(false, Ordering::Relaxed);
-            match self.handle_spooling_directory(
-                upload_state,
-                stale,
-                &state.spool_path,
-                /*sleep_on_credential_failure=*/ true,
+            match call_with_slow_logging(
+                Duration::from_secs(60),
+                || {
+                    self.handle_spooling_directory(
+                        upload_state,
+                        stale,
+                        &state.spool_path,
+                        /*sleep_on_credential_failure=*/ true,
+                    )
+                },
+                |duration| tracing::info!(?duration, spool=?state.spool_path, "slow handle_spooling_directory"),
             ) {
                 Ok(true) => {
                     state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
@@ -1485,14 +1533,18 @@ impl CopierWorker {
                 success = true;
             }
 
+            if let Some(work) = follow_up_work {
+                call_with_slow_logging(
+                    Duration::from_secs(60),
+                    || work(self),
+                    |duration| tracing::info!(?duration, spool=?state.spool_path, "slow follow_up_work"),
+                );
+            }
+
             if !success {
                 // If we failed to acquire the copy lock, we'll keep
                 // retrying the last failure.
                 queued = Some(state);
-            }
-
-            if let Some(work) = follow_up_work {
-                work(self);
             }
         }
     }
