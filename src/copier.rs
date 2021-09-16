@@ -68,6 +68,11 @@ const SYNCHRONOUS_COPY_RATE_QUOTA: governor::Quota =
 /// delay to our sleep duration.
 const RATE_LIMIT_SLEEP_JITTER_FRAC: f64 = 1.0;
 
+/// We upload 64KB chunks, so uploads should be fast.  Impose
+/// a short timeout after which we should abort the request
+/// and try again.
+const COPY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How many times do we retry on transient errors?
 const COPY_RETRY_LIMIT: i32 = 3;
 
@@ -611,6 +616,7 @@ fn create_target(
                 ensure_bucket_exists(&bucket)?;
             }
 
+            bucket.set_request_timeout(Some(COPY_REQUEST_TIMEOUT));
             Ok(bucket)
         }
     }
