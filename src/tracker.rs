@@ -102,7 +102,7 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
 }
 
 impl Tracker {
-    #[instrument]
+    #[instrument(err)]
     pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker> {
         use std::os::unix::io::FromRawFd;
 
@@ -159,7 +159,7 @@ impl Tracker {
     /// immediately after acquiring an exclusive lock on the tracked
     /// file, and lets us remember the file's version before we change
     /// it.
-    #[instrument]
+    #[instrument(skip(self))]
     pub fn note_exclusive_lock(&mut self) {
         if !self.previous_version_id.is_empty() {
             return;
@@ -173,7 +173,7 @@ impl Tracker {
 
     /// Notes that we are about to update the tracked file, and
     /// that bytes in [offset, offset + count) are about to change.
-    #[instrument(level = "trace")]
+    #[instrument(level = "trace", skip(self))]
     pub fn flag_write(&mut self, buf: *const u8, offset: u64, count: u64) {
         // Attempt to update the version id xattr if this is the
         // first write since our last snapshot.
@@ -223,7 +223,7 @@ impl Tracker {
     /// Snapshots all the 64KB chunks in the tracked file, and returns
     /// the file's size as well, a list of chunk fingerprints, and the
     /// number of chunks that were actually snapshotted.
-    #[instrument]
+    #[instrument(skip(self, base), err)]
     fn snapshot_chunks(
         &self,
         repl: &ReplicationBuffer,
@@ -394,7 +394,7 @@ impl Tracker {
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
-    #[instrument]
+    #[instrument(skip(self), err)]
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
@@ -608,7 +608,7 @@ impl Tracker {
     /// it exists.
     ///
     /// Must be called with a read lock held on the underlying file.
-    #[instrument]
+    #[instrument(skip(self), err)]
     pub fn snapshot(&mut self) -> Result<()> {
         let ret = (|| {
             if let Some(buffer) = &self.buffer {
@@ -646,7 +646,7 @@ impl Tracker {
     /// Performs test-only checks before a transaction's initial lock
     /// acquisition.
     #[inline]
-    #[instrument]
+    #[instrument(skip(self))]
     pub fn pre_lock_checks(&self) {
         #[cfg(feature = "test_validate_reads")]
         if let Some(buffer) = &self.buffer {

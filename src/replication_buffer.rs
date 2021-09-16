@@ -235,7 +235,7 @@ pub(crate) fn set_default_spooling_directory(
 /// scratch directory.
 ///
 /// On success, returns the temporary file and the scratch directory's path.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, PathBuf)> {
     let mut scratch = spool_dir;
     scratch.push(STAGING);
@@ -256,7 +256,7 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
 /// Returns the .tap path for `source_db`'s manifest proto file,
 /// given the path prefix for spooling directories (or None to use
 /// the global default).
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 pub(crate) fn tapped_meta_path_in_spool_prefix(
     spool_prefix: Option<PathBuf>,
     source_db: &Path,
@@ -275,7 +275,7 @@ pub(crate) fn tapped_meta_path_in_spool_prefix(
 }
 
 /// Returns the .tap path for `source_db`'s manifest proto file, given the file's `spool_dir`.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> Result<PathBuf> {
     // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to the prefix, `...`.
     let base = spool_dir
@@ -288,7 +288,7 @@ pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> 
 }
 
 /// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &File) -> Result<()> {
     use rand::Rng;
     use std::os::unix::io::AsRawFd;
@@ -355,7 +355,7 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
 ///
 /// Returns a File object that owns the lock on success (dropping that
 /// file will release the lock), None on acquisition failure.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<OfdLock>> {
     let mut lock_path = spool_dir;
     lock_path.push(DOT_META_COPY_LOCK);
@@ -365,7 +365,7 @@ pub(crate) fn acquire_meta_copy_lock(spool_dir: PathBuf) -> Result<Option<OfdLoc
 }
 
 /// Clears the meta copy lock's state for `spool_dir`.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 pub(crate) fn reset_meta_copy_lock(spool_dir: PathBuf) -> Result<()> {
     let mut lock_path = spool_dir;
     lock_path.push(DOT_META_COPY_LOCK);
@@ -425,7 +425,7 @@ fn db_file_key(fd: &File) -> Result<String> {
 
 /// Attempts to delete all directories in the parent of `goal_path`
 /// except `goal_path`.
-#[instrument]
+#[instrument(err)]
 fn delete_stale_directories(goal_path: &Path) -> Result<()> {
     let mut parent = goal_path.to_owned();
     if !parent.pop() {
@@ -454,7 +454,7 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
 
 /// Attempts to delete all directories in `parent` that refer to a file
 /// that does not exist anymore.
-#[instrument]
+#[instrument(err)]
 fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
     for subdir in std::fs::read_dir(&parent)
         .map_err(|e| chain_info!(e, "failed to list parent directory", ?parent))?
@@ -506,6 +506,7 @@ fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
 /// publishes it to `target` on success.
 ///
 /// Returns Ok(()) if the target file exists.
+#[instrument(skip(worker), err)]
 fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) -> Result<()> {
     use std::os::unix::io::FromRawFd;
 
@@ -515,7 +516,6 @@ fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) 
         fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
     }
 
-    let _span = tracing::info_span!("call_with_temp_file", ?target);
     if target.exists() {
         return Ok(());
     }
@@ -632,7 +632,7 @@ pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
 
 /// Attempts to read a valid Manifest message from `file_path`.
 /// Returns Ok(None) if the file does not exist.
-#[instrument(level = "trace")]
+#[instrument(level = "trace", err)]
 fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
     use prost::Message;
 
@@ -681,7 +681,7 @@ pub(crate) fn mutable_ready_directory(parent: PathBuf) -> PathBuf {
 /// a file object that must be kept alive to ensure the path is valid.
 ///
 /// Returns Ok(None) if the directory does not exist.
-#[instrument(level = "trace")]
+#[instrument(level = "trace", err)]
 pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBuf, File)>> {
     use std::os::unix::io::FromRawFd;
 
@@ -714,7 +714,7 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
 
 /// Attempts to remove the "ready" subdirectory of `parent`, if it is
 /// empty.
-#[instrument(level = "trace")]
+#[instrument(level = "trace", err)]
 pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
     let mut ready = parent;
     ready.push(READY);
@@ -775,7 +775,7 @@ impl ReplicationBuffer {
     ///
     /// Returns `Err` if the replication buffer directory could not be
     /// created.
-    #[instrument]
+    #[instrument(err)]
     pub fn new(db_path: &Path, fd: &File) -> Result<Option<ReplicationBuffer>> {
         use std::sync::atomic::AtomicBool;
 
@@ -881,7 +881,7 @@ impl ReplicationBuffer {
 
     /// Attempts to publish a chunk of data for `fprint`.  This file
     /// might already exist, in which case we don't have to do anything.
-    #[instrument(level = "trace")]
+    #[instrument(level = "trace", err)]
     pub fn stage_chunk(&self, fprint: Fingerprint, data: &[u8]) -> Result<()> {
         use std::io::Write;
 
@@ -899,7 +899,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to overwrite the manifest file for the replicated file.
-    #[instrument]
+    #[instrument(err)]
     pub fn publish_manifest(&self, db_path: &Path, manifest: &Manifest) -> Result<()> {
         use prost::Message;
         use std::io::Write;
@@ -931,7 +931,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current ready manifest file.
-    #[instrument(level = "trace")]
+    #[instrument(level = "trace", err)]
     pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
@@ -941,7 +941,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to parse the current staged manifest file.
-    #[instrument(level = "trace")]
+    #[instrument(level = "trace", err)]
     pub fn read_staged_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
@@ -977,7 +977,7 @@ impl ReplicationBuffer {
     /// spuriously and retry than to publish a partial buffer.
     ///
     /// On success, returns the temporary directory.
-    #[instrument]
+    #[instrument(skip(chunks), err)]
     pub fn prepare_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<TempDir> {
         use tempfile::Builder;
 
@@ -1095,7 +1095,7 @@ impl ReplicationBuffer {
 
     /// Attempts to publish a temporary buffer directory to an empty
     /// or missing "ready" buffer.
-    #[instrument]
+    #[instrument(err)]
     pub fn publish_ready_buffer(&self, ready: TempDir) -> Result<()> {
         let mut target = self.spooling_directory.clone();
         target.push(READY);
@@ -1118,7 +1118,7 @@ impl ReplicationBuffer {
 
     /// Attempts to clean up any chunk file that's not referred by the
     /// `chunks` list.
-    #[instrument]
+    #[instrument(skip(chunks), err)]
     pub fn gc_chunks(&self, chunks: &[Fingerprint]) -> Result<()> {
         let live: HashSet<String> = chunks.iter().map(fingerprint_chunk_name).collect();
 
@@ -1155,7 +1155,7 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to delete all temporary files and directory from "staging/scratch."
-    #[instrument]
+    #[instrument(err)]
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
         fn file_is_stale(path: &Path) -> Result<bool> {
             let meta = std::fs::metadata(path)

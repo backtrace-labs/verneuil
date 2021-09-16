@@ -175,7 +175,7 @@ impl Loader {
     /// and then in `remote`.  The `Loader` always check the sources
     /// in order: low-to-high index in `local`, and then similarly in
     /// `remote`.
-    #[instrument]
+    #[instrument(err)]
     pub(crate) fn new(local: Vec<PathBuf>, remote: &[ReplicationTarget]) -> Result<Loader> {
         let mut remote_sources = Vec::new();
 
@@ -230,7 +230,7 @@ impl Loader {
     /// Attempts to return the bytes for chunk `fprint`.
     ///
     /// Returns Ok(None) if nothing was found.
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip(self), err)]
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
         if fprint == ZERO_FILLED_CHUNK.0 {
             return Ok(Some(ZERO_FILLED_CHUNK.1.clone()));
@@ -311,7 +311,7 @@ fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
     Some(upgraded)
 }
 
-#[instrument(level = "debug", skip(creds, bucket_extractor))]
+#[instrument(level = "debug", skip(creds, bucket_extractor), err)]
 fn create_source(
     source: &ReplicationTarget,
     creds: &Credentials,

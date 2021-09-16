@@ -34,7 +34,7 @@ impl OfdLock {
     ///
     /// Returns Err on IO error, Ok(None) if the lock acquisition
     /// failed, and Ok(Some) on success.
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", err)]
     pub fn try_lock(lock_path: &Path) -> Result<Option<OfdLock>> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;

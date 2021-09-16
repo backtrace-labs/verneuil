@@ -20,7 +20,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug_span;
 use tracing::info_span;
 use tracing::instrument;
 use tracing::Level;
@@ -465,6 +464,7 @@ enum ConsumeDirectoryPolicy {
 /// When `stop_if_exists` is provided, periodically checks whether
 /// that directory exists and contains files.  If it does, stops
 /// consuming files.
+#[instrument(level = "debug", skip(consumer), err)]
 fn consume_directory(
     mut to_consume: PathBuf,
     mut consumer: impl FnMut(&OsStr, File) -> Result<()>,
@@ -472,8 +472,6 @@ fn consume_directory(
     stop_if_exists: Option<&Path>,
 ) -> Result<()> {
     use ConsumeDirectoryPolicy::*;
-
-    let _span = debug_span!("consume_directory", ?to_consume, ?policy);
 
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
     let mut consume_files = |dirents: std::fs::ReadDir, to_consume: &mut PathBuf| {
@@ -541,7 +539,7 @@ fn consume_directory(
 }
 
 /// Creates `bucket` if it does not already exists.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip(bucket), err)]
 fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
     let bucket_location = bucket.location().map_err(|e| {
         chain_debug!(
@@ -578,21 +576,20 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
                                         response=?(response.response_code, response.response_text),
                                         name=?bucket.name(), region=?bucket.region())),
         Err(e) => Err(chain_warn!(e, "failed to create bucket in S3",
-                        name=?bucket.name(), region=?bucket.region())),
+                                  name=?bucket.name(), region=?bucket.region())),
     }
 }
 
 /// Attempts to configure a `Bucket` from a `ReplicationTarget`.  Once
 /// configured, the `Copier` will use the same bucket object to
 /// publish objects.
+#[instrument(level = "debug", skip(bucket_extractor, creds), err)]
 fn create_target(
     target: &ReplicationTarget,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
     creds: Credentials,
 ) -> Result<Bucket> {
     use ReplicationTarget::*;
-
-    let _span = debug_span!("create_target", ?target);
 
     match target {
         S3(s3) => {
@@ -647,7 +644,7 @@ fn call_with_slow_logging<T>(
 }
 
 /// Attempts to publish the `contents` to `name` in all `targets`.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip(targets), err)]
 fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
@@ -738,7 +735,7 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
 /// This function only returns `Err` if we successfully contacted the
 /// remote blob store and something is actively wrong with `blob_name`
 /// (e.g., it doesn't exist).
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip(targets), err)]
 fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
     use rand::Rng;
 
@@ -922,7 +919,7 @@ fn force_full_snapshot(spool_path: &Path, source: &Path) {
 /// as long as copiers can make progress.
 ///
 /// Returns Err on failure, Ok on success or if we waited long enough.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", err)]
 fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<OfdLock>> {
     use rand::Rng;
 
@@ -969,7 +966,7 @@ fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<OfdLock>> {
 
 impl CopierWorker {
     /// Sleeps until the governor lets us fire the next set of API calls.
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip(self))]
     fn pace(&self) {
         use rand::Rng;
 
@@ -991,14 +988,13 @@ impl CopierWorker {
     /// make it possible to rename fresh replication data over it.
     ///
     /// Returns whether we successfully updated the remote snapshot.
+    #[instrument(skip(self, creds), err)]
     fn handle_ready_directory(
         &self,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
-        let _span = info_span!("handle_ready_directory", ?targets, ?parent);
-
         let (ready, _file) = match replication_buffer::snapshot_ready_directory(parent.clone())? {
             Some(ret) => ret,
             None => return Ok(false),
@@ -1071,6 +1067,7 @@ impl CopierWorker {
     ///
     /// This function can only make progress if the caller first
     /// calls `handle_ready_directory`.
+    #[instrument(skip(self, creds), err)]
     fn handle_staging_directory(
         &self,
         state: &mut CopierUploadState,
@@ -1082,8 +1079,6 @@ impl CopierWorker {
         use rand::Rng;
 
         const FORCE_META_PROBABILITY: f64 = 0.05;
-
-        let _span = info_span!("handle_staging_directory", ?targets, ?parent);
 
         let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
@@ -1220,7 +1215,7 @@ impl CopierWorker {
     ///
     /// Returns `Err` on failure, `Ok(true)` if we updated snapshots,
     /// and `Ok(false)` if we successfully did not make progress.
-    #[instrument]
+    #[instrument(skip(self), err)]
     fn handle_spooling_directory(
         &self,
         state: &mut CopierUploadState,
@@ -1338,7 +1333,7 @@ impl CopierWorker {
     ///
     /// Only errors out if we successfully connected to remote storage
     /// and failed to update one of the "touched" chunks.
-    #[instrument]
+    #[instrument(skip(self), err)]
     fn patrol_touch_chunks(
         &self,
         spool_path: &Path,
@@ -1716,7 +1711,7 @@ impl CopierBackend {
     ///
     /// Logs at WARNing level when lag is above the
     /// `REPLICATION_LAG_REPORT_THRESHOLD`.
-    #[instrument]
+    #[instrument(skip(self))]
     fn scan_for_replication_lag(&self) {
         use rand::prelude::SliceRandom;
 
@@ -1820,7 +1815,7 @@ impl CopierBackend {
 
     /// Handles the next request from our channels.  Returns true on
     /// success, false if the worker thread should abort.
-    #[instrument(level = "debug")]
+    #[instrument(level = "debug", skip(self))]
     fn handle_one_request(&mut self, timeout: Duration) -> bool {
         use ActiveSetMaintenance::*;
 

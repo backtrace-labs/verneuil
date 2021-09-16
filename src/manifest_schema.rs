@@ -231,7 +231,7 @@ pub(crate) fn extract_version_id(
 /// that reads the version id always combines it with the file's ctime
 /// and sqlite header, which can mostly be trusted to change whenever
 /// sqlite writes to the file.
-#[instrument]
+#[instrument(err)]
 pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use uuid::adapter::Hyphenated;
@@ -274,7 +274,7 @@ pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>)
 
 /// Erases the version id on `file`.  Change `Tracker`s will have to
 /// rebuild the replication state from scratch.
-#[instrument]
+#[instrument(err)]
 pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
