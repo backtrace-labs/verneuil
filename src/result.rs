@@ -39,6 +39,12 @@ impl Error {
     }
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(fmt, "{:?}", self)
+    }
+}
+
 /// Only exported for macro use
 ///
 /// Computes a backtrace if `level` is severe enough.
