@@ -461,15 +461,14 @@ enum ConsumeDirectoryPolicy {
 /// is `RemoveFilesAndDirectory`; on success, this implies that every
 /// file in it has been consumed.
 ///
-/// When `stop_if_exists` is provided, periodically checks whether
-/// that directory exists and contains files.  If it does, stops
-/// consuming files.
+/// Periodically checks any of the directories in `stop_if_exists`
+/// exist and contain files.  If one does, stops consuming files.
 #[instrument(level = "debug", skip(consumer), err)]
 fn consume_directory(
     mut to_consume: PathBuf,
     mut consumer: impl FnMut(&OsStr, File) -> Result<()>,
     policy: ConsumeDirectoryPolicy,
-    stop_if_exists: Option<&Path>,
+    stop_if_exists: &[&Path],
 ) -> Result<()> {
     use ConsumeDirectoryPolicy::*;
 
@@ -482,6 +481,14 @@ fn consume_directory(
             .map(|dirent| dirent.file_name())
             .chunks(CONSUME_DIRECTORY_BATCH_SIZE)
         {
+            // Break out early if the `stop_if_exists` path contains files.
+            if stop_if_exists
+                .iter()
+                .any(|path| !matches!(directory_is_empty_or_absent(path), Ok(true)))
+            {
+                break;
+            }
+
             // Force eager evaluation for each chunk of files
             for name in names.collect::<Vec<_>>() {
                 to_consume.push(&name);
@@ -508,13 +515,6 @@ fn consume_directory(
                 }
 
                 to_consume.pop();
-            }
-
-            // Break out early if the `stop_if_exists` path contains files.
-            if let Some(path) = stop_if_exists {
-                if !matches!(directory_is_empty_or_absent(path), Ok(true)) {
-                    break;
-                }
             }
         }
     };
@@ -907,7 +907,7 @@ fn force_full_snapshot(spool_path: &Path, source: &Path) {
     let staging = replication_buffer::mutable_staging_directory(spool_path.to_owned());
     let meta_directory = replication_buffer::directory_meta(staging);
     drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
-                                   ConsumeDirectoryPolicy::RemoveFiles, None),
+                                   ConsumeDirectoryPolicy::RemoveFiles, &[]),
                  e => chain_error!(e, "failed to delete staged meta files", ?spool_path));
 }
 
@@ -1021,7 +1021,7 @@ impl CopierWorker {
                     copy_file(name, &mut file, &chunks_buckets)
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
-                None,
+                &[],
             )?;
         }
 
@@ -1052,7 +1052,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
-                None,
+                &[],
             )?;
         }
 
@@ -1116,7 +1116,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
-                Some(&ready_directory),
+                &[&ready_directory],
             )?;
         }
 
@@ -1130,7 +1130,7 @@ impl CopierWorker {
                 Ok(())
             },
             ConsumeDirectoryPolicy::KeepAll,
-            None,
+            &[],
         )?;
 
         // We must now make sure that we have published all the chunks
@@ -1203,7 +1203,7 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::KeepAll,
-                None,
+                &[],
             )?;
         }
 
