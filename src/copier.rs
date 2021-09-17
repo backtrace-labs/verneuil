@@ -541,7 +541,7 @@ fn consume_directory(
 /// Creates `bucket` if it does not already exists.
 #[instrument(level = "debug", skip(bucket), err)]
 fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
-    let bucket_location = bucket.location().map_err(|e| {
+    let bucket_location = bucket.location_blocking().map_err(|e| {
         chain_debug!(
             e,
             "failed to get buccket location",
@@ -554,9 +554,9 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
     }
 
     let result = if bucket.is_subdomain_style() {
-        Bucket::create
+        Bucket::create_blocking
     } else {
-        Bucket::create_with_path_style
+        Bucket::create_with_path_style_blocking
     }(
         &bucket.name(),
         bucket.region(),
@@ -669,14 +669,20 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
         // unconditionally.
         let _ = call_with_slow_logging(
             Duration::from_secs(5),
-            || target.get_object_range(&blob_name, 0, Some(1)),
+            || target.get_object_range_blocking(&blob_name, 0, Some(1)),
             |duration| tracing::info!(?duration, ?blob_name, "slow S3 RANGE GET"),
         );
 
         for i in 0..=COPY_RETRY_LIMIT {
             match call_with_slow_logging(
                 Duration::from_secs(10),
-                || target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE),
+                || {
+                    target.put_object_with_content_type_blocking(
+                        &blob_name,
+                        &bytes,
+                        CHUNK_CONTENT_TYPE,
+                    )
+                },
                 |duration| tracing::info!(?duration, ?blob_name, len = bytes.len(), "slow S3 PUT"),
             ) {
                 Ok((_, code)) if (200..300).contains(&code) => {
@@ -762,7 +768,13 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
         for i in 0..=COPY_RETRY_LIMIT {
             match call_with_slow_logging(
                 Duration::from_secs(10),
-                || target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE),
+                || {
+                    target.put_object_with_content_type_blocking(
+                        &blob_name,
+                        &[],
+                        CHUNK_CONTENT_TYPE,
+                    )
+                },
                 |duration| tracing::info!(?duration, ?blob_name, "slow S3 COPY"),
             ) {
                 Ok((_, code)) if (200..300).contains(&code) => {

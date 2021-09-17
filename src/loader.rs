@@ -387,7 +387,7 @@ fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
     for i in 0..=LOAD_RETRY_LIMIT {
         match call_with_slow_logging(
             LOAD_REQUEST_TIMEOUT,
-            || source.get_object(name),
+            || source.get_object_blocking(name),
             |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
         ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
