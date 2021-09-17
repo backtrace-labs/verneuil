@@ -656,20 +656,34 @@ impl Tracker {
 }
 
 #[cfg(feature = "test_vfs")]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum ChunkSource {
+    Consuming = 0,
+    Ready = 1,
+    Staged = 2,
+}
+
+#[cfg(feature = "test_vfs")]
 impl Tracker {
     fn fetch_snapshot_or_die(
         &self,
         buf: &ReplicationBuffer,
         manifest: &Manifest,
-        from_staging: bool,
+        source: ChunkSource,
     ) -> crate::snapshot::Snapshot {
         let mut local_chunk_dirs = Vec::new();
-        if from_staging {
+        if source >= ChunkSource::Staged {
             local_chunk_dirs.push(buf.staged_chunk_directory());
         }
 
-        local_chunk_dirs.push(buf.ready_chunk_directory());
-        local_chunk_dirs.push(buf.consuming_chunk_directory());
+        if source >= ChunkSource::Ready {
+            local_chunk_dirs.push(buf.ready_chunk_directory());
+        }
+
+        if source >= ChunkSource::Consuming {
+            local_chunk_dirs.push(buf.consuming_chunk_directory());
+        }
+
         crate::snapshot::Snapshot::new(
             local_chunk_dirs,
             &self.replication_targets.replication_targets,
@@ -684,7 +698,7 @@ impl Tracker {
         &self,
         buf: &ReplicationBuffer,
         manifest_or: crate::result::Result<Option<Manifest>>,
-        from_staging: bool,
+        source: ChunkSource,
     ) -> Result<()> {
         let manifest = match manifest_or {
             // If the manifest file can't be found, assume it was
@@ -694,7 +708,7 @@ impl Tracker {
             Err(err) => return Err(err),
         };
 
-        self.fetch_snapshot_or_die(buf, &manifest, from_staging);
+        self.fetch_snapshot_or_die(buf, &manifest, source);
         Ok(())
     }
 
@@ -702,10 +716,20 @@ impl Tracker {
     /// sense (if they exist).
     #[cfg(feature = "test_validate_reads")]
     fn validate_all_snapshots(&self, buf: &ReplicationBuffer) {
-        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), false)
+        self.validate_snapshot(
+            buf,
+            buf.read_consuming_manifest(&self.path),
+            ChunkSource::Consuming,
+        )
+        .expect("consuming snapshot must be valid");
+        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), ChunkSource::Ready)
             .expect("ready snapshot must be valid");
-        self.validate_snapshot(buf, buf.read_staged_manifest(&self.path), true)
-            .expect("staged snapshot must be valid");
+        self.validate_snapshot(
+            buf,
+            buf.read_staged_manifest(&self.path),
+            ChunkSource::Staged,
+        )
+        .expect("staged snapshot must be valid");
     }
 
     /// Attempts to assert that the snapshot's contents match that of
@@ -714,7 +738,13 @@ impl Tracker {
         use blake2b_simd::Params;
         use std::os::unix::io::AsRawFd;
 
-        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), false)
+        self.validate_snapshot(
+            buf,
+            buf.read_consuming_manifest(&self.path),
+            ChunkSource::Consuming,
+        )
+        .expect("consuming snapshot must be valid");
+        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), ChunkSource::Ready)
             .expect("ready snapshot must be valid");
 
         let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
@@ -748,7 +778,7 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
-        let snapshot = self.fetch_snapshot_or_die(buf, &manifest, true);
+        let snapshot = self.fetch_snapshot_or_die(buf, &manifest, ChunkSource::Staged);
         std::io::copy(&mut snapshot.as_read(0, u64::MAX), &mut hasher).expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())

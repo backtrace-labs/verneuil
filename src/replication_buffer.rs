@@ -947,6 +947,16 @@ impl ReplicationBuffer {
         Ok(())
     }
 
+    /// Attempts to parse the current "consuming" manifest file.
+    #[instrument(level = "trace", err)]
+    pub fn read_consuming_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
+        let mut src = self.spooling_directory.clone();
+        src.push(CONSUMING);
+        src.push(META);
+        src.push(&percent_encode_local_path_uri(db_path)?);
+        read_manifest_at_path(&src)
+    }
+
     /// Attempts to parse the current ready manifest file.
     #[instrument(level = "trace", err)]
     pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
