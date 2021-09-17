@@ -691,8 +691,17 @@ pub(crate) fn mutable_ready_directory(parent: PathBuf) -> PathBuf {
     ready
 }
 
+/// Returns the path to the consuming directory under `parent`; it may
+/// be updated concurrently.
+pub(crate) fn mutable_consuming_directory(parent: PathBuf) -> PathBuf {
+    let mut ready = parent;
+    ready.push(CONSUMING);
+    ready
+}
+
 /// Attempts to open a snapshot of the "ready" subdirectory of
-/// `parent`.
+/// `parent`: renames "ready" to "consuming", and opens a snapshot
+/// of that "consuming" directory.
 ///
 /// On success, returns a process-local path to that subdirectory, and
 /// a file object that must be kept alive to ensure the path is valid.
@@ -707,10 +716,23 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
         fn verneuil__open_directory(path: *const c_char) -> i32;
     }
 
-    let ready = mutable_ready_directory(parent);
-    let ready_str = CString::new(ready.as_os_str().as_bytes())
-        .map_err(|e| chain_error!(e, "failed to convert path to C string", ?ready))?;
-    let fd = unsafe { verneuil__open_directory(ready_str.as_ptr()) };
+    let ready = mutable_ready_directory(parent.clone());
+    let consuming = mutable_consuming_directory(parent);
+
+    match std::fs::rename(ready, &consuming) {
+        Ok(()) => {}
+        // It's fine if `ready` does not exist: someone else might
+        // already have renamed it to `consuming`.
+        //
+        // If also fine if we can't rename over `consuming`: that
+        // means there's already something there waiting to be copied.
+        Err(e) if matches!(e.kind(), ErrorKind::AlreadyExists | ErrorKind::NotFound) => {}
+        Err(e) => return Err(chain_error!(e, "failed to acquire new consuming directory")),
+    }
+
+    let consuming_str = CString::new(consuming.as_os_str().as_bytes())
+        .map_err(|e| chain_error!(e, "failed to convert path to C string", ?consuming))?;
+    let fd = unsafe { verneuil__open_directory(consuming_str.as_ptr()) };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
 
@@ -720,8 +742,8 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
 
         return Err(chain_error!(
             error,
-            "failed to open ready directory",
-            ?ready
+            "failed to open consuming directory",
+            ?consuming
         ));
     }
 
@@ -729,17 +751,21 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
     Ok(Some((format!("/proc/self/fd/{}/", fd).into(), file)))
 }
 
-/// Attempts to remove the "ready" subdirectory of `parent`, if it is
-/// empty.
+/// Attempts to remove the "consuming" subdirectory of `parent`, if it
+/// is empty.
 #[instrument(level = "trace", err)]
-pub(crate) fn remove_ready_directory_if_empty(parent: PathBuf) -> Result<()> {
+pub(crate) fn remove_consuming_directory_if_empty(parent: PathBuf) -> Result<()> {
     let mut ready = parent;
-    ready.push(READY);
+    ready.push(CONSUMING);
 
     match std::fs::remove_dir(&ready) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(chain_error!(e, "failed to remove ready directory", ?ready)),
+        Err(e) => Err(chain_error!(
+            e,
+            "failed to remove consuming directory",
+            ?ready
+        )),
     }
 }
 

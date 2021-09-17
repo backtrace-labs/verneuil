@@ -982,10 +982,16 @@ impl CopierWorker {
         }
     }
 
-    /// Handles one "ready" directory: copy the contents, and delete
-    /// the corresponding files and directory as we go.  Once *everything*
-    /// has been copied, the directory will be empty, which will
-    /// make it possible to rename fresh replication data over it.
+    /// Handles one "ready" directory: rename it to "consuming", copy
+    /// the contents, and delete the corresponding files and
+    /// directories as we go.
+    ///
+    /// Renaming the "ready" directory makes it possible for change
+    /// `Tracker`s to publish a new "ready" directory immediately.
+    ///
+    /// Once *everything* has been copied, the "consuming" directory
+    /// will be empty, which will make it possible to rename a fresher
+    /// "ready" snapshot over it.
     ///
     /// Returns whether we successfully updated the remote snapshot.
     #[instrument(skip(self, creds), err)]
@@ -995,7 +1001,8 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
-        let (ready, _file) = match replication_buffer::snapshot_ready_directory(parent.clone())? {
+        let (consuming, _file) = match replication_buffer::snapshot_ready_directory(parent.clone())?
+        {
             Some(ret) => ret,
             None => return Ok(false),
         };
@@ -1015,7 +1022,7 @@ impl CopierWorker {
             }
 
             consume_directory(
-                replication_buffer::directory_chunks(ready.clone()),
+                replication_buffer::directory_chunks(consuming.clone()),
                 |name, mut file| {
                     self.pace();
                     copy_file(name, &mut file, &chunks_buckets)
@@ -1041,7 +1048,7 @@ impl CopierWorker {
 
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
-                replication_buffer::directory_meta(ready),
+                replication_buffer::directory_meta(consuming),
                 |name, mut file| {
                     self.pace();
                     copy_file(name, &mut file, &meta_buckets)?;
@@ -1056,9 +1063,9 @@ impl CopierWorker {
             )?;
         }
 
-        // And now try to get rid of the hopefully empty directory.
-        drop_result!(replication_buffer::remove_ready_directory_if_empty(parent),
-                     e => chain_info!(e, "failed to clean up ready directory"));
+        // And now try to get rid of the hopefully consuming directory.
+        drop_result!(replication_buffer::remove_consuming_directory_if_empty(parent),
+                     e => chain_info!(e, "failed to clean up consuming directory"));
         Ok(did_something)
     }
 
@@ -1080,6 +1087,7 @@ impl CopierWorker {
 
         const FORCE_META_PROBABILITY: f64 = 0.05;
 
+        let consuming_directory = replication_buffer::mutable_consuming_directory(parent.clone());
         let ready_directory = replication_buffer::mutable_ready_directory(parent.clone());
         let staging = replication_buffer::mutable_staging_directory(parent.clone());
         let chunks_directory = replication_buffer::directory_chunks(staging.clone());
@@ -1116,12 +1124,12 @@ impl CopierWorker {
                     Ok(())
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
-                &[&ready_directory],
+                &[&ready_directory, &consuming_directory],
             )?;
         }
 
-        // Snapshot the current meta files.  We hang on to the file to prevent
-        // inode reuse.
+        // Snapshot the current meta files.  We hang on to the `File`s
+        // to prevent inode reuse.
         let mut initial_meta: HashMap<std::ffi::OsString, (FileIdentifier, File)> = HashMap::new();
         consume_directory(
             meta_directory.clone(),
@@ -1140,19 +1148,33 @@ impl CopierWorker {
             return Ok(false);
         }
 
-        // If the "ready" directory now exists, we may have observed an
-        // empty `chunks_directory` because a Tracker cleared everything
-        // once the data to replicate was in "ready."
-        //
-        // However, if we now observe that the ready directory doesn't
-        // exist, either that didn't happen, or another copier already
-        // replicated its contents.  Either way, it's safe to copy the
-        // meta files (unless they have changed).
+        // `chunks` might have been emptied because its contents were
+        // moved to `ready` (and then maybe to `consuming`).  Make
+        // sure such a move didn't happen *before* our check for a
+        // non-empty chunks directory.
+
+        // We must first check for a `ready` directory: if it doesn't
+        // exist, it might now be `consuming`.
         if !directory_is_empty_or_absent(&ready_directory)? {
             tracing::info!(?ready_directory, "ready directory exists");
             return Ok(false);
         }
 
+        // The `ready` directory might have been empty because it was
+        // moved to `consuming`.  Check that it didn't happen.
+        if !directory_is_empty_or_absent(&consuming_directory)? {
+            tracing::info!(?consuming_directory, "consuming directory exists");
+            return Ok(false);
+        }
+
+        // The `consuming` directory might be empty because it was
+        // all fully uploaded.  That's fine: either way, there's no
+        // missing chunk in remote storage.
+        //
+        // A new `ready` directory might exist now, but it must have
+        // been created after our check that the `chunks` directory
+        // was empty.  It's safe to assume that all the chunks needed
+        // by the manifests we read earlier have been copied.
         let mut did_something = false;
 
         {
@@ -1256,16 +1278,25 @@ impl CopierWorker {
             })?
         };
 
-        let ready = replication_buffer::mutable_ready_directory(spool.to_path_buf());
-        let is_empty = directory_is_empty_or_absent(&ready)
-            .map_err(|e| chain_debug!(e, "failed to list directory", ?ready));
-        if matches!(is_empty, Ok(true)) {
-            // It's not an error if this fails: we expect
-            // failures when `ready` becomes non-empty, and
-            // we never lose data.
-            drop_result!(std::fs::remove_dir(&ready),
-                         e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
-                                                 "failed to remove ready directory", ?ready));
+        // We want to treat these directories as missing if they're
+        // empty.  Our logic should handle errors that way, but we can
+        // get more useful logs if we clean up here.
+        for cleanup in [
+            replication_buffer::mutable_consuming_directory(spool.to_path_buf()),
+            replication_buffer::mutable_ready_directory(spool.to_path_buf()),
+        ]
+        .iter()
+        {
+            let is_empty = directory_is_empty_or_absent(&cleanup)
+                .map_err(|e| chain_debug!(e, "failed to list directory", ?cleanup));
+            if matches!(is_empty, Ok(true)) {
+                // It's not an error if this fails: we expect failures
+                // when the directory becomes non-empty, and we never
+                // lose data.
+                drop_result!(std::fs::remove_dir(&cleanup),
+                             e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
+                                                     "failed to remove directory", ?cleanup));
+            }
         }
 
         did_something |= call_with_slow_logging(
