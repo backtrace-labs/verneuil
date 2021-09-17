@@ -669,7 +669,7 @@ impl Tracker {
         }
 
         local_chunk_dirs.push(buf.ready_chunk_directory());
-
+        local_chunk_dirs.push(buf.consuming_chunk_directory());
         crate::snapshot::Snapshot::new(
             local_chunk_dirs,
             &self.replication_targets.replication_targets,

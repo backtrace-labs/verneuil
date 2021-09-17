@@ -14,7 +14,8 @@
 //! once they have been copied to remote storage.
 //!
 //! Each spooling buffer is a directory that includes a "staging"
-//! directory, and a "ready" directory.
+//! directory, and a "ready" directory.  It may temporarily include a
+//! "consuming" directory.
 //!
 //! The staging directory has a "chunks" subdirectory, and a "meta"
 //! subdirectory.  The chunks directory contains content-addressed
@@ -24,6 +25,9 @@
 //!
 //! The "ready" directory always contains a manifest that's ready to
 //! be consumed by the replication subsystem.
+//!
+//! When the replication subsystem is ready to consume a "ready"
+//! directory, the directory is first renamed to "consuming."
 //!
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
@@ -40,7 +44,10 @@
 //!   rename(2)/link(2).  The files are also created with read-only
 //!   permissions.
 //!
-//! - Data in a "ready" directory only goes away once it has been
+//! - A "ready" directory only goes away when it's atomically renamed
+//!   over an empty or absent "consuming" directory.
+//!
+//! - Data in a "consuming" directory only goes away once it has been
 //!   copied to remote storage.  A Tracker can thus only publish a new
 //!   "ready" directory once the old one (if any) has been fully copied.
 //!
@@ -48,16 +55,17 @@
 //!   its "ready/meta" files have already been copied, or are in the
 //!   "ready/chunks" subdirectory.  This is true when a Tracker
 //!   constructs a fresh "ready" directory and publishes it
-//!   atomically, and remains true because copiers always consume
-//!   (upload and delete) "ready/chunks" before "ready/meta".
+//!   atomically and when it's renamed to "consuming," and
+//!   remains true because copiers always consume
+//!   (upload and delete) "consuming/chunks" before "consuming/meta".
 //!
-//! - Copiers eventually empty or delete a "ready" directory when its
+//! - Copiers eventually empty or delete a "consuming" directory when its
 //!   "chunks" and "meta" subdirectories are empty or absent.
 //!
 //! - All chunks referenced by "staging/meta" files have already been
-//!   copied, are in "ready/chunks", or are in "staging/chunks".
+//!   copied, are in "{ready,consuming}/chunks", or are in "staging/chunks".
 //!   Copiers maintain this invariant by only deleting a file from
-//!   "ready/chunks" once it has been uploaded.  Trackers maintain
+//!   "consuming/chunks" once it has been uploaded.  Trackers maintain
 //!   this invariant by:
 //!     1. writing chunks to "staging/chunks" before publishing to
 //!        "staging/meta";
@@ -71,13 +79,14 @@
 //! producers (`Tracker`s) will publish new data, so consumers must
 //! still worry about ABA.
 //!
-//! For the "ready" directory, `Copier`s access a snapshot of the
-//! current directory via a file descriptor for that directory
-//! structure.  The snapshot is mutable, but, once published, only
-//! `Copier`s update a "ready" directory, and only by removing files
-//! or subdirectory once they are useless.  This RCU-like protocol
-//! ensures that `Copier`s can always make progress even when
-//! `Tracker`s constantly observe new writes.
+//! For the "ready" directory, `Copier`s first rename it to
+//! "consuming," and access a snapshot of the current directory via a
+//! file descriptor for that directory structure.  The snapshot is
+//! mutable, but, once published, only `Copier`s update a "consuming"
+//! directory, and only by removing files or subdirectory once they
+//! are useless.  This RCU-like protocol ensures that `Copier`s can
+//! always make progress even when `Tracker`s constantly observe new
+//! writes.
 //!
 //! For the "staging" directory, it makes sense to split the analysis
 //! between the easy part (chunks) and and the hard part (meta files).
@@ -94,17 +103,21 @@
 //! sequence lock scheme on each "meta" file.  A `Copier` computes a
 //! unique identifier for (the inode of) each meta file, checks that
 //! all relevant chunks have definitely been published
-//! ("staging/chunks" is empty, *and then* "ready" is empty or
-//! missing), and finally uploads all meta files that have not changed.
+//! ("staging/chunks" is empty, *and then* both "ready" and
+//! "consuming" are empty or missing), and finally uploads all meta
+//! files that have not changed.
 //!
 //! It's important to check for chunks to upload first in "staging",
-//! and then in "ready" because we can't check for both atomically,
-//! and "ready" is sticky: when we observe an empty "staging/chunks"
-//! subdirectory, that might be because relevant chunks are now
-//! in "ready".  However, if we then observe an empty "ready", either
-//! that did not happen, or all chunks that used to be there have
-//! been uploaded.  Either way, the unchanged meta files' dependencies
-//! should all have been copied to remote storage.
+//! then in "ready" and finally in "consuming" because we can't check
+//! for all atomically, and "ready/consuming" are sticky: when we
+//! observe an empty "staging/chunks" subdirectory, that might be
+//! because relevant chunks are now in "ready" or "consuming."
+//! However, if we then observe an empty "ready", either that did not
+//! happen, or it was renamed to "consuming."  If we also later
+//! observe that "consuming" is empty or missing, the rename did not
+//! happen or all chunks that used to be there have been uploaded.
+//! Either way, the unchanged meta files' dependencies should all have
+//! been copied to remote storage.
 //!
 //! The conditions for producers (`Tracker`s) are more complex, and
 //! involve non-monotonic/idempotent state updates.  However, they can
@@ -174,8 +187,12 @@ const STAGING: &str = "staging";
 
 /// When the "staging" subdirectory matches the db, it can be copied
 /// atomically to an empty or missing "ready" subdirectory: the copy
-/// logic clears the directory once everything has been copied.
+/// logic renames the directory to "consuming."
 const READY: &str = "ready";
+
+/// When copiers are ready to consume a new "ready" directory, they
+/// rename it to "consuming."
+const CONSUMING: &str = "consuming";
 
 /// The ".metadata" file, at the toplevel of the buffer directory,
 /// tells copier where to copy ready and staged data.
@@ -965,6 +982,16 @@ impl ReplicationBuffer {
     pub fn ready_chunk_directory(&self) -> PathBuf {
         let mut dir = self.spooling_directory.clone();
         dir.push(READY);
+        dir.push(CHUNKS);
+
+        dir
+    }
+
+    /// Returns the path prefix for consuming chunks.
+    #[allow(dead_code)]
+    pub fn consuming_chunk_directory(&self) -> PathBuf {
+        let mut dir = self.spooling_directory.clone();
+        dir.push(CONSUMING);
         dir.push(CHUNKS);
 
         dir
