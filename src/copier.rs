@@ -484,7 +484,10 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
     use ConsumeDirectoryPolicy::*;
 
     let delete_file = matches!(policy, RemoveFiles | RemoveFilesAndDirectory);
-    let mut consume_files = |dirents: std::fs::ReadDir, to_consume: &mut PathBuf| {
+    let mut consume_files = |rt: &tokio::runtime::Runtime,
+                             local_set: &tokio::task::LocalSet,
+                             dirents: std::fs::ReadDir,
+                             to_consume: &mut PathBuf| {
         use itertools::Itertools;
 
         for names in &dirents
@@ -528,20 +531,17 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                         }
                     };
 
-                    call_with_executor(|runtime| {
-                        let _scope = runtime.enter();
-                        match consumer(&name, contents) {
-                            Ok(None) => cleanup(Ok(()), &name, &to_consume),
-                            Ok(Some(continuation)) => {
-                                let name = name.to_owned();
-                                let to_consume = to_consume.clone();
-                                runtime.block_on(async move {
-                                    cleanup(continuation.await, &name, &to_consume);
-                                })
-                            }
-                            Err(e) => cleanup(Err(e), &name, &to_consume),
+                    match consumer(&name, contents) {
+                        Ok(None) => cleanup(Ok(()), &name, &to_consume),
+                        Ok(Some(continuation)) => {
+                            let name = name.to_owned();
+                            let to_consume = to_consume.clone();
+                            local_set.block_on(rt, async move {
+                                cleanup(continuation.await, &name, &to_consume);
+                            })
                         }
-                    });
+                        Err(e) => cleanup(Err(e), &name, &to_consume),
+                    };
                 }
 
                 to_consume.pop();
@@ -551,7 +551,17 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
 
     match std::fs::read_dir(&to_consume) {
         Ok(dirents) => {
-            consume_files(dirents, &mut to_consume);
+            call_with_executor(|runtime| {
+                let _scope = runtime.enter();
+                let local_set = tokio::task::LocalSet::new();
+                consume_files(runtime, &local_set, dirents, &mut to_consume);
+                // Wait for any pending task before returning.
+                call_with_slow_logging(
+                    Duration::from_secs(30),
+                    || runtime.block_on(local_set),
+                    |duration| tracing::info!(?duration, ?to_consume, "slow consume_files join"),
+                );
+            });
             if policy == RemoveFilesAndDirectory {
                 // If we can't get rid of that directory, it must be
                 // non-empty, which means we failed to consume some
