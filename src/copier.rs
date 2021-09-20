@@ -129,6 +129,10 @@ const COPY_LOCK_RESET_RATE: f64 = 0.01;
 /// from an apparently neverending directory of files.
 const CONSUME_DIRECTORY_BATCH_SIZE: usize = 10;
 
+/// The maximum number of concurrent file consumption tasks allowed
+/// for a single call to `consume_directory`.
+const CONSUME_DIRECTORY_CONCURRENCY_LIMIT: usize = 100;
+
 /// We aim for ~30 requests / second.  We've seen a p99 of ~300 ms per
 /// PUT, so 10 workers should be enough, even with additional sleeping
 /// and backoff.
@@ -490,6 +494,10 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                              to_consume: &mut PathBuf| {
         use itertools::Itertools;
 
+        let consume_limit = Arc::new(tokio::sync::Semaphore::new(
+            CONSUME_DIRECTORY_CONCURRENCY_LIMIT,
+        ));
+
         for names in &dirents
             .flatten()
             .map(|dirent| dirent.file_name())
@@ -514,31 +522,50 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                 if let Ok(contents) = file_or {
                     // Logs any failure, and deletes the file on
                     // success, if the caller asked for that.
-                    let cleanup = |consume_result: Result<()>, name: &OsStr, to_consume: &Path| {
-                        let result = consume_result.map_err(|e| {
-                            chain_info!(e, "failed to consume file", ?name, ?to_consume)
-                        });
-                        if result.is_ok() && delete_file {
-                            // Attempt to remove the file.  It's ok if
-                            // this fails: either someone else removed
-                            // the file, or `ensure_directory_removed`
-                            // will fail, correctly signaling failure.
-                            drop_result!(
+                    let cleanup =
+                        move |consume_result: Result<()>, name: &OsStr, to_consume: &Path| {
+                            let result = consume_result.map_err(|e| {
+                                chain_info!(e, "failed to consume file", ?name, ?to_consume)
+                            });
+                            if result.is_ok() && delete_file {
+                                // Attempt to remove the file.  It's ok if
+                                // this fails: either someone else removed
+                                // the file, or `ensure_directory_removed`
+                                // will fail, correctly signaling failure.
+                                drop_result!(
                                 std::fs::remove_file(&to_consume),
                                 e => filtered_io_error!(
                                     e, ErrorKind::NotFound => Level::DEBUG,
                                     "failed to remove consumed file", path=?to_consume));
-                        }
-                    };
+                            }
+                        };
 
                     match consumer(&name, contents) {
                         Ok(None) => cleanup(Ok(()), &name, &to_consume),
                         Ok(Some(continuation)) => {
                             let name = name.to_owned();
                             let to_consume = to_consume.clone();
-                            local_set.block_on(rt, async move {
+                            let consume_limit = consume_limit.clone();
+                            // Wait until a token is available.
+                            // Convert errors to None: we never close
+                            // the Semaphore explicitly, and we'd
+                            // rather make progress too fast than
+                            // stop or crash.
+                            let token = local_set
+                                .block_on(rt, async {
+                                    // Let pending tasks make a bit of progress.
+                                    tokio::task::yield_now().await;
+                                    consume_limit.acquire_owned().await.map_err(|e| {
+                                        chain_error!(e, "failed to acquire copy semaphore")
+                                    })
+                                })
+                                .ok();
+
+                            // Spawn a new task that now owns the token.
+                            local_set.spawn_local(async move {
                                 cleanup(continuation.await, &name, &to_consume);
-                            })
+                                std::mem::drop(token);
+                            });
                         }
                         Err(e) => cleanup(Err(e), &name, &to_consume),
                     };
