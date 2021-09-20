@@ -1,4 +1,5 @@
 mod copier;
+mod executor;
 mod instance_id;
 mod loader;
 mod manifest_schema;

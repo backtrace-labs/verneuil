@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::future;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,6 +33,7 @@ use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
+use crate::executor::call_with_executor;
 use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_warn;
@@ -460,8 +463,10 @@ enum ConsumeDirectoryPolicy {
 }
 
 /// Lists the files in `to_consume`, and passes them to `consumer`.
-/// When the `consumer` returns Ok for a file, attempts to remove it
-/// if the policy is `RemoveFiles` or `RemoveFilesAndDirectory`.
+/// When the `consumer` returns Ok(None) or Ok(future) where the
+/// future eventually resolves to Ok(()) for a file, attempts to
+/// remove it if the policy is `RemoveFiles` or
+/// `RemoveFilesAndDirectory`.
 ///
 /// Finally, ensures the `to_consume` directory is gone if the policy
 /// is `RemoveFilesAndDirectory`; on success, this implies that every
@@ -470,9 +475,9 @@ enum ConsumeDirectoryPolicy {
 /// Periodically checks any of the directories in `stop_if_exists`
 /// exist and contain files.  If one does, stops consuming files.
 #[instrument(level = "debug", skip(consumer), err)]
-fn consume_directory(
+fn consume_directory<R: 'static + Future<Output = Result<()>>>(
     mut to_consume: PathBuf,
-    mut consumer: impl FnMut(&OsStr, File) -> Result<()>,
+    mut consumer: impl FnMut(&OsStr, File) -> Result<Option<R>>,
     policy: ConsumeDirectoryPolicy,
     stop_if_exists: &[&Path],
 ) -> Result<()> {
@@ -504,7 +509,15 @@ fn consume_directory(
                                        "failed to open file to copy", path=?to_consume)
                 });
                 if let Ok(contents) = file_or {
-                    if consumer(&name, contents)
+                    let consume_result = call_with_executor(|runtime| {
+                        let _scope = runtime.enter();
+                        match consumer(&name, contents)? {
+                            Some(continuation) => runtime.block_on(continuation),
+                            None => Ok(()),
+                        }
+                    });
+
+                    if consume_result
                         .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
                         .is_ok()
                         && delete_file
@@ -924,7 +937,8 @@ fn force_full_snapshot(spool_path: &Path, source: &Path) {
     // And now delete all (manifest) files in staging/meta.
     let staging = replication_buffer::mutable_staging_directory(spool_path.to_owned());
     let meta_directory = replication_buffer::directory_meta(staging);
-    drop_result!(consume_directory(meta_directory, |_, _| Ok(()),
+    drop_result!(consume_directory(meta_directory,
+                                   |_, _| -> Result<Option<future::Ready<Result<()>>>> { Ok(None) },
                                    ConsumeDirectoryPolicy::RemoveFiles, &[]),
                  e => chain_error!(e, "failed to delete staged meta files", ?spool_path));
 }
@@ -1039,18 +1053,22 @@ impl CopierWorker {
                 return Ok(false);
             }
 
+            let chunks_buckets = Arc::new(chunks_buckets);
             consume_directory(
                 replication_buffer::directory_chunks(consuming.clone()),
                 |name, mut file| {
                     self.pace();
-                    copy_file(name, &mut file, &chunks_buckets)
+                    let name = name.to_owned();
+                    let chunks_buckets = chunks_buckets.clone();
+                    let ret = copy_file(&name, &mut file, &chunks_buckets);
+                    Ok(Some(async move { ret }))
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
                 &[],
             )?;
         }
 
-        let mut did_something = false;
+        let did_something = Arc::new(AtomicBool::new(false));
 
         {
             let meta_buckets = targets
@@ -1064,17 +1082,25 @@ impl CopierWorker {
                 return Ok(false);
             }
 
+            let meta_buckets = Arc::new(meta_buckets);
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
                 replication_buffer::directory_meta(consuming),
                 |name, mut file| {
                     self.pace();
-                    copy_file(name, &mut file, &meta_buckets)?;
-                    replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
-                        chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                    })?;
-                    did_something = true;
-                    Ok(())
+                    let name = name.to_owned();
+                    let did_something = did_something.clone();
+                    let meta_buckets = meta_buckets.clone();
+                    let parent = parent.to_owned();
+                    let copy_ret = copy_file(&name, &mut file, &meta_buckets);
+                    Ok(Some(async move {
+                        copy_ret?;
+                        replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
+                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                        })?;
+                        did_something.store(true, Ordering::Relaxed);
+                        Ok(())
+                    }))
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
                 &[],
@@ -1084,7 +1110,7 @@ impl CopierWorker {
         // And now try to get rid of the hopefully consuming directory.
         drop_result!(replication_buffer::remove_consuming_directory_if_empty(parent),
                      e => chain_info!(e, "failed to clean up consuming directory"));
-        Ok(did_something)
+        Ok(did_something.load(Ordering::Relaxed))
     }
 
     /// Handles one "staging" directory: copy the chunks, then copy
@@ -1113,7 +1139,9 @@ impl CopierWorker {
 
         // If true, we always try to upload the contents of the meta
         // directory, even if we think that might be useless.
-        let mut force_meta = stale || rand::thread_rng().gen_bool(FORCE_META_PROBABILITY);
+        let force_meta = Arc::new(AtomicBool::new(
+            stale || rand::thread_rng().gen_bool(FORCE_META_PROBABILITY),
+        ));
 
         // It's always safe to publish chunks: they don't have any
         // dependency.
@@ -1125,21 +1153,28 @@ impl CopierWorker {
                 .flatten() // TODO: how do we want to handle failures here?
                 .collect::<Vec<_>>();
 
-            // If we don't have replication target, best to leave the data
-            // where it is.
+            // If we don't have any replication target, best to leave
+            // the data where it is.
             if chunks_buckets.is_empty() {
                 return Ok(false);
             }
 
+            let chunks_buckets = Arc::new(chunks_buckets);
             consume_directory(
                 chunks_directory.clone(),
                 |name: &OsStr, mut file| {
                     self.pace();
-                    copy_file(name, &mut file, &chunks_buckets)?;
-                    // Always upload the contents of the meta
-                    // directory if we found chunks to upload.
-                    force_meta = true;
-                    Ok(())
+                    let name = name.to_owned();
+                    let chunks_buckets = chunks_buckets.clone();
+                    let force_meta = force_meta.clone();
+                    let copy_ret = copy_file(&name, &mut file, &chunks_buckets);
+                    Ok(Some(async move {
+                        copy_ret?;
+                        // Always upload the contents of the meta
+                        // directory if we found chunks to upload.
+                        force_meta.store(true, Ordering::Relaxed);
+                        Ok(())
+                    }))
                 },
                 ConsumeDirectoryPolicy::RemoveFiles,
                 &[&ready_directory, &consuming_directory],
@@ -1151,9 +1186,9 @@ impl CopierWorker {
         let mut initial_meta: HashMap<std::ffi::OsString, (FileIdentifier, File)> = HashMap::new();
         consume_directory(
             meta_directory.clone(),
-            &mut |name: &OsStr, file| {
+            &mut |name: &OsStr, file| -> Result<Option<future::Ready<Result<()>>>> {
                 initial_meta.insert(name.to_owned(), (FileIdentifier::new(&file)?, file));
-                Ok(())
+                Ok(None)
             },
             ConsumeDirectoryPolicy::KeepAll,
             &[],
@@ -1193,7 +1228,7 @@ impl CopierWorker {
         // been created after our check that the `chunks` directory
         // was empty.  It's safe to assume that all the chunks needed
         // by the manifests we read earlier have been copied.
-        let mut did_something = false;
+        let did_something = Arc::new(AtomicBool::new(false));
 
         {
             let meta_buckets = targets
@@ -1207,6 +1242,7 @@ impl CopierWorker {
                 return Ok(false);
             }
 
+            let meta_buckets = Arc::new(meta_buckets);
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
                 meta_directory,
@@ -1215,7 +1251,7 @@ impl CopierWorker {
 
                     // This is a new manifest file, we don't want to upload it.
                     if initial_meta.get(name).map(|x| &x.0) != Some(&identifier) {
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     // If we're not forcing uploads and we think we
@@ -1223,7 +1259,7 @@ impl CopierWorker {
                     // We must ignore ctime because tapping a file
                     // changes its hardlink count, and thus updates
                     // its ctime.
-                    if !force_meta
+                    if !force_meta.load(Ordering::Relaxed)
                         && state
                             .recent_staged_directories
                             .lock()
@@ -1231,29 +1267,33 @@ impl CopierWorker {
                             .find(|x| x.equal_except_ctime(&identifier))
                             .is_some()
                     {
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     self.pace();
-                    copy_file(name, &mut file, &meta_buckets)?;
-                    replication_buffer::tap_meta_file(&parent, name, &file).map_err(|e| {
-                        chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                    })?;
+                    let name = name.to_owned();
+                    let did_something = did_something.clone();
+                    let meta_buckets = meta_buckets.clone();
+                    let parent = parent.to_owned();
+                    let recent_staged_directories = state.recent_staged_directories.clone();
+                    let copy_ret = copy_file(&name, &mut file, &meta_buckets);
+                    Ok(Some(async move {
+                        copy_ret?;
+                        replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
+                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                        })?;
 
-                    state
-                        .recent_staged_directories
-                        .lock()
-                        .unwrap()
-                        .insert(identifier);
-                    did_something = true;
-                    Ok(())
+                        recent_staged_directories.lock().unwrap().insert(identifier);
+                        did_something.store(true, Ordering::Relaxed);
+                        Ok(())
+                    }))
                 },
                 ConsumeDirectoryPolicy::KeepAll,
                 &[],
             )?;
         }
 
-        Ok(did_something)
+        Ok(did_something.load(Ordering::Relaxed))
     }
 
     /// Processes one spooling directory that should be ready for
