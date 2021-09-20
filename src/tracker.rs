@@ -227,7 +227,7 @@ impl Tracker {
     fn snapshot_chunks(
         &self,
         repl: &ReplicationBuffer,
-        mut base: Option<Vec<Fingerprint>>,
+        base: Option<Vec<Fingerprint>>,
     ) -> Result<(u64, Vec<Fingerprint>, usize)> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -246,22 +246,6 @@ impl Tracker {
         // Always copy everything in [backfill_begin, num_chunks),
         // in addition to any known dirty chunk.
         let mut backfill_begin: u64;
-
-        // We expect to copy ~2 chunks per offset in
-        // `self.dirty_chunks`.  Pseudorandomly compute a full
-        // snapshot with probability `self.dirty_chunks.len() /
-        // num_chunks`; that still averages to a constant number of
-        // copies per dirty chunks.
-        //
-        // Computing a full snapshot from time to time helps us
-        // recover from silent desynchronisation.  That's good for
-        // robustness in production, but we should disable that in
-        // tests to catch logic bugs.
-        if cfg!(not(feature = "test_vfs"))
-            && (self.dirty_chunks.len() as u64) >= rng.gen_range(0..=num_chunks / 2)
-        {
-            base = None;
-        }
 
         // Setup the initial chunk fingerprint vector.
         let mut chunk_fprints = if let Some(fprints) = base {
