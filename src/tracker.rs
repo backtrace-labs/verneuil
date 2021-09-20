@@ -289,6 +289,9 @@ impl Tracker {
         // Updates the snapshot to take into account the data in chunk
         // `chunk_index`.
         //
+        // If `expected_fprint` is provided, the corresponding chunk
+        // file must have already been staged.
+        //
         // Returns true if the new chunk fprint differs from the old one.
         let update = &mut |chunk_index, expected_fprint| -> Result<bool> {
             num_snapshotted += 1;
@@ -306,22 +309,25 @@ impl Tracker {
             )?;
 
             let fprint = fingerprint_file_chunk(slice);
-
             if let Some(expected) = expected_fprint {
+                // Our incremental change tracking should work.
                 #[cfg(feature = "test_validate_writes")]
                 assert_eq!(fprint, expected);
 
-                // Outside tests, trigger a full rescan if the chunk
-                // on disk doesn't match our expectation.
-                if fprint != expected {
-                    return Ok(true);
-                }
+                chunk_fprints[chunk_index as usize] = expected;
             }
 
-            repl.stage_chunk(fprint, slice)?;
-            let ret = fprint != chunk_fprints[chunk_index as usize];
-            chunk_fprints[chunk_index as usize] = fprint;
-            Ok(ret)
+            if fprint == chunk_fprints[chunk_index as usize] {
+                // Nothing to do, it's all clean
+                Ok(false)
+            } else {
+                // Only stage the chunk if it has changed: we don't
+                // want our background scans to create useless copy
+                // work.
+                repl.stage_chunk(fprint, slice)?;
+                chunk_fprints[chunk_index as usize] = fprint;
+                Ok(true)
+            }
         };
 
         for (base, expected_fprint) in &self.dirty_chunks {
@@ -336,7 +342,15 @@ impl Tracker {
                 break;
             }
 
-            update(chunk_index, *expected_fprint)?;
+            if update(chunk_index, *expected_fprint)? && expected_fprint.is_some() {
+                // `update` found a mismatch, our metadata said we
+                // already knew what was there.  Trigger a full
+                // rescan.
+                tracing::error!(path=?self.path, chunk_index,
+                                "forcing resynchronisation scan");
+                backfill_begin = 0;
+                break;
+            }
 
             // Now do the same for a random chunk index, as a
             // background scan for any desynchronisation we might
@@ -357,7 +371,7 @@ impl Tracker {
                 // clean, force a full scan.
                 let result = update(random_index, None).map_err(|e| {
                     chain_error!(e, "failed to scrub random clean chunk",
-                                              path=?self.path, random_index)
+                                 path=?self.path, random_index)
                 });
                 if !matches!(result, Ok(false)) {
                     tracing::error!(path=?self.path, random_index, ?result,
