@@ -3,10 +3,6 @@
 //! of replication directories, and sending the ready snapshot to
 //! object stores like S3.
 use core::num::NonZeroU32;
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -19,7 +15,13 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use s3::bucket::Bucket;
+use s3::creds::Credentials;
 use tracing::info_span;
 use tracing::instrument;
 use tracing::Level;
@@ -190,7 +192,11 @@ struct FileIdentifier {
 /// file.
 #[derive(Debug, Default)]
 struct CopierUploadState {
-    recent_staged_directories: uluru::LRUCache<FileIdentifier, STAGED_MANIFEST_MEMORY>,
+    // We always acquire the lock that surrounds `CopierUploadState`
+    // first around accesses to `recent_staged_directories`, so we
+    // never block on the mutex; we only need the Arc + Mutex to
+    // guarantee a 'static lifetime for async.
+    recent_staged_directories: Arc<Mutex<uluru::LRUCache<FileIdentifier, STAGED_MANIFEST_MEMORY>>>,
 }
 
 /// The `CopierSpoolState` represent what we know about the spool for
@@ -229,7 +235,7 @@ struct CopierSpoolState {
 
     // Copier workers attempt to acquire this mutex before processing
     // the spool path's contents.
-    upload_lock: std::sync::Mutex<CopierUploadState>,
+    upload_lock: Mutex<CopierUploadState>,
 }
 
 type DateTime = chrono::DateTime<chrono::Utc>;
@@ -1089,7 +1095,7 @@ impl CopierWorker {
     #[instrument(skip(self, creds), err)]
     fn handle_staging_directory(
         &self,
-        state: &mut CopierUploadState,
+        state: &CopierUploadState,
         stale: bool,
         targets: &ReplicationTargetList,
         creds: Credentials,
@@ -1204,7 +1210,7 @@ impl CopierWorker {
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
                 meta_directory,
-                &mut |name: &OsStr, mut file| {
+                |name, mut file| {
                     let identifier = FileIdentifier::new(&file)?;
 
                     // This is a new manifest file, we don't want to upload it.
@@ -1220,6 +1226,8 @@ impl CopierWorker {
                     if !force_meta
                         && state
                             .recent_staged_directories
+                            .lock()
+                            .unwrap()
                             .find(|x| x.equal_except_ctime(&identifier))
                             .is_some()
                     {
@@ -1232,7 +1240,11 @@ impl CopierWorker {
                         chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
                     })?;
 
-                    state.recent_staged_directories.insert(identifier);
+                    state
+                        .recent_staged_directories
+                        .lock()
+                        .unwrap()
+                        .insert(identifier);
                     did_something = true;
                     Ok(())
                 },
