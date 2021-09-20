@@ -509,28 +509,39 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                                        "failed to open file to copy", path=?to_consume)
                 });
                 if let Ok(contents) = file_or {
-                    let consume_result = call_with_executor(|runtime| {
+                    // Logs any failure, and deletes the file on
+                    // success, if the caller asked for that.
+                    let cleanup = |consume_result: Result<()>, name: &OsStr, to_consume: &Path| {
+                        let result = consume_result.map_err(|e| {
+                            chain_info!(e, "failed to consume file", ?name, ?to_consume)
+                        });
+                        if result.is_ok() && delete_file {
+                            // Attempt to remove the file.  It's ok if
+                            // this fails: either someone else removed
+                            // the file, or `ensure_directory_removed`
+                            // will fail, correctly signaling failure.
+                            drop_result!(
+                                std::fs::remove_file(&to_consume),
+                                e => filtered_io_error!(
+                                    e, ErrorKind::NotFound => Level::DEBUG,
+                                    "failed to remove consumed file", path=?to_consume));
+                        }
+                    };
+
+                    call_with_executor(|runtime| {
                         let _scope = runtime.enter();
-                        match consumer(&name, contents)? {
-                            Some(continuation) => runtime.block_on(continuation),
-                            None => Ok(()),
+                        match consumer(&name, contents) {
+                            Ok(None) => cleanup(Ok(()), &name, &to_consume),
+                            Ok(Some(continuation)) => {
+                                let name = name.to_owned();
+                                let to_consume = to_consume.clone();
+                                runtime.block_on(async move {
+                                    cleanup(continuation.await, &name, &to_consume);
+                                })
+                            }
+                            Err(e) => cleanup(Err(e), &name, &to_consume),
                         }
                     });
-
-                    if consume_result
-                        .map_err(|e| chain_info!(e, "failed to consume file", ?name, ?to_consume))
-                        .is_ok()
-                        && delete_file
-                    {
-                        // Attempt to remove the file.  It's ok if
-                        // this fails: either someone else removed
-                        // the file, or `ensure_directory_removed`
-                        // will fail, correctly signaling failure.
-                        drop_result!(std::fs::remove_file(&to_consume),
-                                     e => filtered_io_error!(
-                                         e, ErrorKind::NotFound => Level::DEBUG,
-                                         "failed to remove consumed file", path=?to_consume));
-                    }
                 }
 
                 to_consume.pop();
