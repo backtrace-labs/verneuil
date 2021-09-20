@@ -662,9 +662,25 @@ fn call_with_slow_logging<T>(
     ret
 }
 
+async fn await_with_slow_logging<T, R: Future<Output = T>>(
+    limit: Duration,
+    timed: impl FnOnce() -> R,
+    slow_logger: impl FnOnce(Duration),
+) -> T {
+    let start = std::time::Instant::now();
+    let ret = timed().await;
+
+    let elapsed = start.elapsed();
+    if elapsed >= limit {
+        slow_logger(elapsed);
+    }
+
+    ret
+}
+
 /// Attempts to publish the `contents` to `name` in all `targets`.
 #[instrument(level = "debug", skip(targets), err)]
-fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
+async fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
 
@@ -686,24 +702,21 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
         // We're only asking for a couple bytes, and GETs cost 1/10 as
         // much as PUTs, so we can afford to issue redundant GETs
         // unconditionally.
-        let _ = call_with_slow_logging(
+        let _ = await_with_slow_logging(
             Duration::from_secs(5),
-            || target.get_object_range_blocking(&blob_name, 0, Some(1)),
+            || target.get_object_range(&blob_name, 0, Some(1)),
             |duration| tracing::info!(?duration, ?blob_name, "slow S3 RANGE GET"),
-        );
+        )
+        .await;
 
         for i in 0..=COPY_RETRY_LIMIT {
-            match call_with_slow_logging(
+            match await_with_slow_logging(
                 Duration::from_secs(10),
-                || {
-                    target.put_object_with_content_type_blocking(
-                        &blob_name,
-                        &bytes,
-                        CHUNK_CONTENT_TYPE,
-                    )
-                },
+                || target.put_object_with_content_type(&blob_name, &bytes, CHUNK_CONTENT_TYPE),
                 |duration| tracing::info!(?duration, ?blob_name, len = bytes.len(), "slow S3 PUT"),
-            ) {
+            )
+            .await
+            {
                 Ok((_, code)) if (200..300).contains(&code) => {
                     break;
                 }
@@ -743,7 +756,7 @@ fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()
                         len = bytes.len(),
                         "backing off after a failed PUT."
                     );
-                    std::thread::sleep(backoff);
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -1060,8 +1073,10 @@ impl CopierWorker {
                     self.pace();
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
-                    let ret = copy_file(&name, &mut file, &chunks_buckets);
-                    Ok(Some(async move { ret }))
+
+                    Ok(Some(async move {
+                        copy_file(&name, &mut file, &chunks_buckets).await
+                    }))
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
                 &[],
@@ -1092,9 +1107,9 @@ impl CopierWorker {
                     let did_something = did_something.clone();
                     let meta_buckets = meta_buckets.clone();
                     let parent = parent.to_owned();
-                    let copy_ret = copy_file(&name, &mut file, &meta_buckets);
+
                     Ok(Some(async move {
-                        copy_ret?;
+                        copy_file(&name, &mut file, &meta_buckets).await?;
                         replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
                             chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
                         })?;
@@ -1167,9 +1182,9 @@ impl CopierWorker {
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
                     let force_meta = force_meta.clone();
-                    let copy_ret = copy_file(&name, &mut file, &chunks_buckets);
+
                     Ok(Some(async move {
-                        copy_ret?;
+                        copy_file(&name, &mut file, &chunks_buckets).await?;
                         // Always upload the contents of the meta
                         // directory if we found chunks to upload.
                         force_meta.store(true, Ordering::Relaxed);
@@ -1276,9 +1291,9 @@ impl CopierWorker {
                     let meta_buckets = meta_buckets.clone();
                     let parent = parent.to_owned();
                     let recent_staged_directories = state.recent_staged_directories.clone();
-                    let copy_ret = copy_file(&name, &mut file, &meta_buckets);
+
                     Ok(Some(async move {
-                        copy_ret?;
+                        copy_file(&name, &mut file, &meta_buckets).await?;
                         replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
                             chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
                         })?;

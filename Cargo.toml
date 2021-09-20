@@ -51,7 +51,7 @@ rust-s3 = { version = "0.27.0-rc4", git = "https://github.com/backtrace-labs/rus
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
-tokio = { version = "1", features = ["rt"], default-features = false }
+tokio = { version = "1", features = ["rt", "time"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.2", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "2"
