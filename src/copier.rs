@@ -1014,15 +1014,32 @@ impl CopierWorker {
     #[instrument(level = "debug", skip(self))]
     fn pace(&self) {
         use rand::Rng;
+        use std::time::Instant;
 
-        match self.governor.check() {
-            Ok(_) => {}
+        let deadline_or = match self.governor.check() {
+            Ok(_) => None,
             Err(delay) => {
                 let mut rng = rand::thread_rng();
-                let wait_time = delay.wait_time_from(std::time::Instant::now());
-                let jitter_scale = rng.gen_range(1.0..1.0 + RATE_LIMIT_SLEEP_JITTER_FRAC);
+                let wait_time = delay.wait_time_from(Instant::now());
+                let jitter_scale = rng.gen_range(0.0..RATE_LIMIT_SLEEP_JITTER_FRAC);
+                let extra = wait_time.mul_f64(jitter_scale);
+                let deadline = delay.earliest_possible();
+                Some(deadline.checked_add(extra).unwrap_or(deadline))
+            }
+        };
 
-                std::thread::sleep(wait_time.mul_f64(jitter_scale));
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => rt.block_on(async {
+                if let Some(deadline) = deadline_or {
+                    tokio::time::sleep_until(deadline.into()).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }),
+            Err(_) => {
+                if let Some(deadline) = deadline_or {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
             }
         }
     }
