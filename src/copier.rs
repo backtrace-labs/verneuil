@@ -1279,9 +1279,15 @@ impl CopierWorker {
         // sleeping in `self.delay_manifest_copy`: `Tracker`s had time
         // to publish a new `ready` directory while we were consuming
         // the old one in `handle_ready_directory`.
-        if !directory_is_empty_or_absent(&ready_directory)?
-            || !directory_is_empty_or_absent(&consuming_directory)?
-        {
+        if !directory_is_empty_or_absent(&ready_directory)? {
+            tracing::info!(?ready_directory, "ready directory exists");
+            return Ok(false);
+        }
+
+        // The `ready` directory might have been empty because it was
+        // moved to `consuming`.  Check that it didn't happen.
+        if !directory_is_empty_or_absent(&consuming_directory)? {
+            tracing::info!(?consuming_directory, "consuming directory exists");
             return Ok(false);
         }
 
@@ -1356,14 +1362,12 @@ impl CopierWorker {
         // We must first check for a `ready` directory: if it doesn't
         // exist, it might now be `consuming`.
         if !directory_is_empty_or_absent(&ready_directory)? {
-            tracing::info!(?ready_directory, "ready directory exists");
             return Ok(false);
         }
 
         // The `ready` directory might have been empty because it was
         // moved to `consuming`.  Check that it didn't happen.
         if !directory_is_empty_or_absent(&consuming_directory)? {
-            tracing::info!(?consuming_directory, "consuming directory exists");
             return Ok(false);
         }
 
