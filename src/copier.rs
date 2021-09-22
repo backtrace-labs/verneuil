@@ -1275,6 +1275,16 @@ impl CopierWorker {
             stale || rand::thread_rng().gen_bool(FORCE_META_PROBABILITY),
         ));
 
+        // Check for an early exit condition here, before potentially
+        // sleeping in `self.delay_manifest_copy`: `Tracker`s had time
+        // to publish a new `ready` directory while we were consuming
+        // the old one in `handle_ready_directory`.
+        if !directory_is_empty_or_absent(&ready_directory)?
+            || !directory_is_empty_or_absent(&consuming_directory)?
+        {
+            return Ok(false);
+        }
+
         // It's always safe to publish chunks: they don't have any
         // dependency.
         {
