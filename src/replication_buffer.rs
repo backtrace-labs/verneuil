@@ -450,11 +450,15 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
     }
 
     let goal_filename = goal_path.file_name();
+    let it = match std::fs::read_dir(&parent) {
+        Ok(it) => it,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(chain_info!(e, "failed to list parent directory", path=?goal_path, ?parent))
+        }
+    };
 
-    for subdir in std::fs::read_dir(&parent)
-        .map_err(|e| chain_info!(e, "failed to list parent directory", path=?goal_path, ?parent))?
-        .flatten()
-    {
+    for subdir in it.flatten() {
         if Some(subdir.file_name().as_os_str()) != goal_filename {
             parent.push(subdir.file_name());
             if let Err(error) = std::fs::remove_dir_all(&parent) {
@@ -473,10 +477,13 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
 /// that does not exist anymore.
 #[instrument(err)]
 fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
-    for subdir in std::fs::read_dir(&parent)
-        .map_err(|e| chain_info!(e, "failed to list parent directory", ?parent))?
-        .flatten()
-    {
+    let it = match std::fs::read_dir(&parent) {
+        Ok(it) => it,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(chain_info!(e, "failed to list parent directory", ?parent)),
+    };
+
+    for subdir in it.flatten() {
         // We're only interested in percent-encoded paths, and those
         // are always(?) valid utf-8.
         let name = match subdir.file_name().into_string() {
