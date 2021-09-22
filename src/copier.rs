@@ -95,6 +95,27 @@ const BACKGROUND_SCAN_PERIOD: Duration = Duration::from_secs(5);
 /// spooling directory (background or otherwise).
 const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
 
+/// Make sure at least this much time elapses between uploads of the
+/// same manifest blob: some S3-compatible blob store have trouble
+/// with ordering of PUTs that are too close in real time.
+///
+/// For example,
+/// https://www.backblaze.com/b2/docs/s3_compatible_api.html says:
+///
+/// "When uploading multiple versions of the same file within the same
+/// second, the possibility exists that the processing of these
+/// versions may not be in order. Backblaze recommends delaying
+/// uploads of multiple versions of the same file by at least one
+/// second to avoid this situation."
+///
+/// (Might see some noise on this issue
+/// https://github.com/s3fs-fuse/s3fs-fuse/issues/272 when Backblaze
+/// fixes this).
+///
+/// We thus impose a delay slightly greater than one second between
+/// the end of the last manifest upload and the start of the next.
+const MIN_MANIFEST_COPY_DELAY: Duration = Duration::from_millis(1100);
+
 /// Wait up to this long for credentials HTTP requests.  The limit
 /// doesn't really matter, as long as we eventually stop waiting:
 /// we usually get a response in milliseconds.
@@ -224,6 +245,9 @@ struct CopierSpoolState {
     // by `CopierWorker`s immediately as they scan working on
     // the `SpoolState`.
     signaled: AtomicBool,
+
+    // Last time we successfully copied a manifest blob.
+    last_manifest_copy: RacySystemTime,
 
     // Last time we started a copy scan.
     last_scanned: RacySystemTime,
@@ -433,6 +457,7 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
     // Assume the replication target is behind: someone asked for a
     // synchronous copy.
     WORKER.handle_spooling_directory(
+        &Default::default(),
         &mut Default::default(),
         /*stale=*/ true,
         path,
@@ -1076,8 +1101,9 @@ impl CopierWorker {
             }
         };
 
-        // `Handle`'s executor is broken with current thread runtimes.
-        // Just check if
+        // `tokio::runtime::Handle`'s executor is broken with current
+        // thread runtimes.  Always use `call_with_executor` to get
+        // the thread-local current thread executor.
         call_with_executor(|rt| {
             rt.block_on(async {
                 if let Some(deadline) = deadline_or {
@@ -1087,6 +1113,30 @@ impl CopierWorker {
                 }
             })
         });
+    }
+
+    /// Sleeps until `MIN_MANIFEST_COPY_DELAY` has elapsed since `last_manifest_copy`.
+    #[instrument(level = "debug", skip(self))]
+    fn delay_manifest_copy(&self, last_manifest_copy: &RacySystemTime) {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+        let elapsed = last_manifest_copy
+            .load()
+            .elapsed()
+            .unwrap_or(Duration::ZERO);
+        let delay = match MIN_MANIFEST_COPY_DELAY.checked_sub(elapsed) {
+            None => return,
+            Some(delay) => delay,
+        };
+        let jitter_scale = rng.gen_range(1.0..1.5);
+        let sleep = delay.mul_f64(jitter_scale);
+
+        call_with_executor(|rt| {
+            rt.block_on(async {
+                tokio::time::sleep(sleep).await;
+            })
+        })
     }
 
     /// Handles one "ready" directory: rename it to "consuming", copy
@@ -1104,6 +1154,7 @@ impl CopierWorker {
     #[instrument(skip(self, creds), err)]
     fn handle_ready_directory(
         &self,
+        last_manifest_copy: &RacySystemTime,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
@@ -1159,6 +1210,7 @@ impl CopierWorker {
                 return Ok(false);
             }
 
+            self.delay_manifest_copy(last_manifest_copy);
             let meta_buckets = Arc::new(meta_buckets);
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
@@ -1182,6 +1234,8 @@ impl CopierWorker {
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
                 &[],
             )?;
+
+            last_manifest_copy.store_now();
         }
 
         // And now try to get rid of the hopefully consuming directory.
@@ -1198,6 +1252,7 @@ impl CopierWorker {
     #[instrument(skip(self, creds), err)]
     fn handle_staging_directory(
         &self,
+        last_manifest_copy: &RacySystemTime,
         state: &CopierUploadState,
         stale: bool,
         targets: &ReplicationTargetList,
@@ -1235,6 +1290,11 @@ impl CopierWorker {
             if chunks_buckets.is_empty() {
                 return Ok(false);
             }
+
+            // Delay here instead of just before the manifest copy: we
+            // might as well let change `Tracker`s make progress and
+            // publish a new "ready" directory while we wait.
+            self.delay_manifest_copy(last_manifest_copy);
 
             let chunks_buckets = Arc::new(chunks_buckets);
             consume_directory(
@@ -1319,6 +1379,8 @@ impl CopierWorker {
                 return Ok(false);
             }
 
+            // We don't need to `delay_manifest_copy` here: we already
+            // slept for more than long enough before copying chunks.
             let meta_buckets = Arc::new(meta_buckets);
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
@@ -1368,6 +1430,8 @@ impl CopierWorker {
                 ConsumeDirectoryPolicy::KeepAll,
                 &[],
             )?;
+
+            last_manifest_copy.store_now();
         }
 
         Ok(did_something.load(Ordering::Relaxed))
@@ -1381,6 +1445,7 @@ impl CopierWorker {
     #[instrument(skip(self), err)]
     fn handle_spooling_directory(
         &self,
+        last_manifest_copy: &RacySystemTime,
         state: &mut CopierUploadState,
         stale: bool,
         spool: &Path,
@@ -1443,8 +1508,13 @@ impl CopierWorker {
         did_something |= call_with_slow_logging(
             Duration::from_secs(60),
             || {
-                self.handle_ready_directory(&targets, creds.clone(), spool.to_path_buf())
-                    .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))
+                self.handle_ready_directory(
+                    &last_manifest_copy,
+                    &targets,
+                    creds.clone(),
+                    spool.to_path_buf(),
+                )
+                .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))
             },
             |duration| tracing::info!(?duration, ?spool, "slow handle_ready_directory"),
         )?;
@@ -1456,6 +1526,7 @@ impl CopierWorker {
             Duration::from_secs(60),
             || {
                 self.handle_staging_directory(
+                    &last_manifest_copy,
                     state,
                     stale,
                     &targets,
@@ -1483,7 +1554,14 @@ impl CopierWorker {
         // cannot go backwards.
         match call_with_slow_logging(
             Duration::from_secs(60),
-            || self.handle_ready_directory(&targets, creds, spool.to_path_buf()),
+            || {
+                self.handle_ready_directory(
+                    &last_manifest_copy,
+                    &targets,
+                    creds,
+                    spool.to_path_buf(),
+                )
+            },
             |duration| tracing::info!(?duration, ?spool, "slow re-handle_ready_directory"),
         ) {
             Ok(ret) => did_something |= ret,
@@ -1634,6 +1712,7 @@ impl CopierWorker {
                 Duration::from_secs(60),
                 || {
                     self.handle_spooling_directory(
+                        &state.last_manifest_copy,
                         upload_state,
                         stale,
                         &state.spool_path,
