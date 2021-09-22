@@ -1076,20 +1076,17 @@ impl CopierWorker {
             }
         };
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => rt.block_on(async {
+        // `Handle`'s executor is broken with current thread runtimes.
+        // Just check if
+        call_with_executor(|rt| {
+            rt.block_on(async {
                 if let Some(deadline) = deadline_or {
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
                     tokio::task::yield_now().await;
                 }
-            }),
-            Err(_) => {
-                if let Some(deadline) = deadline_or {
-                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                }
-            }
-        }
+            })
+        });
     }
 
     /// Handles one "ready" directory: rename it to "consuming", copy
