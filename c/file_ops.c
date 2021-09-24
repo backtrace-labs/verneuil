@@ -2,26 +2,12 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/xattr.h>
 #include <unistd.h>
-
-/**
- * Some older distributions fail to expose OFD constants.  Hardcode
- * them if necessary: open file description locks have been around
- * since Linux 3.15, and we don't try to support anything that old
- * (getrandom was introduced in 3.17, and we also use that).
- */
-#ifndef F_OFD_SETLK
-#define F_OFD_SETLK     37
-#endif
-
-#if F_OFD_SETLK != 37
-# error "Mismatch in fallback OFD fcntl constant."
-#endif
 
 int
 verneuil__open_temp_file(const char *directory, int mode)
@@ -114,22 +100,20 @@ verneuil__touch(int fd)
 int
 verneuil__ofd_lock_exclusive(int fd)
 {
-        struct flock fl = {
-                .l_type = F_WRLCK,
-                .l_whence = SEEK_SET,
-                .l_start = 0,
-                .l_len = 0,
-        };
         int r;
 
+        /*
+         * We always acquire a lock on the whole file, so regular BSD
+         * flock does what we want.
+         */
         do {
-                r = fcntl(fd, F_OFD_SETLK, &fl);
+                r = flock(fd, LOCK_EX | LOCK_NB);
         } while (r < 0 && errno == EINTR);
 
         if (r == 0)
                 return 0;
 
-        if (errno == EAGAIN || errno == EACCES)
+        if (errno == EWOULDBLOCK)
                 return 1;
 
         return -1;
@@ -138,17 +122,11 @@ verneuil__ofd_lock_exclusive(int fd)
 int
 verneuil__ofd_lock_release(int fd)
 {
-        struct flock fl = {
-                .l_type = F_UNLCK,
-                .l_whence = SEEK_SET,
-                .l_start = 0,
-                .l_len = 0,
-        };
         int r;
 
         do {
-                r = fcntl(fd, F_OFD_SETLK, &fl);
+                r = flock(fd, LOCK_UN);
         } while (r < 0 && errno == EINTR);
 
-	return r;
+        return r;
 }

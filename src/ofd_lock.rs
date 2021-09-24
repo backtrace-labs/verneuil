@@ -1,4 +1,4 @@
-/// An OFD (open file descriptor) lock associates an exclusive lock
+/// An OFD (open file description) lock associates an exclusive lock
 /// with a `File` object (and its clones).  That lock is
 /// system-global, and identified by the file (inode) at a given path.
 use std::fs::File;

@@ -44,15 +44,15 @@ int verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz);
 int verneuil__touch(int fd);
 
 /**
- * Attempts to acquire an exclusive file-private (OFD) lock on
- * `fd`.
+ * Attempts to acquire an exclusive open file description (OFD) lock
+ * on `fd`.
  *
  * Returns 0 on success, 1 if the lock is taken, -1 on failure.
  */
 int verneuil__ofd_lock_exclusive(int fd);
 
 /**
- * Release any file-private (OFD) lock on `fd`.
+ * Release any open file description (OFD) lock on `fd`.
  *
  * Returns 0 on success, -1 on failure.
  */
