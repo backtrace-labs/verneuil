@@ -775,7 +775,6 @@ impl Tracker {
     /// our db file, and that the ready snapshot is valid.
     fn compare_snapshot(&self) -> Result<()> {
         use blake2b_simd::Params;
-        use std::os::unix::io::AsRawFd;
 
         let buf = &self.buffer;
 
@@ -787,13 +786,18 @@ impl Tracker {
         self.validate_snapshot(buf.read_ready_manifest(&self.path), ChunkSource::Ready)
             .expect("ready snapshot must be valid");
 
-        let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
-        let expected = match File::open(&self_path) {
-            // If we can't open the DB file, this isn't a
-            // replication problem.
+        // The VFS layer doesn't do anything with the file's offset,
+        // and all locking uses OFD locks, so this `dup(2)` is fine.
+        let expected = match self.file.try_clone() {
+            // If we can't dup the DB file, this isn't a replication
+            // problem.
             Err(_) => return Ok(()),
             Ok(mut file) => {
+                use std::io::Seek;
+                use std::io::SeekFrom;
+
                 let mut hasher = Params::new().hash_length(32).to_state();
+                file.seek(SeekFrom::Start(0)).expect("seek should succeed");
                 std::io::copy(&mut file, &mut hasher)
                     .map_err(|e| chain_error!(e, "failed to hash base file", path=?self.path))?;
                 hasher.finalize()
@@ -814,8 +818,7 @@ impl Tracker {
         // The header fingerprint must match the current header.
         assert_eq!(
             manifest_v1.header_fprint,
-            fingerprint_sqlite_header(&File::open(&self_path).expect("must open"))
-                .map(|fp| fp.into())
+            fingerprint_sqlite_header(&self.file).map(|fp| fp.into())
         );
 
         let snapshot = self.fetch_snapshot_or_die(&manifest, ChunkSource::Staged);
