@@ -177,6 +177,12 @@ lazy_static::lazy_static! {
     static ref DEFAULT_SPOOLING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
 
+/// We tag the per-boot directory with a version string: if we upgrade
+/// or downgrade to a different directory tree format, Verneuil will
+/// treat that as no or stale data (a well tested path), rather than
+/// getting stuck on an unexpected directory structure.
+const ON_DISK_FORMAT_VERSION_SUFFIX: &str = "v1";
+
 /// The ".tap" subdirectory isn't associated with any specific
 /// replicated file, and is populated with name-addressed files
 /// we successfully copied to remote storage.
@@ -810,8 +816,9 @@ pub(crate) fn directory_meta(parent: PathBuf) -> PathBuf {
 pub(crate) fn current_spooling_dir(mut prefix: PathBuf) -> PathBuf {
     // Add an instance id.
     prefix.push(format!(
-        "verneuil-{}",
-        replace_slashes(instance_id::instance_id())
+        "verneuil-{}-{}",
+        replace_slashes(instance_id::instance_id()),
+        ON_DISK_FORMAT_VERSION_SUFFIX,
     ));
 
     prefix
