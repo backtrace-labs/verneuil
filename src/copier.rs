@@ -1280,12 +1280,16 @@ impl CopierWorker {
         // to publish a new `ready` directory while we were consuming
         // the old one in `handle_ready_directory`.
         if !directory_is_empty_or_absent(&ready_directory)? {
-            tracing::info!(?ready_directory, "ready directory exists");
+            tracing::debug!(?ready_directory, "ready directory exists");
             return Ok(false);
         }
 
         // The `ready` directory might have been empty because it was
         // moved to `consuming`.  Check that it didn't happen.
+        //
+        // This state is worth logging about at info level: it could
+        // also mean that we're failing to copy the contents of the
+        // `consuming` directory (in which case we leave files behind).
         if !directory_is_empty_or_absent(&consuming_directory)? {
             tracing::info!(?consuming_directory, "consuming directory exists");
             return Ok(false);
@@ -1350,7 +1354,7 @@ impl CopierWorker {
         // We must now make sure that we have published all the chunks
         // before publishing the meta files.
         if !directory_is_empty_or_absent(&chunks_directory)? {
-            tracing::info!(?chunks_directory, "unpublished staged chunks remain");
+            tracing::debug!(?chunks_directory, "unpublished staged chunks remain");
             return Ok(false);
         }
 
