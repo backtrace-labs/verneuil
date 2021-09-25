@@ -471,11 +471,15 @@ impl Tracker {
             // empty, we probably missed an update.
             //
             // In all cases, we want to force a full snapshot.
-            if self.previous_version_id.is_empty()
-                || version_id.is_empty()
-                || self.previous_version_id == version_id
-                || self.dirty_chunks.is_empty()
-            {
+            if self.previous_version_id.is_empty() || version_id.is_empty() {
+                // Empty version ids are expected: that's what happens
+                // when we create a new db, and when we force a full
+                // snapshot.
+                tracing::debug!(path=?self.path, ?self.previous_version_id,
+                               ?version_id, num_dirty=self.dirty_chunks.len(),
+                               "forcing a full snapshot due to empty version ids");
+                up_to_date = false;
+            } else if self.previous_version_id == version_id || self.dirty_chunks.is_empty() {
                 tracing::info!(path=?self.path, ?self.previous_version_id,
                                ?version_id, num_dirty=self.dirty_chunks.len(),
                                "forcing a full snapshot due to invalid version ids");
