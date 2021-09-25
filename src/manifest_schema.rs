@@ -122,6 +122,14 @@ pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerpr
     let mut buf = [0u8; HEADER_SIZE];
     match file.read_exact_at(&mut buf, 0) {
         Err(error) => {
+            // Don't whine if we're trying to fingerprint a fresh
+            // empty db file.
+            if let Ok(meta) = file.metadata() {
+                if meta.len() == 0 {
+                    return None;
+                }
+            }
+
             tracing::info!(%error, "failed to read sqlite header");
             None
         }
