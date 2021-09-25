@@ -396,8 +396,25 @@ impl Tracker {
     fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
-        let header_fprint = fingerprint_sqlite_header(&self.file)
-            .ok_or_else(|| fresh_warn!("invalid db file", path=?self.path))?;
+        let header_fprint = match fingerprint_sqlite_header(&self.file) {
+            Some(fprint) => fprint,
+            None => {
+                if let Ok(meta) = self.file.metadata() {
+                    if meta.len() == 0 {
+                        // If the file is empty, the failure is
+                        // benign.  Make sure the next snapshot
+                        // definitely starts from scratch.
+                        clear_version_id(&self.file).map_err(|e| {
+                            chain_error!(e, "failed to clear version xattr on empty db file")
+                        })?;
+                        return Ok(());
+                    }
+                }
+
+                return Err(fresh_warn!("invalid db file", path=?self.path));
+            }
+        };
+
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
         // If we can't find any version id, try to set one for the next run.
         if version_id.is_empty() {
