@@ -827,7 +827,7 @@ async fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Res
                         %target.name,
                         ?blob_name,
                         len = bytes.len(),
-                        "backing off after a failed PUT."
+                        "backing off after a failed PUT"
                     );
                     tokio::time::sleep(backoff).await;
                 }
@@ -923,7 +923,7 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                         ?backoff,
                         %target.name,
                         ?blob_name,
-                        "backing off after a failed PUT."
+                        "backing off after a failed PUT"
                     );
                     std::thread::sleep(backoff);
                 }
@@ -1061,18 +1061,18 @@ fn wait_for_meta_copy_lock(parent: &Path) -> Result<Option<OfdLock>> {
         tracing::debug!(
             ?backoff,
             ?parent,
-            "successfully acquired meta copy lock after sleeping."
+            "successfully acquired meta copy lock after sleeping"
         );
     } else {
         tracing::info!(
             ?backoff,
             ?parent,
             ?ret,
-            "failed to acquire meta copy lock after sleeping."
+            "failed to acquire meta copy lock after sleeping"
         );
 
         if rng.gen_bool(COPY_LOCK_RESET_RATE) {
-            tracing::info!(?parent, "resetting stuck meta copy lock file.");
+            tracing::info!(?parent, "resetting stuck meta copy lock file");
             drop_result!(replication_buffer::reset_meta_copy_lock(parent.to_path_buf()),
                          e => chain_error!(e, "failed to reset meta copy lock after acquisition failure",
                                            ?backoff, ?parent));
@@ -2129,7 +2129,7 @@ impl CopierBackend {
                             // clones that lack the source path.
                             if source_or.is_none() {
                                 tracing::warn!(?spool_path, ?source,
-                                               "registering a new CopierSpoolState without a source path.");
+                                               "registering a new CopierSpoolState without a source path");
                             }
 
                             Arc::new(CopierSpoolState{

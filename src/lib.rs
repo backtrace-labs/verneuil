@@ -416,7 +416,7 @@ pub fn copy_all_spool_paths(
             spools.sort_unstable();
 
             if spools.len() > 1 {
-                tracing::warn!(?spools, path=?subdir.path(), "found multiple inodes for the same source db.");
+                tracing::warn!(?spools, path=?subdir.path(), "found multiple inodes for the same source db");
             }
 
             if let Some(spool) = spools.pop() {

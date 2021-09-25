@@ -910,7 +910,7 @@ impl ReplicationBuffer {
         if overwrite_meta || !buf.exists() {
             use std::io::Write;
 
-            let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata.");
+            let json_bytes = serde_json::to_vec(&targets).expect("failed to serialize metadata");
             if let Ok((temp, _)) = create_scratch_file(self.spooling_directory.clone()) {
                 let written = temp.as_file().write_all(&json_bytes).map_err(|e| {
                     chain_error!(

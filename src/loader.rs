@@ -413,7 +413,7 @@ fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
                     ?backoff,
                     %source.name,
                     %name,
-                    "backing off after a failed GET."
+                    "backing off after a failed GET"
                 );
                 std::thread::sleep(backoff);
             }

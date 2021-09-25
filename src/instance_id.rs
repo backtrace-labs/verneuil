@@ -24,7 +24,7 @@ fn compute_boot_time_slow() -> Result<u64> {
         }
     }
 
-    Err(Error::new(ErrorKind::Other, "btime not in `/proc/stat`."))
+    Err(Error::new(ErrorKind::Other, "btime not in `/proc/stat`"))
 }
 
 /// Returns the Unix timestamp at which the machine booted up.  This
