@@ -8,6 +8,8 @@ use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::instrument;
 use umash::Fingerprint;
@@ -52,6 +54,11 @@ pub(crate) struct Tracker {
     buffer: Option<ReplicationBuffer>,
     copier: Copier,
     replication_targets: ReplicationTargetList,
+
+    // Counts the number of chunks (slightly more than that in fact,
+    // to account for constant overhead) published by this tracker
+    // since its last GC.
+    chunk_counter: AtomicU64,
 
     // We cache up to one v4 uuid, to speed up calls to
     // `update_version_id`.
@@ -149,6 +156,7 @@ impl Tracker {
             copier,
             cached_uuid: Some(Uuid::new_v4()),
             replication_targets,
+            chunk_counter: AtomicU64::new(0),
             dirty_chunks: BTreeMap::new(),
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
@@ -583,11 +591,19 @@ impl Tracker {
             // If we just published our snapshot to the ready
             // buffer, we can delete all chunks.
             drop_result!(buf.gc_chunks(&[]),
-                        e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
+                         e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
+            self.chunk_counter.store(0, Ordering::Relaxed);
         } else {
             use rand::Rng;
 
             let mut rng = rand::thread_rng();
+            // Always increment the chunk counter by at least one:
+            // we did *some* work here.
+            let work = (copied as u64).saturating_add(1);
+            let total_count = self
+                .chunk_counter
+                .fetch_add(work, Ordering::Relaxed)
+                .saturating_add(work);
 
             // If the ready buffer is stale, we can only remove
             // now-useless chunks, with probability slightly
@@ -601,9 +617,17 @@ impl Tracker {
             // chunks.  The probability is low enough that we can
             // amortise the wasted work as constant overhead for
             // each call to `snapshot_file_contents`.
-            if copied >= rng.gen_range(0..=chunks.len() / 4) {
+            //
+            // We also trigger based on a deterministic counter, but
+            // hopefully much more rarely than via the random
+            // criterion: we want to avoid really long delays between
+            // GCs, however unlikely they may be.
+            if copied >= rng.gen_range(0..=chunks.len() / 4)
+                || total_count / 2 >= chunks.len() as u64
+            {
                 drop_result!(buf.gc_chunks(&chunks),
-                            e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
+                             e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
+                self.chunk_counter.store(0, Ordering::Relaxed);
             }
         }
 
