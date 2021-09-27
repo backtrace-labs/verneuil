@@ -734,6 +734,9 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
         // If also fine if we can't rename over `consuming`: that
         // means there's already something there waiting to be copied.
         Err(e) if matches!(e.kind(), ErrorKind::AlreadyExists | ErrorKind::NotFound) => {}
+        // We can also get `ENOTEMPTY` if `consuming` isn't empty;
+        // that's not currently exposed as an `ErrorKind`.
+        Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {}
         Err(e) => return Err(chain_error!(e, "failed to acquire new consuming directory")),
     }
 
@@ -768,6 +771,11 @@ pub(crate) fn remove_consuming_directory_if_empty(parent: PathBuf) -> Result<()>
     match std::fs::remove_dir(&ready) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => Err(chain_info!(
+            e,
+            "found non-empty consuming directory",
+            ?ready
+        )),
         Err(e) => Err(chain_error!(
             e,
             "failed to remove consuming directory",
