@@ -58,6 +58,7 @@ tracing-subscriber = { version = "0.2", optional = true, features = ["tracing-lo
 uluru = "2"
 umash = "0.1.2"
 uuid = { version = "0.8", features = ["v4"] }
+zstd = "0.9"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.2", features = ["tracing-log"] }  # Examples set up tracing.

@@ -46,6 +46,13 @@ const LRU_CACHE_SIZE: usize = 128;
 /// Load chunks in a dedicated thread pool of this size.
 const LOADER_POOL_SIZE: usize = 10;
 
+/// Size limit for chunks after decompression.  We expect
+/// all real chunks to be strictly shorter.
+const DECODED_CHUNK_SIZE_LIMIT: usize = 1usize << 20;
+
+/// A zstd frame starts with 0xFD2FB528 in 4 little-endian bytes.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 #[derive(Eq, PartialEq, Debug)]
 // `#[non_exhaustive]` is too weak: it's a no-op within the crate.
 #[allow(clippy::manual_non_exhaustive)]
@@ -268,13 +275,99 @@ impl Loader {
 
         for source in &self.remote_sources {
             if let Some(remote) = load_from_source(&source, &name)? {
-                update_contents(remote)?;
+                update_contents(maybe_decompress(remote, fprint)?)?;
                 #[cfg(not(feature = "test_vfs"))]
                 return Ok(contents);
             }
         }
 
         Ok(contents)
+    }
+}
+
+/// Attempts to decompress `payload` if that makes it match `fprint`.
+fn maybe_decompress(payload: Vec<u8>, fprint: Fingerprint) -> Result<Vec<u8>> {
+    let hash_matches = |payload: &[u8]| -> bool {
+        // Only check the first 64-bit half of the fingerprint, for
+        // speed.
+        hash_file_chunk(&payload) == fprint.hash[0]
+    };
+
+    let compare_hash = |payload: &[u8]| -> Result<()> {
+        let actual_hash = hash_file_chunk(&payload);
+
+        if actual_hash == fprint.hash[0] {
+            Ok(())
+        } else {
+            Err(fresh_error!(
+                "mismatching file contents",
+                ?fprint,
+                ?actual_hash,
+                len = payload.len()
+            ))
+        }
+    };
+
+    let decompress = |payload: &[u8]| -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+
+        let mut decoder = zstd::Decoder::new(&*payload)?;
+        let mut decompressed = vec![0; DECODED_CHUNK_SIZE_LIMIT];
+
+        match decoder.read(&mut decompressed) {
+            Ok(n) if n < DECODED_CHUNK_SIZE_LIMIT => {
+                decompressed.resize(n, 0u8);
+                decompressed.shrink_to_fit();
+                Ok(decompressed)
+            }
+            Ok(_) => Err(std::io::Error::new(
+                ErrorKind::Other,
+                "decoded zstd data >= DECODED_CHUNK_SIZE_LIMIT",
+            )),
+            Err(e) => Err(e),
+        }
+    };
+
+    if !payload.starts_with(&ZSTD_MAGIC) {
+        return Ok(payload);
+    }
+
+    match decompress(&payload) {
+        Ok(decompressed) => {
+            match compare_hash(&decompressed) {
+                Ok(()) => Ok(decompressed),
+                Err(e) => {
+                    // Maybe the original data only accidentally
+                    // looks like zstd-compressed bytes.  See
+                    // if that matches.
+                    if hash_matches(&payload) {
+                        Ok(payload)
+                    } else {
+                        // We don't want the original data
+                        // either.  Report that zstd
+                        // corruption.
+                        Err(chain_error!(
+                            e,
+                            "decoded zstd data does not match fingerprint",
+                            ?fprint,
+                            len = payload.len()
+                        ))
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if hash_matches(&payload) {
+                Ok(payload)
+            } else {
+                Err(chain_error!(
+                    e,
+                    "failed to decode zstd data",
+                    ?fprint,
+                    len = payload.len()
+                ))
+            }
+        }
     }
 }
 
