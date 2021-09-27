@@ -51,7 +51,7 @@ pub(crate) struct Tracker {
     file: ManuallyDrop<File>,
     // Canonical path for the tracked file.
     path: PathBuf,
-    buffer: Option<ReplicationBuffer>,
+    buffer: ReplicationBuffer,
     copier: Copier,
     replication_targets: ReplicationTargetList,
 
@@ -135,24 +135,25 @@ impl Tracker {
             "A path generated from a String should be convertible back to a String."
         );
 
-        let buffer = ReplicationBuffer::new(&path, &file)
-            .map_err(|e| chain_error!(e, "failed to create replication buffer", ?path))?;
+        let buffer = match ReplicationBuffer::new(&path, &file)
+            .map_err(|e| chain_error!(e, "failed to create replication buffer", ?path))?
+        {
+            Some(buf) => buf,
+            None => return Ok(None),
+        };
         let replication_targets = crate::replication_target::get_default_replication_targets();
         let copier;
 
         // Let the copier pick up any ready snapshot left behind, e.g,
         // by an older crashed process.
-        if let Some(buf) = &buffer {
-            // But first, make sure to overwrite the replication config with our own.
-            buf.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
-            copier = Copier::get_global_copier()
-                .with_spool_path(Arc::new(buf.spooling_directory().to_owned()), path.clone());
-            copier.signal_ready_buffer();
-        } else {
-            // If there is no replication buffer directory, don't
-            // create a tracker.
-            return Ok(None);
-        }
+
+        // But first, make sure to overwrite the replication config with our own.
+        buffer.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
+        copier = Copier::get_global_copier().with_spool_path(
+            Arc::new(buffer.spooling_directory().to_owned()),
+            path.clone(),
+        );
+        copier.signal_ready_buffer();
 
         Ok(Some(Tracker {
             file,
@@ -205,11 +206,11 @@ impl Tracker {
             // expect this to happen most of the time, when the DB is
             // configured with 64 KB pages.
             let slice = unsafe { std::slice::from_raw_parts(buf, count as usize) };
-            let value = if let Some(repl) = &self.buffer {
+            let value = {
                 let fprint = fingerprint_file_chunk(&slice);
 
                 // Remember the chunk's fingerprint if it's now staged.
-                match repl.stage_chunk(fprint, slice) {
+                match self.buffer.stage_chunk(fprint, slice) {
                     Ok(_) => Some(fprint),
                     Err(e) => {
                         let _ = chain_warn!(e, "failed to stage chunk preemptively",
@@ -217,8 +218,6 @@ impl Tracker {
                         None
                     }
                 }
-            } else {
-                None
             };
 
             self.dirty_chunks.insert(offset, value);
@@ -239,12 +238,12 @@ impl Tracker {
     #[instrument(skip(self, base), err)]
     fn snapshot_chunks(
         &self,
-        repl: &ReplicationBuffer,
         base: Option<Vec<Fingerprint>>,
     ) -> Result<(u64, Vec<Fingerprint>, usize)> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
+        let repl = &self.buffer;
         let len = self
             .file
             .metadata()
@@ -406,9 +405,10 @@ impl Tracker {
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     #[instrument(skip(self), err)]
-    fn snapshot_file_contents(&self, buf: &ReplicationBuffer) -> Result<()> {
+    fn snapshot_file_contents(&self) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
+        let buf = &self.buffer;
         let header_fprint = match fingerprint_sqlite_header(&self.file) {
             Some(fprint) => fprint,
             None => {
@@ -539,7 +539,7 @@ impl Tracker {
         }
 
         let (copied, chunks) = {
-            let (len, chunks, copied) = self.snapshot_chunks(&buf, base_fprints)?;
+            let (len, chunks, copied) = self.snapshot_chunks(base_fprints)?;
 
             let (ctime, ctime_ns) = match self.file.metadata() {
                 Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
@@ -584,7 +584,7 @@ impl Tracker {
         }
 
         #[cfg(feature = "test_validate_reads")]
-        self.validate_all_snapshots(buf);
+        self.validate_all_snapshots();
 
         // We did something.  Tell the copier.
         self.copier.signal_ready_buffer();
@@ -648,7 +648,7 @@ impl Tracker {
                      e => chain_info!(e, "failed to clear scratch directory", path=?self.path));
 
         #[cfg(feature = "test_validate_writes")]
-        self.compare_snapshot(&buf).expect("snapshots must match");
+        self.compare_snapshot().expect("snapshots must match");
         Ok(())
     }
 
@@ -659,15 +659,13 @@ impl Tracker {
     #[instrument(skip(self), err)]
     pub fn snapshot(&mut self) -> Result<()> {
         let ret = (|| {
-            if let Some(buffer) = &self.buffer {
-                #[cfg(feature = "test_validate_reads")]
-                self.validate_all_snapshots(&buffer);
-                // Nothing to do if we know we're clean.
-                if self.backing_file_state != MutationState::Clean {
-                    let _span = tracing::info_span!("snapshot",
-                                                    path=?self.path, ?self.backing_file_state);
-                    return self.snapshot_file_contents(&buffer);
-                }
+            #[cfg(feature = "test_validate_reads")]
+            self.validate_all_snapshots();
+            // Nothing to do if we know we're clean.
+            if self.backing_file_state != MutationState::Clean {
+                let _span = tracing::info_span!("snapshot",
+                                                path=?self.path, ?self.backing_file_state);
+                return self.snapshot_file_contents();
             }
 
             Ok(())
@@ -697,9 +695,7 @@ impl Tracker {
     #[instrument(skip(self))]
     pub fn pre_lock_checks(&self) {
         #[cfg(feature = "test_validate_reads")]
-        if let Some(buffer) = &self.buffer {
-            self.validate_all_snapshots(&buffer);
-        }
+        self.validate_all_snapshots();
     }
 }
 
@@ -715,10 +711,10 @@ enum ChunkSource {
 impl Tracker {
     fn fetch_snapshot_or_die(
         &self,
-        buf: &ReplicationBuffer,
         manifest: &Manifest,
         source: ChunkSource,
     ) -> crate::snapshot::Snapshot {
+        let buf = &self.buffer;
         let mut local_chunk_dirs = Vec::new();
         if source >= ChunkSource::Staged {
             local_chunk_dirs.push(buf.staged_chunk_directory());
@@ -744,7 +740,6 @@ impl Tracker {
     /// every chunk in that snapshot.
     fn validate_snapshot(
         &self,
-        buf: &ReplicationBuffer,
         manifest_or: crate::result::Result<Option<Manifest>>,
         source: ChunkSource,
     ) -> Result<()> {
@@ -756,43 +751,40 @@ impl Tracker {
             Err(err) => return Err(err),
         };
 
-        self.fetch_snapshot_or_die(buf, &manifest, source);
+        self.fetch_snapshot_or_die(&manifest, source);
         Ok(())
     }
 
     /// Assert that the contents of ready and staged snapshots make
     /// sense (if they exist).
     #[cfg(feature = "test_validate_reads")]
-    fn validate_all_snapshots(&self, buf: &ReplicationBuffer) {
+    fn validate_all_snapshots(&self) {
+        let buf = &self.buffer;
         self.validate_snapshot(
-            buf,
             buf.read_consuming_manifest(&self.path),
             ChunkSource::Consuming,
         )
         .expect("consuming snapshot must be valid");
-        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), ChunkSource::Ready)
+        self.validate_snapshot(buf.read_ready_manifest(&self.path), ChunkSource::Ready)
             .expect("ready snapshot must be valid");
-        self.validate_snapshot(
-            buf,
-            buf.read_staged_manifest(&self.path),
-            ChunkSource::Staged,
-        )
-        .expect("staged snapshot must be valid");
+        self.validate_snapshot(buf.read_staged_manifest(&self.path), ChunkSource::Staged)
+            .expect("staged snapshot must be valid");
     }
 
     /// Attempts to assert that the snapshot's contents match that of
     /// our db file, and that the ready snapshot is valid.
-    fn compare_snapshot(&self, buf: &ReplicationBuffer) -> Result<()> {
+    fn compare_snapshot(&self) -> Result<()> {
         use blake2b_simd::Params;
         use std::os::unix::io::AsRawFd;
 
+        let buf = &self.buffer;
+
         self.validate_snapshot(
-            buf,
             buf.read_consuming_manifest(&self.path),
             ChunkSource::Consuming,
         )
         .expect("consuming snapshot must be valid");
-        self.validate_snapshot(buf, buf.read_ready_manifest(&self.path), ChunkSource::Ready)
+        self.validate_snapshot(buf.read_ready_manifest(&self.path), ChunkSource::Ready)
             .expect("ready snapshot must be valid");
 
         let self_path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
@@ -826,7 +818,7 @@ impl Tracker {
                 .map(|fp| fp.into())
         );
 
-        let snapshot = self.fetch_snapshot_or_die(buf, &manifest, ChunkSource::Staged);
+        let snapshot = self.fetch_snapshot_or_die(&manifest, ChunkSource::Staged);
         std::io::copy(&mut snapshot.as_read(0, u64::MAX), &mut hasher).expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())
