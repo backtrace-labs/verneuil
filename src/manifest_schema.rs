@@ -184,7 +184,7 @@ pub(crate) fn extract_version_id(
     // xattrs work, but we can't get one.  Assume the worst.
     if ret == 0 {
         let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::NotFound {
+        if error.kind() != std::io::ErrorKind::NotFound && error.raw_os_error() != Some(0) {
             tracing::warn!(?error, "failed to read version xattr");
         }
         buf.clear();
