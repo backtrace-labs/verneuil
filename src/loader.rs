@@ -86,9 +86,7 @@ lazy_static::lazy_static! {
     // of the fingerprint outside the `Arc` to minimise indirection
     // when this optimisation does not trigger.
     static ref ZERO_FILLED_CHUNK: (Fingerprint, Arc<Chunk>) = {
-        let mut payload = Vec::new();
-        payload.resize(crate::tracker::SNAPSHOT_GRANULARITY as usize, 0u8);
-
+        let payload = vec![0; crate::tracker::SNAPSHOT_GRANULARITY as usize];
         let fprint = fingerprint_file_chunk(&payload);
         (fprint, Arc::new(Chunk::new(fprint, payload).expect("fprint must match")))
     };
