@@ -144,7 +144,6 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::fs::Permissions;
-use std::io::Error;
 use std::io::ErrorKind;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -162,7 +161,6 @@ use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
-use crate::error_from_os;
 use crate::filtered_io_error;
 use crate::filtered_os_error;
 use crate::fresh_error;
@@ -582,47 +580,27 @@ fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
 ///
 /// Returns Ok(()) if the target file exists.
 #[instrument(skip(worker), err)]
-fn call_with_temp_file(target: &Path, worker: impl Fn(&mut File) -> Result<()>) -> Result<()> {
-    use std::os::unix::io::FromRawFd;
-
-    // See c/file_ops.h
-    extern "C" {
-        fn verneuil__open_temp_file(directory: *const c_char, mode: i32) -> i32;
-        fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
-    }
-
+fn call_with_temp_file(
+    spool_dir: PathBuf,
+    target: &Path,
+    worker: impl Fn(&mut File) -> Result<()>,
+) -> Result<()> {
     if target.exists() {
         return Ok(());
     }
 
-    let parent = target.parent().expect("parent directory must exist");
-    let parent_str = CString::new(parent.as_os_str().as_bytes())
-        .map_err(|e| chain_error!(e, "unable to convert parent path to C string", ?parent))?;
-    let target_str = CString::new(target.as_os_str().as_bytes())
-        .map_err(|e| chain_error!(e, "unable to convert target path to C string", ?target))?;
-
-    let fd = unsafe { verneuil__open_temp_file(parent_str.as_ptr(), 0o444) };
-    if fd < 0 {
-        return Err(error_from_os!("failed to open temporary file", ?parent_str));
-    }
-
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = worker(&mut file)?;
-
-    if unsafe { verneuil__link_temp_file(fd, target_str.as_ptr()) } < 0 {
-        let error = Error::last_os_error();
-        if error.kind() == ErrorKind::AlreadyExists {
-            return Ok(());
+    let (mut temp, _) = create_scratch_file(spool_dir)
+        .map_err(|e| chain_error!(e, "failed to prepare for publication", ?target))?;
+    let result = worker(temp.as_file_mut())?;
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(result),
+        Err(tempfile::PersistError { error: e, .. })
+            if e.kind() == ErrorKind::AlreadyExists || target.exists() =>
+        {
+            Ok(result)
         }
-
-        return Err(chain_error!(
-            error,
-            "failed to publish temporary file",
-            ?target_str
-        ));
+        Err(e) => Err(chain_error!(e, "failed to publish temporary file", ?target)),
     }
-
-    Ok(result)
 }
 
 /// Returns a conservatively percent-encoded URI for `hostname_or` and
@@ -989,7 +967,7 @@ impl ReplicationBuffer {
         target.push(CHUNKS);
         target.push(&chunk_name);
 
-        call_with_temp_file(&target, |dst| {
+        call_with_temp_file(self.spooling_directory.clone(), &target, |dst| {
             dst.write_all(data)
                 .map_err(|e| chain_error!(e, "failed to write chunk", ?target, len = data.len()))
         })

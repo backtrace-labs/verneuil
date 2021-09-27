@@ -10,18 +10,6 @@
 #include <unistd.h>
 
 int
-verneuil__open_temp_file(const char *directory, int mode)
-{
-        int r;
-
-        do {
-                r = open(directory, O_RDWR | O_CLOEXEC | O_TMPFILE, mode);
-        } while (r < 0 && errno == EINTR);
-
-        return r;
-}
-
-int
 verneuil__link_temp_file(int fd, const char *target)
 {
         char buf[200];
