@@ -1,6 +1,7 @@
 #pragma once
 #include "verneuil.h"
 
+#include <sqlite3ext.h>
 #include <assert.h>
 #include <stdint.h>
 

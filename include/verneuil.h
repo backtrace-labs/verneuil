@@ -1,5 +1,4 @@
 #pragma once
-#include <sqlite3ext.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
