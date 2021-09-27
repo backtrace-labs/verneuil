@@ -211,7 +211,7 @@ const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
 
 /// Only delete scratch files when they're older than this grace
 /// period.
-const SCRATCH_FILE_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const SCRATCH_FILE_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 /// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
@@ -1236,12 +1236,16 @@ impl ReplicationBuffer {
     #[instrument(err)]
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
         fn file_is_stale(path: &Path) -> Result<bool> {
+            use std::os::unix::fs::MetadataExt;
+
             let meta = std::fs::metadata(path)
                 .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to stat file", ?path))?;
-            let modified = meta
-                .modified()
-                .map_err(|e| chain_error!(e, "failed to fetch mtime", ?path))?;
-            let elapsed = modified
+            let changed = Duration::new(meta.ctime() as u64, meta.ctime_nsec() as u32);
+
+            let ctime = std::time::UNIX_EPOCH
+                .checked_add(changed)
+                .unwrap_or_else(std::time::SystemTime::now);
+            let elapsed = ctime
                 .elapsed()
                 .map_err(|e| chain_warn!(e, "time went backward", ?path))?;
             Ok(elapsed >= SCRATCH_FILE_GRACE_PERIOD)
