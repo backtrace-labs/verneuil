@@ -2,28 +2,10 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <stdio.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/xattr.h>
 #include <unistd.h>
-
-int
-verneuil__link_temp_file(int fd, const char *target)
-{
-        char buf[200];
-        int r;
-
-        r = snprintf(buf, sizeof(buf), "/proc/self/fd/%i", fd);
-        assert((size_t)r < sizeof(buf));
-
-        do {
-                r = linkat(AT_FDCWD, buf, AT_FDCWD, target, AT_SYMLINK_FOLLOW);
-        } while (r < 0 && errno == EINTR);
-
-        return r;
-}
 
 ssize_t
 verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz)

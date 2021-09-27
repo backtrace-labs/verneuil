@@ -7,11 +7,6 @@
  */
 
 /**
- * Attempts to create a new hardlink to `fd` at `target`.
- */
-int verneuil__link_temp_file(int fd, const char *target);
-
-/**
  * Attempts to get xattr `name` from `fd`.
  *
  * Returns the xattr size on success, and -1 on error.

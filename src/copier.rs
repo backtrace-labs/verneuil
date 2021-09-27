@@ -1245,9 +1245,11 @@ impl CopierWorker {
                     Ok(Some(async move {
                         copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
                             .await?;
-                        replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
-                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                        })?;
+                        replication_buffer::tap_meta_file(&parent, &name, &mut file).map_err(
+                            |e| {
+                                chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                            },
+                        )?;
                         did_something.store(true, Ordering::Relaxed);
                         Ok(())
                     }))
@@ -1467,9 +1469,11 @@ impl CopierWorker {
                     Ok(Some(async move {
                         copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
                             .await?;
-                        replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
-                            chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
-                        })?;
+                        replication_buffer::tap_meta_file(&parent, &name, &mut file).map_err(
+                            |e| {
+                                chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                            },
+                        )?;
 
                         recent_staged_directories.lock().unwrap().insert(identifier);
                         did_something.store(true, Ordering::Relaxed);

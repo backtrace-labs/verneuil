@@ -141,12 +141,9 @@
 //! guarantee progress both when `Tracker`s are idle, and when they're
 //! constantly churning.
 use std::collections::HashSet;
-use std::ffi::CString;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io::ErrorKind;
-use std::os::raw::c_char;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -162,7 +159,6 @@ use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
 use crate::filtered_io_error;
-use crate::filtered_os_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::instance_id;
@@ -355,14 +351,12 @@ pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> 
 
 /// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
 #[instrument(level = "debug", err)]
-pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &File) -> Result<()> {
-    use rand::Rng;
-    use std::os::unix::io::AsRawFd;
-
-    // See c/file_ops.h
-    extern "C" {
-        fn verneuil__link_temp_file(fd: i32, target: *const c_char) -> i32;
-    }
+pub(crate) fn tap_meta_file(
+    spool_dir: &Path,
+    name: &std::ffi::OsStr,
+    file: &mut File,
+) -> Result<()> {
+    use std::io::Seek;
 
     // `spool_dir` is for a specific replicated file, i.e.,
     // ".../$MANGLED_PATH/$DEV.$INO/".  The ".tap" directory lives
@@ -384,36 +378,15 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
 
     tap.push(name);
 
-    let mut scratch = spool_dir.to_path_buf();
-    scratch.push(STAGING);
-    scratch.push(SCRATCH);
-    scratch.push(format!(
-        "{}.tap_meta.{}.{}.tmp",
-        process_id(),
-        name.to_string_lossy(),
-        rand::thread_rng().gen::<u64>()
-    ));
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| chain_error!(e, "failed to rewind manifest file", ?file, ?tap))?;
+    let (mut temp, _) = create_scratch_file(spool_dir.to_path_buf())?;
+    std::io::copy(file, &mut temp)
+        .map_err(|e| chain_error!(e, "failed to copy .tap file", ?tap))?;
 
-    let scratch_str = CString::new(scratch.as_os_str().as_bytes())
-        .map_err(|e| chain_error!(e, "unable to convert scratch path to C string", ?scratch))?;
-
-    // We must create a new name for the file's inode before we can rename it.
-    if unsafe { verneuil__link_temp_file(file.as_raw_fd(), scratch_str.as_ptr()) } < 0 {
-        return Err(
-            filtered_os_error!(ErrorKind::NotFound => Level::DEBUG, "failed to create scratch file", ?scratch),
-        );
-    }
-
-    let result = std::fs::rename(&scratch, &tap)
-        .map_err(|e| chain_warn!(e, "failed to tap update meta file"));
-
-    // Unconditionally try to clean up before returning: `rename(2)`
-    // no-ops successfully when `tap` and `scratch` point to the same
-    // file.
-    drop_result!(std::fs::remove_file(&scratch),
-                 e if e.kind() == ErrorKind::NotFound => (),
-                 e => chain_warn!(e, "failed to remove scratch file", ?scratch));
-    result
+    temp.persist(&tap)
+        .map_err(|e| chain_warn!(e, "failed to tap update meta file"))?;
+    Ok(())
 }
 
 /// Attempts to acquire the local lock around uploading "meta"
