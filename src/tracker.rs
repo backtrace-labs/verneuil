@@ -109,8 +109,11 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
 }
 
 impl Tracker {
+    /// Attempts to create a fresh tracker for `fd` at `c_path`.
+    ///
+    /// Returns Ok(None) if there is no replication spooling dir.
     #[instrument(err)]
-    pub fn new(c_path: *const c_char, fd: i32) -> Result<Tracker> {
+    pub fn new(c_path: *const c_char, fd: i32) -> Result<Option<Tracker>> {
         use std::os::unix::io::FromRawFd;
 
         if fd < 0 {
@@ -146,10 +149,12 @@ impl Tracker {
                 .with_spool_path(Arc::new(buf.spooling_directory().to_owned()), path.clone());
             copier.signal_ready_buffer();
         } else {
-            copier = Copier::get_global_copier()
+            // If there is no replication buffer directory, don't
+            // create a tracker.
+            return Ok(None);
         }
 
-        Ok(Tracker {
+        Ok(Some(Tracker {
             file,
             path,
             buffer,
@@ -160,7 +165,7 @@ impl Tracker {
             dirty_chunks: BTreeMap::new(),
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
-        })
+        }))
     }
 
     /// Remembers the file's state.  This function is called

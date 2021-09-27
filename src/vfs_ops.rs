@@ -66,7 +66,8 @@ extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> SqliteCode {
 
     match Tracker::new(file.path, file.fd) {
         Err(_) => SqliteCode::CantOpen,
-        Ok(tracker) => {
+        Ok(None) => SqliteCode::Ok,
+        Ok(Some(tracker)) => {
             file.tracker = Box::leak(Box::new(tracker)) as *mut Tracker as *mut _;
             SqliteCode::Ok
         }
