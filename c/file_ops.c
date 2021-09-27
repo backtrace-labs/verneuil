@@ -37,18 +37,6 @@ verneuil__link_temp_file(int fd, const char *target)
         return r;
 }
 
-int
-verneuil__open_directory(const char *path)
-{
-        int r;
-
-        do {
-                r = open(path, O_CLOEXEC | O_DIRECTORY | O_PATH);
-        } while (r < 0 && errno == EINTR);
-
-        return r;
-}
-
 ssize_t
 verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz)
 {

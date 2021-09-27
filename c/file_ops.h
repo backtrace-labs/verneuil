@@ -17,11 +17,6 @@ int verneuil__open_temp_file(const char *directory, int mode);
 int verneuil__link_temp_file(int fd, const char *target);
 
 /**
- * Opens a directory as O_PATH.
- */
-int verneuil__open_directory(const char *);
-
-/**
  * Attempts to get xattr `name` from `fd`.
  *
  * Returns the xattr size on success, and -1 on error.

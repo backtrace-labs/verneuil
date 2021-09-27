@@ -29,6 +29,13 @@
 //! When the replication subsystem is ready to consume a "ready"
 //! directory, the directory is first renamed to "consuming."
 //!
+//! That directory has one member, a pseudo-uniquely named directory.
+//! Inside that pseudo-unique directory are a "chunks" and a "meta"
+//! subdirectories; every chunk file in "chunks" must be published
+//! before the manifest in "meta" is safe to copy over.  The
+//! pseudo-unique name lets readers safely consume from a path without
+//! having to worry about ABA.
+//!
 //! The files are *not* fsynced before publishing them: the buffer
 //! directory is tagged with an instance id, so any file we observe
 //! must have been created after the last crash or reboot.
@@ -181,7 +188,7 @@ lazy_static::lazy_static! {
 /// or downgrade to a different directory tree format, Verneuil will
 /// treat that as no or stale data (a well tested path), rather than
 /// getting stuck on an unexpected directory structure.
-const ON_DISK_FORMAT_VERSION_SUFFIX: &str = "v1";
+const ON_DISK_FORMAT_VERSION_SUFFIX: &str = "v2";
 
 /// The ".tap" subdirectory isn't associated with any specific
 /// replicated file, and is populated with name-addressed files
@@ -276,6 +283,44 @@ fn create_scratch_file(spool_dir: PathBuf) -> Result<(tempfile::NamedTempFile, P
     Ok((temp, scratch))
 }
 
+/// Returns a string that is safe to use as a filename and is
+/// extremely unlikely to be repeated.
+fn pseudo_unique_filename() -> String {
+    use rand::Rng;
+    use std::sync::atomic::AtomicU64;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let pid = process_id();
+    let timestamp = match std::time::SystemTime::UNIX_EPOCH.elapsed() {
+        Ok(duration) => duration.as_micros(),
+        Err(_) => 0,
+    };
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let random = rand::thread_rng().gen::<u128>();
+
+    format!("{}.{}.{}.{:x}", pid, timestamp, seq, random)
+}
+
+/// Returns `base` extended with an arbitrary subdirectory, if these
+/// is at least one.  Otherwise, returns an inexistent child of `base`.
+fn append_subdirectory(mut base: PathBuf) -> PathBuf {
+    fn find_child(base: &Path) -> std::io::Result<Option<std::ffi::OsString>> {
+        if let Some(dirent) = std::fs::read_dir(base)?.flatten().next() {
+            Ok(Some(dirent.file_name()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    match find_child(&base) {
+        Ok(Some(child)) => base.push(child),
+        _ => base.push(pseudo_unique_filename()),
+    }
+
+    base
+}
+
 /// Returns the .tap path for `source_db`'s manifest proto file,
 /// given the path prefix for spooling directories (or None to use
 /// the global default).
@@ -334,7 +379,7 @@ pub(crate) fn tap_meta_file(spool_dir: &Path, name: &std::ffi::OsStr, file: &Fil
     tap.push(DOT_TAP);
     std::fs::create_dir_all(&tap).map_err(|e| {
         filtered_io_error!(e, ErrorKind::AlreadyExists => Level::DEBUG,
-                                        "failed to create .tap dir", dir=?tap)
+                           "failed to create .tap dir", dir=?tap)
     })?;
     std::fs::set_permissions(&tap, PermissionsExt::from_mode(0o777))
         .map_err(|e| chain_error!(e, "failed to set .tap permissions", dir=?tap))?;
@@ -716,19 +761,13 @@ pub(crate) fn mutable_consuming_directory(parent: PathBuf) -> PathBuf {
 /// `parent`: renames "ready" to "consuming", and opens a snapshot
 /// of that "consuming" directory.
 ///
-/// On success, returns a process-local path to that subdirectory, and
-/// a file object that must be kept alive to ensure the path is valid.
+/// On success, returns a path for the consuming directory's
+/// pseudo-unique subdirectory (which contains the "chunks" and "meta"
+/// subdirectories).
 ///
 /// Returns Ok(None) if the directory does not exist.
 #[instrument(level = "trace", err)]
-pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBuf, File)>> {
-    use std::os::unix::io::FromRawFd;
-
-    // See c/file_ops.h
-    extern "C" {
-        fn verneuil__open_directory(path: *const c_char) -> i32;
-    }
-
+pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<PathBuf>> {
     let ready = mutable_ready_directory(parent.clone());
     let consuming = mutable_consuming_directory(parent);
 
@@ -743,49 +782,42 @@ pub(crate) fn snapshot_ready_directory(parent: PathBuf) -> Result<Option<(PathBu
         // We can also get `ENOTEMPTY` if `consuming` isn't empty;
         // that's not currently exposed as an `ErrorKind`.
         Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {}
-        Err(e) => return Err(chain_error!(e, "failed to acquire new consuming directory")),
-    }
-
-    let consuming_str = CString::new(consuming.as_os_str().as_bytes())
-        .map_err(|e| chain_error!(e, "failed to convert path to C string", ?consuming))?;
-    let fd = unsafe { verneuil__open_directory(consuming_str.as_ptr()) };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-
-        if error.kind() == ErrorKind::NotFound {
-            return Ok(None);
+        // Let the caller consume `consuming` if it exists, even if
+        // `rename` failed: the caller could make progress.
+        Err(e) => {
+            if !consuming.is_dir() {
+                return Err(chain_error!(e, "failed to acquire new consuming directory"));
+            }
         }
-
-        return Err(chain_error!(
-            error,
-            "failed to open consuming directory",
-            ?consuming
-        ));
     }
 
-    let file = unsafe { File::from_raw_fd(fd) };
-    Ok(Some((format!("/proc/self/fd/{}/", fd).into(), file)))
+    let ret = append_subdirectory(consuming);
+    if ret.is_dir() {
+        Ok(Some(ret))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Attempts to remove the "consuming" subdirectory of `parent`, if it
 /// is empty.
-#[instrument(level = "trace", err)]
+#[instrument(level = "trace")]
 pub(crate) fn remove_consuming_directory_if_empty(parent: PathBuf) -> Result<()> {
-    let mut ready = parent;
-    ready.push(CONSUMING);
+    let mut consuming = parent;
+    consuming.push(CONSUMING);
 
-    match std::fs::remove_dir(&ready) {
+    match std::fs::remove_dir(&consuming) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => Err(chain_info!(
             e,
             "found non-empty consuming directory",
-            ?ready
+            ?consuming
         )),
         Err(e) => Err(chain_error!(
             e,
             "failed to remove consuming directory",
-            ?ready
+            ?consuming
         )),
     }
 }
@@ -1000,6 +1032,7 @@ impl ReplicationBuffer {
     pub fn read_consuming_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(CONSUMING);
+        src = append_subdirectory(src);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
         read_manifest_at_path(&src)
@@ -1010,6 +1043,7 @@ impl ReplicationBuffer {
     pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
+        src = append_subdirectory(src);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
         read_manifest_at_path(&src)
@@ -1040,6 +1074,7 @@ impl ReplicationBuffer {
     pub fn ready_chunk_directory(&self) -> PathBuf {
         let mut dir = self.spooling_directory.clone();
         dir.push(READY);
+        dir = append_subdirectory(dir);
         dir.push(CHUNKS);
 
         dir
@@ -1050,6 +1085,7 @@ impl ReplicationBuffer {
     pub fn consuming_chunk_directory(&self) -> PathBuf {
         let mut dir = self.spooling_directory.clone();
         dir.push(CONSUMING);
+        dir = append_subdirectory(dir);
         dir.push(CHUNKS);
 
         dir
@@ -1084,6 +1120,21 @@ impl ReplicationBuffer {
         let mut temp_path = temp.path().to_owned();
         std::fs::set_permissions(&temp_path, PermissionsExt::from_mode(0o777)).map_err(
             |e| chain_error!(e, "failed to set temporary dir permissions", dir=?temp_path),
+        )?;
+
+        // Work inside a pseudo unique subdirectory to let copiers
+        // consume files without worrying about ABA.
+        temp_path.push(pseudo_unique_filename());
+        std::fs::create_dir(&temp_path).map_err(|e| {
+            filtered_io_error!(
+                e,
+                ErrorKind::NotFound => Level::DEBUG,
+                "failed to create temporary pseudo-unique directory",
+                ?temp_path
+            )
+        })?;
+        std::fs::set_permissions(&temp_path, PermissionsExt::from_mode(0o777)).map_err(
+            |e| chain_error!(e, "failed to set temporary pseudo-unique dir permissions", dir=?temp_path),
         )?;
 
         // hardlink relevant chunk files to `temp_path/chunks`.

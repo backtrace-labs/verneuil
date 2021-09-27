@@ -1159,8 +1159,7 @@ impl CopierWorker {
         creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
-        let (consuming, _file) = match replication_buffer::snapshot_ready_directory(parent.clone())?
-        {
+        let consuming = match replication_buffer::snapshot_ready_directory(parent.clone())? {
             Some(ret) => ret,
             None => return Ok(false),
         };
@@ -1214,7 +1213,7 @@ impl CopierWorker {
             let meta_buckets = Arc::new(meta_buckets);
             let _lock = wait_for_meta_copy_lock(&parent)?;
             consume_directory(
-                replication_buffer::directory_meta(consuming),
+                replication_buffer::directory_meta(consuming.clone()),
                 |name, mut file| {
                     self.pace();
                     let name = name.to_owned();
@@ -1237,6 +1236,14 @@ impl CopierWorker {
 
             last_manifest_copy.store_now();
         }
+
+        // The pseudo unique directory should be empty now.  If it
+        // isn't, the `remove_dir` call will fail.
+        drop_result!(std::fs::remove_dir(&consuming),
+                     // It's ok if someone else already beat us to the
+                     // cleanup.
+                     e if e.kind() == ErrorKind::NotFound => {},
+                     e => chain_info!(e, "failed to clean up pseudo-unique consuming directory"));
 
         // And now try to get rid of the hopefully consuming directory.
         drop_result!(replication_buffer::remove_consuming_directory_if_empty(parent),

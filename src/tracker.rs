@@ -721,7 +721,27 @@ impl Tracker {
         }
 
         if source >= ChunkSource::Ready {
-            local_chunk_dirs.push(buf.ready_chunk_directory());
+            let mut ready = buf.ready_chunk_directory();
+            local_chunk_dirs.push(ready.clone());
+
+            // Also derive what the path will become once it's moved
+            // to `consuming`.
+            //
+            // That's a bit of an abstraction violation, but this is
+            // test-only code.
+            let pseudo_unique = ready
+                .file_name()
+                .expect("must have pseudo-unique")
+                .to_owned();
+            ready.pop();
+            let chunks = ready.file_name().expect("must have `chunks`").to_owned();
+            ready.pop();
+            ready.pop();
+
+            ready.push("consuming");
+            ready.push(chunks);
+            ready.push(pseudo_unique);
+            local_chunk_dirs.push(ready);
         }
 
         if source >= ChunkSource::Consuming {
