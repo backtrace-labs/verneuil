@@ -175,6 +175,13 @@ const REPLICATION_LAG_REPORT_THRESHOLD: Duration = Duration::from_secs(120);
 /// Time background "touch" to fully cover each db file once per period.
 const PATROL_TOUCH_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
+/// Compression level for zstd. 0 maps to zstd's internal default
+/// compression level.
+const ZSTD_COMPRESSION_LEVEL: i32 = 0;
+
+/// Disable compression with a negative level value.
+const ZSTD_COMPRESSION_DISABLE: i32 = -1;
+
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
 /// copiers for the same directory, so we must refcount them.
@@ -752,8 +759,15 @@ async fn await_with_slow_logging<T, R: Future<Output = T>>(
 }
 
 /// Attempts to publish the `contents` to `name` in all `targets`.
+///
+/// If `level >= 0`, compresses the contents with zstd, at that level.
 #[instrument(level = "debug", skip(targets), err)]
-async fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Result<()> {
+async fn copy_file(
+    name: &OsStr,
+    contents: &mut File,
+    level: i32,
+    targets: &[Bucket],
+) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
 
@@ -768,6 +782,13 @@ async fn copy_file(name: &OsStr, contents: &mut File, targets: &[Bucket]) -> Res
     contents
         .read_to_end(&mut bytes)
         .map_err(|e| chain_error!(e, "failed to read file contents", ?blob_name))?;
+
+    if level >= 0 {
+        match zstd::encode_all(bytes.as_slice(), level) {
+            Ok(encoded) => bytes = encoded,
+            Err(e) => tracing::warn!(?e, "failed to zstd-compress data"),
+        }
+    }
 
     for target in targets {
         // Apparently we can force S3 to behave better when repeatedly
@@ -1187,7 +1208,7 @@ impl CopierWorker {
                     let chunks_buckets = chunks_buckets.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, &chunks_buckets).await
+                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets).await
                     }))
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
@@ -1222,7 +1243,8 @@ impl CopierWorker {
                     let parent = parent.to_owned();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, &meta_buckets).await?;
+                        copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
+                            .await?;
                         replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
                             chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
                         })?;
@@ -1333,7 +1355,8 @@ impl CopierWorker {
                     let force_meta = force_meta.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, &chunks_buckets).await?;
+                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets)
+                            .await?;
                         // Always upload the contents of the meta
                         // directory if we found chunks to upload.
                         force_meta.store(true, Ordering::Relaxed);
@@ -1442,7 +1465,8 @@ impl CopierWorker {
                     let recent_staged_directories = state.recent_staged_directories.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, &meta_buckets).await?;
+                        copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
+                            .await?;
                         replication_buffer::tap_meta_file(&parent, &name, &file).map_err(|e| {
                             chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
                         })?;
