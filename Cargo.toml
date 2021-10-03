@@ -32,6 +32,7 @@ test_validate_reads = ["test_vfs"]  # Validate snapshots after reads as well (ex
 test_validate_all = ["test_validate_writes", "test_validate_reads"]
 
 [dependencies]
+attohttpc = { version = "0.17", default-features = false }
 backtrace = "0.3"
 # We use blake2b to compare the actual db file and our replicated snapshot,
 # but only during tests.

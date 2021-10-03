@@ -102,8 +102,12 @@ struct Restore {
     ///
     /// If missing, verneuilctl restore will attempt to download it
     /// from remote storage, based on `--hostname` and `--source_path`.
-    #[structopt(short, long, parse(from_os_str))]
-    manifest: Option<PathBuf>,
+    ///
+    /// As special cases, an `http://` or `https://` prefix will be
+    /// downloaded over HTTP(S), and a `file://` prefix will always
+    /// be read as a local path.
+    #[structopt(short, long)]
+    manifest: Option<String>,
 
     /// The hostname of the machine that generated the snapshot.
     ///
@@ -126,8 +130,10 @@ struct Restore {
 fn restore(cmd: Restore, config: Options) -> Result<()> {
     let read_manifest = || {
         if let Some(path) = &cmd.manifest {
-            std::fs::read(path)
-                .map_err(|e| chain_error!(e, "failed to read manifest file", path=?cmd.manifest))
+            match verneuil::manifest_bytes_for_path(None, &path)? {
+                Some(bytes) => Ok(bytes),
+                None => Err(fresh_error!("manifest not found", ?path)),
+            }
         } else if let Some(path) = &cmd.source_path {
             match verneuil::manifest_bytes_for_hostname_path(
                 Some(&config),

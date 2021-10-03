@@ -380,6 +380,58 @@ pub fn manifest_bytes_for_hostname_path(
     loader::fetch_manifest(&manifest_name, &[], targets)
 }
 
+fn retry_loop<T, E>(body: impl Fn() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+    use rand::Rng;
+    use std::time::Duration;
+
+    let mut rng = rand::thread_rng();
+    for i in 0..=3 {
+        match body() {
+            Ok(ret) => return Ok(ret),
+            ret if i == 3 => return ret,
+            _ => {
+                let sleep = Duration::from_millis(100).mul_f64(10f64.powi(i));
+                std::thread::sleep(sleep.mul_f64(rng.gen_range(1.0..2.0)));
+            }
+        }
+    }
+
+    unreachable!();
+}
+
+/// Attempts to fetch the manifest from `path`.
+///
+/// If `path` starts with `http://` or `https://`, the bytes are
+/// downloaded over http(s) at that URL.
+///
+/// Otherwise, or if the `path` starts with `file://`, returns the
+/// contents of the local file.
+pub fn manifest_bytes_for_path(_config: Option<&Options>, path: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+    if path.starts_with("http://") || path.starts_with("https://") {
+        let response = retry_loop(|| attohttpc::get(path).timeout(DOWNLOAD_TIMEOUT).send())
+            .map_err(|e| chain_warn!(e, "failed to download HTTP(S) manifest", %path))?;
+        if response.status() == attohttpc::StatusCode::NOT_FOUND {
+            Ok(None)
+        } else {
+            Ok(Some(response.bytes().map_err(
+                |e| chain_warn!(e, "HTTP request for manifest failed", %path),
+            )?))
+        }
+    } else {
+        let path = path.strip_prefix("file://").unwrap_or(path);
+
+        match std::fs::read(path) {
+            Ok(ret) => Ok(Some(ret)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(chain_error!(e, "failed to read manifest file", %path)),
+        }
+    }
+}
+
 /// Synchronously uploads all the data contained in the spooling
 /// directory prefix.
 ///
