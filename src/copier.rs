@@ -761,6 +761,7 @@ async fn await_with_slow_logging<T, R: Future<Output = T>>(
 /// Attempts to publish the `contents` to `name` in all `targets`.
 ///
 /// If `level >= 0`, compresses the contents with zstd, at that level.
+#[allow(clippy::suspicious_else_formatting)] // clippy complains about the macro
 #[instrument(level = "debug", skip(targets), err)]
 async fn copy_file(
     name: &OsStr,
