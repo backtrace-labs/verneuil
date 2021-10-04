@@ -190,6 +190,7 @@ static int linux_file_device_characteristics(sqlite3_file *);
 
 static int snapshot_open(sqlite3_vfs *, const char *name, sqlite3_file *,
     int flags, int *OUT_flags);
+static int snapshot_full_pathname(sqlite3_vfs *, const char *name, int n, char *dst);
 static int snapshot_check_reserved_lock(sqlite3_file *, int *OUT_result);
 static int snapshot_file_control(sqlite3_file *, int op, void *arg);
 static int snapshot_device_characteristics(sqlite3_file *);
@@ -320,7 +321,7 @@ static sqlite3_vfs verneuil_snapshot_vfs = {
         .xDelete = linux_delete,
         .xAccess = linux_access,
 
-        .xFullPathname = linux_full_pathname,
+        .xFullPathname = snapshot_full_pathname,
 
         .xDlOpen = linux_dlopen,
         .xDlError = linux_dlerror,
@@ -1096,6 +1097,40 @@ linux_full_pathname(sqlite3_vfs *vfs, const char *name, int n, char *dst)
                 return SQLITE_CANTOPEN;
 
         return ok;
+}
+
+/*
+ * Snapshot paths can look like URIs; if they do, skip any
+ * normalisation.  We don't expect to find or process any journal file
+ * next to the manifest file, so the full path doesn't really matter.
+ */
+static int
+snapshot_full_pathname(sqlite3_vfs *vfs, const char *name, int n, char *dst)
+{
+        static const char *const prefixes[] = {
+                "file://",
+                "http://",
+                "https://",
+                "s3://",
+                "verneuil://",
+        };
+
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+                const char *prefix = prefixes[i];
+
+                if (strncmp(name, prefix, strlen(prefix)) == 0) {
+                        size_t len;
+
+                        len = strlen(name);
+                        if (n < 0 || len >= (size_t)n)
+                                return SQLITE_CANTOPEN;
+
+                        memcpy(dst, name, len + 1);
+                        return SQLITE_OK;
+                }
+        }
+
+        return linux_full_pathname(vfs, name, n, dst);
 }
 
 static void *
