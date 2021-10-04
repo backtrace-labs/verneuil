@@ -42,28 +42,32 @@ impl SnapshotFile {
     }
 }
 
+fn fetch_new_data(path: &str) -> Result<Arc<Data>> {
+    use prost::Message;
+
+    let bytes = match crate::manifest_bytes_for_path(None, path)? {
+        Some(bytes) => bytes,
+        None => return Err(fresh_error!("manifest not found", %path)),
+    };
+
+    let manifest = crate::Manifest::decode(&*bytes)
+        .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
+
+    Ok(Arc::new(Data {
+        data: Snapshot::new_with_default_targets(&manifest)?,
+    }))
+}
+
 #[no_mangle]
 extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_char) -> SqliteCode {
     #[tracing::instrument]
     fn open(file: &mut SnapshotFile, c_path: *const c_char) -> Result<()> {
-        use prost::Message;
-
         let string = unsafe { std::ffi::CStr::from_ptr(c_path) }
             .to_str()
             .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let bytes = match crate::manifest_bytes_for_path(None, &string)? {
-            Some(bytes) => bytes,
-            None => return Err(fresh_error!("manifest not found", path=%string)),
-        };
-
-        let manifest = crate::Manifest::decode(&*bytes)
-            .map_err(|e| chain_error!(e, "failed to parse manifest file", path=%string))?;
-        let data = Arc::new(Data {
-            data: Snapshot::new_with_default_targets(&manifest)?,
-        });
-
+        let data = fetch_new_data(&string)?;
         file.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
         Ok(())
     }
