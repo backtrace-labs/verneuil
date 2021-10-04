@@ -3,6 +3,8 @@ use std::boxed::Box;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -24,6 +26,7 @@ struct Data {
 #[repr(C)]
 struct SnapshotFile {
     methods: *const c_void,
+    locked: AtomicBool,
     snapshot: *mut c_void, // Really a &mut Arc<Data>.
 }
 
@@ -201,8 +204,12 @@ extern "C" fn verneuil__snapshot_size(file: &SnapshotFile, out_size: &mut i64) -
 }
 
 #[no_mangle]
-extern "C" fn verneuil__snapshot_lock(_file: &SnapshotFile, level: LockLevel) -> SqliteCode {
+extern "C" fn verneuil__snapshot_lock(file: &SnapshotFile, level: LockLevel) -> SqliteCode {
     if level <= LockLevel::Shared {
+        if level > LockLevel::None {
+            file.locked.store(true, Ordering::Relaxed);
+        }
+
         SqliteCode::Ok
     } else {
         SqliteCode::Perm
@@ -210,7 +217,11 @@ extern "C" fn verneuil__snapshot_lock(_file: &SnapshotFile, level: LockLevel) ->
 }
 
 #[no_mangle]
-extern "C" fn verneuil__snapshot_unlock(_file: &SnapshotFile, _level: LockLevel) -> SqliteCode {
+extern "C" fn verneuil__snapshot_unlock(file: &SnapshotFile, level: LockLevel) -> SqliteCode {
+    if level == LockLevel::None {
+        file.locked.store(false, Ordering::Relaxed);
+    }
+
     SqliteCode::Ok
 }
 

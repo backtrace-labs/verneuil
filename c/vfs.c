@@ -148,6 +148,7 @@ static_assert(sizeof(ino_t) == sizeof(uint64_t),
 struct snapshot_file {
         sqlite3_file base;
 
+        bool locked;
         struct verneuil_snapshot *snapshot;
 };
 
