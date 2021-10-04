@@ -48,7 +48,7 @@ prost = "0.7"
 rand = "0.8"
 rayon = "1.5"
 regex = "1"
-rust-s3 = { version = "0.27.0-rc4", git = "https://github.com/backtrace-labs/rust-s3", rev = "f70b8a72596bc1fd4bbafaf59a9cf105666fda90", default-features = false, features = ["tokio-rustls-tls", "blocking"] }
+rust-s3 = { version = "0.27.0-rc4", git = "https://github.com/backtrace-labs/rust-s3", rev = "ae5d6d0d2fa49df7a71fd14e4721af1f5e610b62", default-features = false, features = ["tokio-rustls-tls", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
