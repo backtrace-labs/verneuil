@@ -38,6 +38,12 @@ impl SnapshotFile {
         unsafe { (self.snapshot as *mut Arc<Data>).as_mut() }
     }
 
+    /// Replaces the data in this `SnapshotFile` with `data`.
+    #[inline]
+    fn set_snapshot(&mut self, data: Arc<Data>) {
+        self.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
+    }
+
     /// Replaces the `snapshot` pointer in this `SnapshotFile` with a
     /// NULL pointer, and returns the old `Data`, if it was
     /// populated.
@@ -126,8 +132,7 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
             .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let data = get_data(string.into())?;
-        file.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
+        file.set_snapshot(get_data(string.into())?);
         Ok(())
     }
 
