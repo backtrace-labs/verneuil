@@ -2224,7 +2224,11 @@ snapshot_device_characteristics(sqlite3_file *vfile)
 {
 
         (void)vfile;
-        return SQLITE_IOCAP_POWERSAFE_OVERWRITE | SQLITE_IOCAP_IMMUTABLE;
+        /*
+         * Should we tag snapshots that will never be refreshed,
+         * and let those return `SQLITE_IOCAP_IMMUTABLE`?
+         */
+        return SQLITE_IOCAP_POWERSAFE_OVERWRITE;
 }
 
 int
