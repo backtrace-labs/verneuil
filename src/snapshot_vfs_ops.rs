@@ -1,7 +1,10 @@
 use std::boxed::Box;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
 
 use crate::chain_error;
 use crate::fresh_error;
@@ -11,6 +14,7 @@ use crate::Result;
 use crate::Snapshot;
 
 struct Data {
+    path: String,
     data: Snapshot,
 }
 
@@ -42,10 +46,34 @@ impl SnapshotFile {
     }
 }
 
-fn fetch_new_data(path: &str) -> Result<Arc<Data>> {
+// This internal cache maps from path to latest live snapshot data.
+lazy_static::lazy_static! {
+    static ref LIVE_DATA: Mutex<HashMap<String, Weak<Data>>> = Default::default();
+}
+
+impl Drop for Data {
+    fn drop(&mut self) {
+        // Remove this `Data` from the global cache.
+        let mut map = LIVE_DATA.lock().expect("mutex should be valid");
+
+        // By the time this `Data` is dropped, the Arc's strong count
+        // has already been decremented to 0.  If we can upgrade the
+        // value, it must have been inserted for a different copy of
+        // this `Data`.
+        if let Some(weak) = map.remove(&self.path) {
+            if let Some(_strong) = weak.upgrade() {
+                let mut path = String::new();
+                std::mem::swap(&mut path, &mut self.path);
+                map.insert(path, weak);
+            }
+        }
+    }
+}
+
+fn fetch_new_data(path: String) -> Result<Arc<Data>> {
     use prost::Message;
 
-    let bytes = match crate::manifest_bytes_for_path(None, path)? {
+    let bytes = match crate::manifest_bytes_for_path(None, &path)? {
         Some(bytes) => bytes,
         None => return Err(fresh_error!("manifest not found", %path)),
     };
@@ -53,9 +81,17 @@ fn fetch_new_data(path: &str) -> Result<Arc<Data>> {
     let manifest = crate::Manifest::decode(&*bytes)
         .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
 
-    Ok(Arc::new(Data {
+    let data = Arc::new(Data {
+        path: path.clone(),
         data: Snapshot::new_with_default_targets(&manifest)?,
-    }))
+    });
+
+    LIVE_DATA
+        .lock()
+        .expect("mutex should be valid")
+        .insert(path, Arc::downgrade(&data));
+
+    Ok(data)
 }
 
 #[no_mangle]
@@ -67,7 +103,7 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
             .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let data = fetch_new_data(&string)?;
+        let data = fetch_new_data(string)?;
         file.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
         Ok(())
     }
