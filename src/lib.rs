@@ -408,9 +408,15 @@ fn retry_loop<T, E>(body: impl Fn() -> std::result::Result<T, E>) -> std::result
 /// `bucket-name.region[.endpoint]/path/to/blob`) the bytes are
 /// downloaded over the S3 protocol and the default credentials.
 ///
+/// If `path` starts with `verneuil://` (followed by
+/// `source-machine-hostname/path/to/sqlite.db`), the bytes are
+/// dowloaded for that manifest path in the configuration's
+/// manifest buckets.  An empty hostname resolve to the current
+/// machine.
+///
 /// Otherwise, or if the `path` starts with `file://`, returns the
 /// contents of the local file.
-pub fn manifest_bytes_for_path(_config: Option<&Options>, path: &str) -> Result<Option<Vec<u8>>> {
+pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<Option<Vec<u8>>> {
     use std::io::ErrorKind;
     use std::time::Duration;
     const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -471,6 +477,25 @@ pub fn manifest_bytes_for_path(_config: Option<&Options>, path: &str) -> Result<
         bucket.set_request_timeout(Some(DOWNLOAD_TIMEOUT));
 
         loader::load_from_source(&bucket, blob)
+    } else if let Some(suffix) = path.strip_prefix("verneuil://") {
+        let (machine, path) = match suffix.split_once("/") {
+            Some((machine, path)) => (machine, format!("/{}", path)),
+            None => {
+                return Err(fresh_error!(
+                "failed to parse verneuil URI; should be verneuil://machine-hostname/path/to/sqlite.db",
+                %path))
+            }
+        };
+
+        manifest_bytes_for_hostname_path(
+            config,
+            if machine.is_empty() {
+                None
+            } else {
+                Some(machine)
+            },
+            Path::new(&path),
+        )
     } else {
         let path = path.strip_prefix("file://").unwrap_or(path);
 

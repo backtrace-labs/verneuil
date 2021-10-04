@@ -105,8 +105,11 @@ struct Restore {
     ///
     /// As special cases, an `http://` or `https://` prefix will be
     /// downloaded over HTTP(S), an
-    /// `s3://bucket.region[.endpoint]/path/to/blob` URI will be
-    /// loaded via HTTPS domain-addressed S3, and a `file://` prefix
+    /// `s3://bucket.region[.endpoing]/path/to/blob` URI will be
+    /// loaded via HTTPS domain-addressed S3,
+    /// `verneuil://machine-host-name/path/to/sqlite.db` will be
+    /// loaded based on that hostname (or the current machine's
+    /// hostname if empty) and source path, and a `file://` prefix
     /// will always be read as a local path.
     #[structopt(short, long)]
     manifest: Option<String>,
