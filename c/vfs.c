@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -2112,10 +2113,70 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
 }
 
 static int
+snapshot_refresh(sqlite3_file *vfile, char **dst, bool force)
+{
+        struct snapshot_file *file = (void *)vfile;
+        struct timestamp updated = { 0 };
+        const char *result;
+        size_t len;
+
+        if (file->locked == true) {
+                *dst = sqlite3_mprintf(
+                    "verneuil snapshot may not be %srefreshed within a transaction",
+                    (force ? "force " : ""));
+                return SQLITE_LOCKED;
+        }
+
+        result = verneuil__snapshot_refresh(file, &updated, &len, force);
+        if (result == NULL) {
+                *dst = sqlite3_mprintf(TIMESTAMP_FMT, TIMESTAMP_ARG(updated));
+                return SQLITE_OK;
+        }
+
+        *dst = sqlite3_mprintf("failed to %srefresh verneuil snapshot: %*s",
+            (force ? "force " : ""), (int)len, result);
+        return SQLITE_ERROR;
+}
+
+/**
+ * Converts a string parameter to a truth value:
+ *
+ * If the string is empty, returns the default value.
+ * Otherwise, returns false iff the string's first character
+ *  is '0', 'f'(alse), or 'n'(o).
+ */
+static bool
+parse_bool_param(const char *param, bool default_value)
+{
+
+        if (param == NULL)
+                return default_value;
+
+        /*
+         * https://www.sqlite.org/pragma.html says boolean parameters
+         * map "0", "no", "false", and "off" to false.  Extend the
+         * classic switch on the first character to also handle "off".
+         */
+        switch (param[0]) {
+        case '0':
+        case 'f':
+        case 'F':
+        case 'n':
+        case 'N':
+                return false;
+
+        default:
+                if (strcasecmp(param, "off") == 0)
+                        return false;
+
+                return true;
+        }
+}
+
+static int
 snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
 {
 
-        (void)vfile;
         switch (op) {
         case SQLITE_FCNTL_VFSNAME:
                 *(char**)arg = sqlite3_mprintf("%s", "verneuil_snapshot");
@@ -2127,6 +2188,28 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
 
         case SQLITE_FCNTL_TEMPFILENAME:
                 return linux_tempfilename(arg);
+
+        case SQLITE_FCNTL_PRAGMA: {
+             char **argv = arg;
+             char **dst = &argv[0];
+             const char *pragma = argv[1];
+             const char *param = argv[2];
+
+             if (strcmp(pragma, "verneuil_snapshot_refresh") == 0) {
+                     bool force;
+
+                     if (param != NULL &&
+                         strncasecmp(param, "force", strlen("force")) == 0) {
+                             force = true;
+                     } else {
+                             force = parse_bool_param(param, false);
+                     }
+
+                     return snapshot_refresh(vfile, dst, force);
+             }
+
+             return SQLITE_NOTFOUND;
+        }
 
         default:
                 return SQLITE_NOTFOUND;

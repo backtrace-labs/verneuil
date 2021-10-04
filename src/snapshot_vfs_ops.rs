@@ -38,6 +38,29 @@ struct SnapshotFile {
     snapshot: AtomicPtr<c_void>, // Really a &mut Arc<Data>.
 }
 
+// See vfs.h
+#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+struct Timestamp {
+    seconds: u64,
+    nanos: u32,
+}
+
+impl std::convert::From<SystemTime> for Timestamp {
+    fn from(time: SystemTime) -> Self {
+        use std::time::Duration;
+
+        let since_epoch = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+
+        Timestamp {
+            seconds: since_epoch.as_secs(),
+            nanos: since_epoch.subsec_nanos(),
+        }
+    }
+}
+
 impl SnapshotFile {
     /// Returns a reference to this `SnapshotFile`'s `Data`, if
     /// it is populated.
@@ -250,6 +273,47 @@ extern "C" fn verneuil__snapshot_unlock(file: &SnapshotFile, level: LockLevel) -
     }
 
     SqliteCode::Ok
+}
+
+/// Refreshes the snapshot data.  If `force`, always gets a fresh
+/// snapshot; otherwise, uses the latest available data.
+#[no_mangle]
+extern "C" fn verneuil__snapshot_refresh(
+    file: &SnapshotFile,
+    update_ts: &mut Timestamp,
+    len: &mut usize,
+    force: bool,
+) -> *const c_char {
+    fn doit(file: &SnapshotFile, force: bool) -> Result<SystemTime> {
+        let path = &file
+            .snapshot()
+            .ok_or_else(|| fresh_error!("attempted to read uninitialised SnapshotFile"))?
+            .path;
+
+        let data = if force {
+            fetch_new_data(path.clone())
+        } else {
+            get_data(path.into())
+        }?;
+
+        let ts = data.updated;
+        file.set_snapshot(data);
+        Ok(ts)
+    }
+
+    *update_ts = Default::default();
+    *len = 0;
+    match doit(file, force) {
+        Ok(updated) => {
+            *update_ts = updated.into();
+            std::ptr::null()
+        }
+        Err(e) => {
+            let msg: &'static str = e.message;
+            *len = msg.len();
+            msg.as_ptr() as *const c_char
+        }
+    }
 }
 
 impl SnapshotFile {

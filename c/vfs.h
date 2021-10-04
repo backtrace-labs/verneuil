@@ -1,12 +1,23 @@
 #pragma once
 #include "verneuil.h"
 
-#include <sqlite3ext.h>
 #include <assert.h>
+#include <sqlite3ext.h>
 #include <stdint.h>
 
 struct linux_file;
 struct snapshot_file;
+
+/**
+ * A nanosecond precision Unix timestamp.
+ */
+struct timestamp {
+        uint64_t seconds;
+        uint32_t nanos;
+};
+
+#define TIMESTAMP_FMT "%"PRIu64".%09"PRIu32
+#define TIMESTAMP_ARG(X) (X).seconds, (X).nanos
 
 /*
  * The functions defined in this header are exported by the C side for
@@ -160,3 +171,18 @@ int verneuil__file_unlock_impl(sqlite3_file *, int level);
  */
 int verneuil__file_unlock(sqlite3_file *, int level);
 int verneuil__snapshot_unlock(sqlite3_file *, int level);
+
+/**
+ * Refreshes the snapshot's underlying data.  If `force`, always
+ * updates to a new version; otherwise, uses the latest version
+ * already available.
+ *
+ * Returns NULL on success, and an error message on failure; that
+ * message is not NUL terminated and its length is written to
+ * `OUT_len` on error.
+ *
+ * On success, the `timestamp` is overwritten with the local system
+ * time at which we fetched the now-current snapshot.
+ */
+const char *verneuil__snapshot_refresh(struct snapshot_file *, struct timestamp *,
+    size_t *OUT_len, bool force);
