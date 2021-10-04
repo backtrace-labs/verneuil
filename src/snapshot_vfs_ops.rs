@@ -1,6 +1,7 @@
 use std::boxed::Box;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::sync::Arc;
 
 use crate::chain_error;
 use crate::fresh_error;
@@ -9,27 +10,31 @@ use crate::sqlite_lock_level::LockLevel;
 use crate::Result;
 use crate::Snapshot;
 
+struct Data {
+    data: Snapshot,
+}
+
 // See vfs.c
 #[derive(Debug)]
 #[repr(C)]
 struct SnapshotFile {
     methods: *const c_void,
-    snapshot: *mut c_void, // Really a &mut crate::Snapshot.
+    snapshot: *mut c_void, // Really a &mut Arc<Data>.
 }
 
 impl SnapshotFile {
-    /// Returns a reference to this `SnapshotFile`'s `Snapshot`, if
+    /// Returns a reference to this `SnapshotFile`'s `Data`, if
     /// it is populated.
     #[inline]
-    fn snapshot(&self) -> Option<&mut Snapshot> {
-        unsafe { (self.snapshot as *mut Snapshot).as_mut() }
+    fn snapshot(&self) -> Option<&mut Arc<Data>> {
+        unsafe { (self.snapshot as *mut Arc<Data>).as_mut() }
     }
 
     /// Replaces the `snapshot` pointer in this `SnapshotFile` with a
-    /// NULL pointer, and returns the old `Snapshot`, if it was
+    /// NULL pointer, and returns the old `Data`, if it was
     /// populated.
-    fn consume_snapshot(&mut self) -> Option<Box<Snapshot>> {
-        let ptr = self.snapshot as *mut Snapshot;
+    fn consume_snapshot(&mut self) -> Option<Box<Arc<Data>>> {
+        let ptr = self.snapshot as *mut Arc<Data>;
         self.snapshot = std::ptr::null_mut();
 
         let snapshot = unsafe { ptr.as_mut() }?;
@@ -55,9 +60,11 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
 
         let manifest = crate::Manifest::decode(&*bytes)
             .map_err(|e| chain_error!(e, "failed to parse manifest file", path=%string))?;
-        let snapshot = Snapshot::new_with_default_targets(&manifest)?;
+        let data = Arc::new(Data {
+            data: Snapshot::new_with_default_targets(&manifest)?,
+        });
 
-        file.snapshot = Box::leak(Box::new(snapshot)) as *mut Snapshot as *mut _;
+        file.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
         Ok(())
     }
 
@@ -149,9 +156,10 @@ extern "C" fn verneuil__snapshot_unlock(_file: &SnapshotFile, _level: LockLevel)
 
 impl SnapshotFile {
     fn read(&self, mut dst: &mut [u8], offset: u64) -> Result<u64> {
-        let snapshot = self
+        let snapshot = &self
             .snapshot()
-            .ok_or_else(|| fresh_error!("attempted to read uninitialised SnapshotFile"))?;
+            .ok_or_else(|| fresh_error!("attempted to read uninitialised SnapshotFile"))?
+            .data;
 
         let copied = std::io::copy(&mut snapshot.as_read(offset, dst.len() as u64), &mut dst)
             .map_err(|e| chain_error!(e, "failed to read from snapshot"))?;
@@ -160,9 +168,10 @@ impl SnapshotFile {
     }
 
     fn size(&self) -> Result<u64> {
-        let snapshot = self
+        let snapshot = &self
             .snapshot()
-            .ok_or_else(|| fresh_error!("attempted to size uninitialised SnapshotFile"))?;
+            .ok_or_else(|| fresh_error!("attempted to size uninitialised SnapshotFile"))?
+            .data;
 
         Ok(snapshot.len())
     }
