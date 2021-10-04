@@ -16,7 +16,7 @@ const BACKTRACE_SEVERITY: Level = Level::ERROR;
 pub struct Error {
     // The uuid for the initial ("root") error.
     initial_id: Uuid,
-    message: &'static str,
+    pub message: &'static str,
 }
 
 impl Error {
