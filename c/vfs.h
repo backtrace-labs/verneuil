@@ -197,3 +197,10 @@ struct timestamp verneuil__snapshot_ctime(struct snapshot_file *);
  * data snapshot.
  */
 struct timestamp verneuil__snapshot_updated(struct snapshot_file *);
+
+/**
+ * Updates the auto-refresh-before-read-lock flag on the connection.
+ *
+ * Returns the previous value.
+ */
+bool verneuil__snapshot_auto_refresh(struct snapshot_file *, bool auto_refresh);

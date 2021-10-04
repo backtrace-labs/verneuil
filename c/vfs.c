@@ -150,6 +150,7 @@ struct snapshot_file {
         sqlite3_file base;
 
         bool locked;
+        bool auto_refresh;
         struct verneuil_snapshot *snapshot;
 };
 
@@ -2194,6 +2195,30 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
              char **dst = &argv[0];
              const char *pragma = argv[1];
              const char *param = argv[2];
+
+             if (strcmp(pragma, "verneuil_snapshot_auto_refresh") == 0) {
+                     struct snapshot_file *file = (void *)vfile;
+                     bool prev;
+
+                     /* No param -> get the current value. */
+                     if (param == NULL) {
+                             prev = file->auto_refresh;
+                     } else {
+                             bool enable;
+
+                             enable = parse_bool_param(param, true);
+                             prev = verneuil__snapshot_auto_refresh(file, enable);
+                     }
+
+                     /*
+                      * https://www.sqlite.org/pragma.html says
+                      * boolean return values are often returned as
+                      * numeric 0/1; it certainly seems to be the
+                      * norm.
+                      */
+                     *dst = sqlite3_mprintf("%s", (prev ? "1" : "0"));
+                     return SQLITE_OK;
+             }
 
              if (strcmp(pragma, "verneuil_snapshot_ctime") == 0) {
                      struct timestamp ctime;

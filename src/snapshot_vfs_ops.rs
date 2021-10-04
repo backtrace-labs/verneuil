@@ -40,6 +40,9 @@ struct Data {
 struct SnapshotFile {
     methods: *const c_void,
     locked: AtomicBool,
+
+    /// Whether to refresh the snapshot before acquiring a read lock.
+    auto_refresh: AtomicBool,
     snapshot: AtomicPtr<c_void>, // Really a &mut Arc<Data>.
 }
 
@@ -270,15 +273,27 @@ extern "C" fn verneuil__snapshot_size(file: &SnapshotFile, out_size: &mut i64) -
 
 #[no_mangle]
 extern "C" fn verneuil__snapshot_lock(file: &SnapshotFile, level: LockLevel) -> SqliteCode {
-    if level <= LockLevel::Shared {
-        if level > LockLevel::None {
-            file.locked.store(true, Ordering::Relaxed);
-        }
-
-        SqliteCode::Ok
-    } else {
-        SqliteCode::Perm
+    if level > LockLevel::Shared {
+        // We can't take a write lock on a snapshot: we can't write to
+        // snapshots.
+        return SqliteCode::Perm;
     }
+
+    if level == LockLevel::None {
+        // Locking to nothing is a no-op.
+        return SqliteCode::Ok;
+    }
+
+    if !file.locked.load(Ordering::Relaxed) && file.auto_refresh.load(Ordering::Relaxed) {
+        if let Some(data) = file.snapshot() {
+            if let Ok(update) = get_data((&data.path).into()) {
+                file.set_snapshot(update);
+            }
+        }
+    }
+
+    file.locked.store(true, Ordering::Relaxed);
+    SqliteCode::Ok
 }
 
 #[no_mangle]
@@ -349,6 +364,14 @@ extern "C" fn verneuil__snapshot_updated(file: &SnapshotFile) -> Timestamp {
     file.snapshot()
         .map(|data| data.updated.into())
         .unwrap_or_default()
+}
+
+/// Overrides the `auto_refresh` (before read lock) flag on `file`.
+///
+/// Returns the old value.
+#[no_mangle]
+extern "C" fn verneuil__snapshot_auto_refresh(file: &SnapshotFile, update: bool) -> bool {
+    file.auto_refresh.swap(update, Ordering::Relaxed)
 }
 
 impl SnapshotFile {
