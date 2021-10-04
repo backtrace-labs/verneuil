@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -70,6 +71,8 @@ impl Drop for Data {
     }
 }
 
+/// Constructs a fresh snapshot for `path`, updates the global cache,
+/// and returns the result.
 fn fetch_new_data(path: String) -> Result<Arc<Data>> {
     use prost::Message;
 
@@ -94,6 +97,23 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
     Ok(data)
 }
 
+/// Gets a snapshot for `path`; only constructs a fresh one on cache
+/// misses.
+fn get_data(path: Cow<str>) -> Result<Arc<Data>> {
+    {
+        if let Some(ret) = LIVE_DATA
+            .lock()
+            .expect("mutex should be valid")
+            .get(&*path)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(ret);
+        }
+    }
+
+    fetch_new_data(path.into_owned())
+}
+
 #[no_mangle]
 extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_char) -> SqliteCode {
     #[tracing::instrument]
@@ -103,7 +123,7 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
             .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let data = fetch_new_data(string)?;
+        let data = get_data(string.into())?;
         file.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
         Ok(())
     }
