@@ -188,6 +188,15 @@ const char *verneuil__snapshot_refresh(struct snapshot_file *, struct timestamp 
     size_t *OUT_len, bool force);
 
 /**
+ * Refreshes the snapshot's underlying data.  If that's a no-op,
+ * schedules a background forced update.
+ *
+ * Returns whether we found fresh data without scheduling a background
+ * update.
+ */
+bool verneuil__snapshot_async_reload(struct snapshot_file *);
+
+/**
  * Returns the `ctime` for the connection's current data snapshot.
  */
 struct timestamp verneuil__snapshot_ctime(struct snapshot_file *);

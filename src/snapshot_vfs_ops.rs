@@ -18,6 +18,9 @@ use crate::sqlite_lock_level::LockLevel;
 use crate::Result;
 use crate::Snapshot;
 
+/// Number of background refresh workers.
+const REFRESH_POOL_SIZE: usize = 4;
+
 struct Data {
     /// URI for the manifest.
     path: String,
@@ -29,6 +32,10 @@ struct Data {
     /// manifest.
     ctime: u64,
     ctime_ns: u32,
+
+    /// This flag is set when a reload has been queued to replace
+    /// this snapshot data, and cleared when the reload is complete.
+    reload_queued: AtomicBool,
 
     /// Replica data.
     data: Snapshot,
@@ -158,6 +165,7 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
         updated: start,
         ctime,
         ctime_ns,
+        reload_queued: AtomicBool::new(false),
         data: Snapshot::new_with_default_targets(&manifest)?,
     });
 
@@ -184,6 +192,27 @@ fn get_data(path: Cow<str>) -> Result<Arc<Data>> {
     }
 
     fetch_new_data(path.into_owned())
+}
+
+/// Ensures an asynchronous refresh for `data`'s manifest path is
+/// scheduled or already executing.
+fn async_update(data: Arc<Data>) {
+    lazy_static::lazy_static! {
+        static ref REFRESH_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new().num_threads(REFRESH_POOL_SIZE)
+            .thread_name(|i| format!("verneuil-refresh-worker/{}", i))
+            .build()
+            .expect("failed to build global refresh pool");
+    }
+
+    // Bail if there's already a reload in flight.
+    if data.reload_queued.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    REFRESH_POOL.spawn_fifo(move || {
+        let _ = fetch_new_data(data.path.clone());
+        data.reload_queued.store(false, Ordering::Relaxed);
+    });
 }
 
 #[no_mangle]
@@ -343,6 +372,34 @@ extern "C" fn verneuil__snapshot_refresh(
             *len = msg.len();
             msg.as_ptr() as *const c_char
         }
+    }
+}
+
+/// Refreshes the snapshot data.  If the connection is already up to
+/// date, schedules a background force update.
+///
+/// Returns whether we found fresh data without having to trigger an
+/// async reload.
+#[no_mangle]
+extern "C" fn verneuil__snapshot_async_reload(file: &SnapshotFile) -> bool {
+    let data = match file.snapshot() {
+        Some(data) => data,
+        None => return false,
+    };
+
+    let update = match get_data((&data.path).into()) {
+        Ok(update) => update,
+        Err(_) => return false,
+    };
+
+    if Arc::ptr_eq(data, &update) {
+        async_update(update);
+        // No fresh snapshot available, we have to trigger an async
+        // update.
+        false
+    } else {
+        file.set_snapshot(update);
+        true
     }
 }
 

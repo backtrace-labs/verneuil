@@ -2196,6 +2196,14 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
              const char *pragma = argv[1];
              const char *param = argv[2];
 
+             if (strcmp(pragma, "verneuil_snapshot_async_reload") == 0) {
+                     bool refreshed;
+
+                     refreshed = verneuil__snapshot_async_reload((void *)vfile);
+                     *dst = sqlite3_mprintf("%s", refreshed ? "1" : "0");
+                     return SQLITE_OK;
+             }
+
              if (strcmp(pragma, "verneuil_snapshot_auto_refresh") == 0) {
                      struct snapshot_file *file = (void *)vfile;
                      bool prev;
