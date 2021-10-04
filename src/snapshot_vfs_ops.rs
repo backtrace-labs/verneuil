@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,32 +28,44 @@ struct Data {
 struct SnapshotFile {
     methods: *const c_void,
     locked: AtomicBool,
-    snapshot: *mut c_void, // Really a &mut Arc<Data>.
+    snapshot: AtomicPtr<c_void>, // Really a &mut Arc<Data>.
 }
 
 impl SnapshotFile {
     /// Returns a reference to this `SnapshotFile`'s `Data`, if
     /// it is populated.
     #[inline]
-    fn snapshot(&self) -> Option<&mut Arc<Data>> {
-        unsafe { (self.snapshot as *mut Arc<Data>).as_mut() }
+    fn snapshot(&self) -> Option<&Arc<Data>> {
+        unsafe { (self.snapshot.load(Ordering::Relaxed) as *const Arc<Data>).as_ref() }
+    }
+
+    /// Exchanges the snapshot pointer with `new` and returns the old
+    /// value, if any.
+    #[inline]
+    fn exchange(&self, new: *mut Arc<Data>) -> Option<Box<Arc<Data>>> {
+        let ptr = self.snapshot.swap(new as *mut _, Ordering::Relaxed) as *mut Arc<Data>;
+
+        let snapshot = unsafe { ptr.as_mut() }?;
+        Some(unsafe { Box::from_raw(snapshot) })
     }
 
     /// Replaces the data in this `SnapshotFile` with `data`.
+    ///
+    /// Replacing the underlying data snapshot while sqlite holds a
+    /// read lock would violate invariants, so we no-op in that case.
     #[inline]
-    fn set_snapshot(&mut self, data: Arc<Data>) {
-        self.snapshot = Box::leak(Box::new(data)) as *mut Arc<Data> as *mut _;
+    fn set_snapshot(&self, data: Arc<Data>) {
+        if !self.locked.load(Ordering::Relaxed) {
+            self.exchange(Box::leak(Box::new(data)) as *mut Arc<Data>);
+        }
     }
 
     /// Replaces the `snapshot` pointer in this `SnapshotFile` with a
     /// NULL pointer, and returns the old `Data`, if it was
     /// populated.
-    fn consume_snapshot(&mut self) -> Option<Box<Arc<Data>>> {
-        let ptr = self.snapshot as *mut Arc<Data>;
-        self.snapshot = std::ptr::null_mut();
-
-        let snapshot = unsafe { ptr.as_mut() }?;
-        Some(unsafe { Box::from_raw(snapshot) })
+    #[inline]
+    fn consume_snapshot(&self) -> Option<Box<Arc<Data>>> {
+        self.exchange(std::ptr::null_mut())
     }
 }
 
