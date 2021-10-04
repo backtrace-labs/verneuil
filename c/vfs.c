@@ -2195,6 +2195,14 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
              const char *pragma = argv[1];
              const char *param = argv[2];
 
+             if (strcmp(pragma, "verneuil_snapshot_ctime") == 0) {
+                     struct timestamp ctime;
+
+                     ctime = verneuil__snapshot_ctime((void *)vfile);
+                     *dst = sqlite3_mprintf(TIMESTAMP_FMT, TIMESTAMP_ARG(ctime));
+                     return SQLITE_OK;
+             }
+
              if (strcmp(pragma, "verneuil_snapshot_refresh") == 0) {
                      bool force;
 

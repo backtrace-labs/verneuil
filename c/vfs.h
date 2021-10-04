@@ -186,3 +186,8 @@ int verneuil__snapshot_unlock(sqlite3_file *, int level);
  */
 const char *verneuil__snapshot_refresh(struct snapshot_file *, struct timestamp *,
     size_t *OUT_len, bool force);
+
+/**
+ * Returns the `ctime` for the connection's current data snapshot.
+ */
+struct timestamp verneuil__snapshot_ctime(struct snapshot_file *);

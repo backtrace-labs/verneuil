@@ -25,6 +25,11 @@ struct Data {
     /// A lower bound on the time at which we updated the manifest for `data`.
     updated: SystemTime,
 
+    /// ctime on the replicated source db file, as advertised by the
+    /// manifest.
+    ctime: u64,
+    ctime_ns: u32,
+
     /// Replica data.
     data: Snapshot,
 }
@@ -137,9 +142,19 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
     let manifest = crate::Manifest::decode(&*bytes)
         .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
 
+    let (ctime, ctime_ns) = match &manifest.v1 {
+        Some(v1) => (
+            v1.ctime.clamp(0, i64::MAX) as u64,
+            v1.ctime_ns.clamp(0, 999_999_999) as u32,
+        ),
+        None => (0, 0),
+    };
+
     let data = Arc::new(Data {
         path: path.clone(),
         updated: start,
+        ctime,
+        ctime_ns,
         data: Snapshot::new_with_default_targets(&manifest)?,
     });
 
@@ -314,6 +329,18 @@ extern "C" fn verneuil__snapshot_refresh(
             msg.as_ptr() as *const c_char
         }
     }
+}
+
+/// Returns the `ctime` for the file's current snapshot data,
+/// and stores the fractional nanosecond part in `ns`.
+#[no_mangle]
+extern "C" fn verneuil__snapshot_ctime(file: &SnapshotFile) -> Timestamp {
+    file.snapshot()
+        .map(|data| Timestamp {
+            seconds: data.ctime,
+            nanos: data.ctime_ns,
+        })
+        .unwrap_or_default()
 }
 
 impl SnapshotFile {
