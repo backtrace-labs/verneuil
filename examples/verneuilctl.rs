@@ -104,8 +104,10 @@ struct Restore {
     /// from remote storage, based on `--hostname` and `--source_path`.
     ///
     /// As special cases, an `http://` or `https://` prefix will be
-    /// downloaded over HTTP(S), and a `file://` prefix will always
-    /// be read as a local path.
+    /// downloaded over HTTP(S), an
+    /// `s3://bucket.region[.endpoint]/path/to/blob` URI will be
+    /// loaded via HTTPS domain-addressed S3, and a `file://` prefix
+    /// will always be read as a local path.
     #[structopt(short, long)]
     manifest: Option<String>,
 

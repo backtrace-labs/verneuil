@@ -404,6 +404,10 @@ fn retry_loop<T, E>(body: impl Fn() -> std::result::Result<T, E>) -> std::result
 /// If `path` starts with `http://` or `https://`, the bytes are
 /// downloaded over http(s) at that URL.
 ///
+/// If `path` starts with `s3://` (followed by
+/// `bucket-name.region[.endpoint]/path/to/blob`) the bytes are
+/// downloaded over the S3 protocol and the default credentials.
+///
 /// Otherwise, or if the `path` starts with `file://`, returns the
 /// contents of the local file.
 pub fn manifest_bytes_for_path(_config: Option<&Options>, path: &str) -> Result<Option<Vec<u8>>> {
@@ -421,6 +425,52 @@ pub fn manifest_bytes_for_path(_config: Option<&Options>, path: &str) -> Result<
                 |e| chain_warn!(e, "HTTP request for manifest failed", %path),
             )?))
         }
+    } else if let Some(path) = path.strip_prefix("s3://") {
+        use s3::bucket::Bucket;
+        use s3::creds::Credentials;
+
+        let (bucket_region, blob) = match path.split_once("/") {
+            Some(pair) => pair,
+            None => {
+                return Err(fresh_error!(
+                    "failed to parse S3 URI; should be s3://bucket-name.region[.endpoint]/path-to-blob",
+                    %path))
+            }
+        };
+
+        let (bucket, region) = match bucket_region.split_once(".") {
+            Some(pair) => pair,
+            None => {
+                return Err(fresh_error!(
+                    "failed to parse S3 URI; should be s3://bucket-name.region[.endpoint]/path-to-blob",
+                    %path))
+            }
+        };
+
+        let creds =
+            Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
+
+        let region: s3::Region = match region.parse() {
+            Ok(region) if !matches!(region, s3::Region::Custom { .. }) => region,
+            _ => {
+                let (region_name, endpoint) = match region.split_once(".") {
+                    Some(pair) => pair,
+                    None => (region, region),
+                };
+                tracing::debug!(%region, %region_name, %endpoint,
+                                "unknown S3 region; assuming it is a custom `region[.endpoint]`.");
+                s3::Region::Custom {
+                    region: region_name.to_owned(),
+                    endpoint: format!("https://{}", endpoint),
+                }
+            }
+        };
+        let mut bucket = Bucket::new(bucket, region, creds)
+            .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
+        bucket.set_subdomain_style();
+        bucket.set_request_timeout(Some(DOWNLOAD_TIMEOUT));
+
+        loader::load_from_source(&bucket, blob)
     } else {
         let path = path.strip_prefix("file://").unwrap_or(path);
 

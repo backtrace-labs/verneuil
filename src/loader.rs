@@ -471,7 +471,7 @@ fn call_with_slow_logging<T>(
 }
 
 /// Attempts to load the blob `name` from `source`.
-fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
     use rand::Rng;
 
     let mut rng = rand::thread_rng();
