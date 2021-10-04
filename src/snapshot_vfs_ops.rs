@@ -48,8 +48,10 @@ extern "C" fn verneuil__snapshot_open(file: &mut SnapshotFile, path: *const c_ch
             .map_err(|e| chain_error!(e, "path is not valid utf-8"))?
             .to_owned();
 
-        let bytes = std::fs::read(&string)
-            .map_err(|e| chain_error!(e, "failed to read manifest file", path=%string))?;
+        let bytes = match crate::manifest_bytes_for_path(None, &string)? {
+            Some(bytes) => bytes,
+            None => return Err(fresh_error!("manifest not found", path=%string)),
+        };
 
         let manifest = crate::Manifest::decode(&*bytes)
             .map_err(|e| chain_error!(e, "failed to parse manifest file", path=%string))?;
