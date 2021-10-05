@@ -220,6 +220,10 @@ const SUBDIRS: [&str; 3] = [CHUNKS, META, SCRATCH];
 /// period.
 const SCRATCH_FILE_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
+/// Only delete orphan `.tap` manifest files when they're older than
+/// this grace period.
+const ORPHAN_TAP_FILE_GRACE_PERIOD: Duration = Duration::from_secs(24 * 3600);
+
 /// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
 #[instrument]
@@ -573,6 +577,101 @@ fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Scans all manifest files in `spooling`'s `.tap` subdirectory.  If
+/// they're old and refer to nonexistent db files on the current
+/// hostname, delete them.
+fn delete_orphan_tapped_manifest_files(spooling: PathBuf) -> Result<()> {
+    let mut tap = spooling;
+    tap.push(DOT_TAP);
+
+    let it = match std::fs::read_dir(&tap) {
+        Ok(it) => it,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(chain_info!(e, "failed to list .tap directory", ?tap)),
+    };
+
+    // This string looks like
+    // `${hostname_hash}-verneuil:${hostname}:${path_hash}/${path}`,
+    // except percent-encoded.
+    let local_name = manifest_name_for_hostname_path(None, Path::new(""))
+        .map_err(|e| chain_error!(e, "failed to generate local manifest name"))?;
+    let decoded_name = percent_encoding::percent_decode_str(&local_name)
+        .decode_utf8()
+        .map_err(|e| chain_info!(e, "invalid utf-8 bytes in local manifest name"))?
+        .to_string();
+
+    // Find the hostname-specific prefix (up to and including the last colon).
+    let local_prefix = match decoded_name.rsplit_once(":") {
+        Some((prefix, _)) => format!("{}:", prefix),
+        None => {
+            return Err(fresh_error!(
+            "unexpected pattern in local manifest name",
+            %local_name))
+        }
+    };
+
+    fn handle_tap_file(path: &Path, decoded_name: &str) -> Result<()> {
+        if !file_is_stale(path, ORPHAN_TAP_FILE_GRACE_PERIOD)? {
+            return Ok(());
+        }
+
+        // Extract the `{path_hash}/{path}` suffix, and, from that,
+        // the final `path` component.
+        let suffix = match decoded_name
+            .rsplit_once(":")
+            .and_then(|(_, hash_path)| hash_path.split_once("/"))
+        {
+            Some((_hash, path)) => path,
+            None => return Ok(()),
+        };
+
+        // Only delete if we can positively tell that the target db
+        // file does not exist.
+        if !matches!(std::fs::metadata(Path::new(suffix)), Err(e) if e.kind() == ErrorKind::NotFound)
+        {
+            return Ok(());
+        }
+
+        match std::fs::remove_file(&path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(chain_error!(e, "failed to delete orphan tap file", ?path)),
+        }
+    }
+
+    for child in it.flatten() {
+        // We're only interested in percent-encoded paths, and those
+        // are always(?) valid utf-8.
+        let name = match child.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+
+        let decoded = match percent_encoding::percent_decode_str(&name).decode_utf8() {
+            Ok(decoded) => decoded.to_string(),
+            // if we can't percent-decode the string, it's not ours.
+            Err(_) => continue,
+        };
+
+        // Only look at files that match the current machine's prefix.
+        if !decoded.starts_with(&local_prefix) {
+            continue;
+        }
+
+        // Skip non-files.
+        if !matches!(child.file_type(), Ok(typ) if typ.is_file()) {
+            continue;
+        }
+
+        tap.push(child.file_name());
+        drop_result!(handle_tap_file(&tap, &decoded),
+                     e => chain_info!(e, "failed to maybe delete tapped manifest file", path=?tap));
+        tap.pop();
+    }
+
+    Ok(())
+}
+
 /// Creates a temporary file, populates it with `worker`, and
 /// publishes it to `target` on success.
 ///
@@ -862,14 +961,18 @@ impl ReplicationBuffer {
         // Add an instance id.
         spooling = current_spooling_dir(spooling);
 
-        // Once per process, try to scan for replication
-        // directories that refer to inexistent database files.
-        // Obviously, this logic only works because we only have
-        // the default spooling directory, but it's better than
-        // nothing.
+        // Once per process, try to scan for replication directories
+        // and `.tap`ped manifest files that refer to inexistent
+        // database files.  Obviously, this logic only works because
+        // we only have the default spooling directory, but it's
+        // better than nothing.
         if CLEAN_ONCE_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed) {
             drop_result!(delete_dangling_replication_directories(spooling.clone()),
                          e => chain_info!(e, "failed to scan for dangling replication directories",
+                                          ?spooling));
+
+            drop_result!(delete_orphan_tapped_manifest_files(spooling.clone()),
+                         e => chain_info!(e, "failed to scan for orphan manifest files",
                                           ?spooling));
         }
 
