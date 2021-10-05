@@ -456,21 +456,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
         let creds =
             Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
-        let region: s3::Region = match region.parse() {
-            Ok(region) if !matches!(region, s3::Region::Custom { .. }) => region,
-            _ => {
-                let (region_name, endpoint) = match region.split_once(".") {
-                    Some(pair) => pair,
-                    None => (region, region),
-                };
-                tracing::debug!(%region, %region_name, %endpoint,
-                                "unknown S3 region; assuming it is a custom `region[.endpoint]`.");
-                s3::Region::Custom {
-                    region: region_name.to_owned(),
-                    endpoint: format!("https://{}", endpoint),
-                }
-            }
-        };
+        let region = replication_target::parse_s3_region_specification(region, None);
         let mut bucket = Bucket::new(bucket, region, creds)
             .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
         bucket.set_subdomain_style();

@@ -18,6 +18,7 @@ use crate::chain_warn;
 use crate::fresh_error;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
+use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
@@ -412,17 +413,7 @@ fn create_source(
 
     match source {
         S3(s3) => {
-            let region = if let Some(endpoint) = &s3.endpoint {
-                s3::Region::Custom {
-                    region: s3.region.clone(),
-                    endpoint: endpoint.clone(),
-                }
-            } else {
-                s3.region
-                    .parse()
-                    .map_err(|e| chain_error!(e, "failed to parse S3 region", ?s3))?
-            };
-
+            let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(&s3);
             let mut bucket = Bucket::new(bucket_name, region, creds.clone())
                 .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;

@@ -43,6 +43,7 @@ use crate::manifest_schema::parse_manifest_info;
 use crate::ofd_lock::OfdLock;
 use crate::racy_time::RacySystemTime;
 use crate::replication_buffer;
+use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
 use crate::replication_target::S3ReplicationTarget;
@@ -692,17 +693,7 @@ fn create_target(
 
     match target {
         S3(s3) => {
-            let region = if let Some(endpoint) = &s3.endpoint {
-                s3::Region::Custom {
-                    region: s3.region.clone(),
-                    endpoint: endpoint.clone(),
-                }
-            } else {
-                s3.region
-                    .parse()
-                    .map_err(|e| chain_error!(e, "failed to parse S3 region", ?s3))?
-            };
-
+            let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(&s3);
             let mut bucket = Bucket::new(bucket_name, region, creds)
                 .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;

@@ -79,6 +79,47 @@ pub(crate) fn get_default_replication_targets() -> ReplicationTargetList {
     }
 }
 
+/// Parses a S3-compatible region specification from a region and an
+/// optional endpoint.
+///
+/// If the endpoint is provided, we use that region name and endpoint
+/// verbatim.
+///
+/// Otherwise, we use the region if it's known to our S3 crate (e.g.,
+/// standard AWS or yandex regions).
+///
+/// Finally, if we only have a non-standard region, we try to parse it
+/// as a custom region / HTTPS endpoint pair, of the form
+/// `region-name.domain.for.https.endpoint`; if there is no dot in the
+/// "region" name, we assume the endpoint matches the region name
+/// (e.g., when deployed to a local undotted domain entry).
+pub(crate) fn parse_s3_region_specification(region: &str, endpoint: Option<&str>) -> s3::Region {
+    if let Some(endpoint) = endpoint {
+        return s3::Region::Custom {
+            region: region.to_owned(),
+            endpoint: endpoint.to_owned(),
+        };
+    }
+
+    match region.parse() {
+        Ok(region) if !matches!(region, s3::Region::Custom { .. }) => region,
+        _ => {
+            let (region_name, endpoint) = match region.split_once(".") {
+                Some(pair) => pair,
+                None => (region, region),
+            };
+
+            let endpoint = format!("https://{}", endpoint);
+            tracing::debug!(string=%region, region=%region_name, %endpoint,
+                            "unknown S3 region; assuming it is a custom `region[.endpoint]`.");
+            s3::Region::Custom {
+                region: region_name.to_owned(),
+                endpoint,
+            }
+        }
+    }
+}
+
 #[test]
 fn test_serialization_smoke_test() {
     let targets = ReplicationTargetList {
