@@ -833,47 +833,49 @@ impl ReplicationBuffer {
 
         static CLEAN_ONCE_FLAG: AtomicBool = AtomicBool::new(true);
 
-        if let Some(mut spooling) = DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
-            // Add an instance id.
-            spooling = current_spooling_dir(spooling);
+        let mut spooling = match DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone() {
+            Some(dir) => dir,
+            None => return Ok(None),
+        };
 
-            // Once per process, try to scan for replication
-            // directories that refer to inexistent database files.
-            // Obviously, this logic only works because we only have
-            // the default spooling directory, but it's better than
-            // nothing.
-            if CLEAN_ONCE_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                drop_result!(delete_dangling_replication_directories(spooling.clone()),
-                             e => chain_info!(e, "failed to scan for dangling replication directories",
-                                              ?spooling));
-            }
+        // Add an instance id.
+        spooling = current_spooling_dir(spooling);
 
-            // And now add the unique local key for the db file.
-            spooling.push(mangle_path(db_path)?);
-            spooling.push(db_file_key(fd)?);
-
-            // Attempt to delete directories that refer to the same
-            // path, but different inode.
-            drop_result!(delete_stale_directories(&spooling),
-                         e => chain_info!(e, "failed to delete stale directories", ?spooling));
-
-            std::fs::create_dir_all(&spooling).map_err(|e| {
-                chain_error!(
-                    e,
-                    "failed to create spooling directory",
-                    ?db_path,
-                    ?spooling
-                )
-            })?;
-            std::fs::set_permissions(&spooling, PermissionsExt::from_mode(0o777)).map_err(
-                |e| chain_error!(e, "failed to set spooling dir permissions", dir=?spooling),
-            )?;
-            Ok(Some(ReplicationBuffer {
-                spooling_directory: spooling,
-            }))
-        } else {
-            Ok(None)
+        // Once per process, try to scan for replication
+        // directories that refer to inexistent database files.
+        // Obviously, this logic only works because we only have
+        // the default spooling directory, but it's better than
+        // nothing.
+        if CLEAN_ONCE_FLAG.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            drop_result!(delete_dangling_replication_directories(spooling.clone()),
+                         e => chain_info!(e, "failed to scan for dangling replication directories",
+                                          ?spooling));
         }
+
+        // And now add the unique local key for the db file.
+        spooling.push(mangle_path(db_path)?);
+        spooling.push(db_file_key(fd)?);
+
+        // Attempt to delete directories that refer to the same
+        // path, but different inode.
+        drop_result!(delete_stale_directories(&spooling),
+                     e => chain_info!(e, "failed to delete stale directories", ?spooling));
+
+        std::fs::create_dir_all(&spooling).map_err(|e| {
+            chain_error!(
+                e,
+                "failed to create spooling directory",
+                ?db_path,
+                ?spooling
+            )
+        })?;
+        std::fs::set_permissions(&spooling, PermissionsExt::from_mode(0o777)).map_err(
+            |e| chain_error!(e, "failed to set spooling dir permissions", dir=?spooling),
+        )?;
+
+        Ok(Some(ReplicationBuffer {
+            spooling_directory: spooling,
+        }))
     }
 
     /// Attempts to create a staging directory for the replication
