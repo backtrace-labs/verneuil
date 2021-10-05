@@ -1225,9 +1225,14 @@ impl CopierWorker {
                     Ok(Some(async move {
                         copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
                             .await?;
-                        replication_buffer::tap_meta_file(&parent, &name, &mut file).map_err(
+                        replication_buffer::tap_manifest_file(&parent, &name, &mut file).map_err(
                             |e| {
-                                chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                                chain_warn!(
+                                    e,
+                                    "failed to tap replicated manifest file",
+                                    ?name,
+                                    ?parent
+                                )
                             },
                         )?;
                         did_something.store(true, Ordering::Relaxed);
@@ -1449,9 +1454,14 @@ impl CopierWorker {
                     Ok(Some(async move {
                         copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
                             .await?;
-                        replication_buffer::tap_meta_file(&parent, &name, &mut file).map_err(
+                        replication_buffer::tap_manifest_file(&parent, &name, &mut file).map_err(
                             |e| {
-                                chain_warn!(e, "failed to tap replicated meta file", ?name, ?parent)
+                                chain_warn!(
+                                    e,
+                                    "failed to tap replicated manifest file",
+                                    ?name,
+                                    ?parent
+                                )
                             },
                         )?;
 
@@ -1637,7 +1647,7 @@ impl CopierWorker {
         let coverage_fraction = (time_since_last_patrol.as_secs_f64()
             / PATROL_TOUCH_PERIOD.as_secs_f64())
         .clamp(0.0, 1.0);
-        let tap_file = replication_buffer::construct_tapped_meta_path(spool_path, source)?;
+        let tap_file = replication_buffer::construct_tapped_manifest_path(spool_path, source)?;
         let mut chunks = parse_manifest_chunks(&tap_file)?;
         let mut rng = rand::thread_rng();
 
@@ -1886,7 +1896,7 @@ impl CopierSpoolState {
         let source_file_ctime = SystemTime::UNIX_EPOCH
             + std::time::Duration::new(stat.ctime() as u64, stat.ctime_nsec() as u32);
 
-        let tap_file = replication_buffer::construct_tapped_meta_path(&self.spool_path, &key)?;
+        let tap_file = replication_buffer::construct_tapped_manifest_path(&self.spool_path, &key)?;
         let (fprint, replicated_file_ctime) = parse_manifest_info(&tap_file)?;
 
         let sqlite_headers_match = match File::open(&key) {

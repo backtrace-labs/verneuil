@@ -328,23 +328,24 @@ pub fn current_replication_proto_for_db(
     source_db: &std::path::Path,
     spool_prefix: Option<std::path::PathBuf>,
 ) -> Result<(String, Option<ReplicationProtoData>)> {
-    let meta_path = replication_buffer::tapped_meta_path_in_spool_prefix(spool_prefix, source_db)?;
+    let manifest_path =
+        replication_buffer::tapped_manifest_path_in_spool_prefix(spool_prefix, source_db)?;
 
-    let blob_name = meta_path
+    let blob_name = manifest_path
         .file_name()
-        .expect("meta_path must have file name")
+        .expect("manifest_path must have file name")
         .to_str()
         .expect("url-encoded blob name must be valid utf-8")
         .to_string();
 
     let proto_data = (|| {
-        let bytes = match std::fs::read(&meta_path) {
+        let bytes = match std::fs::read(&manifest_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 return Err(chain_error!(
                     e,
-                    "failed to read tapped meta file",
-                    ?meta_path
+                    "failed to read tapped manifest file",
+                    ?manifest_path
                 ))
             }
             Ok(bytes) => bytes,

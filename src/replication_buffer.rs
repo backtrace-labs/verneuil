@@ -315,11 +315,11 @@ fn append_subdirectory(mut base: PathBuf) -> PathBuf {
     base
 }
 
-/// Returns the .tap path for `source_db`'s manifest proto file,
-/// given the path prefix for spooling directories (or None to use
-/// the global default).
+/// Returns the .tap path for `source_db`'s manifest proto file, given
+/// the path prefix for spooling directories (or None to use the
+/// global default).
 #[instrument(level = "debug", err)]
-pub(crate) fn tapped_meta_path_in_spool_prefix(
+pub(crate) fn tapped_manifest_path_in_spool_prefix(
     spool_prefix: Option<PathBuf>,
     source_db: &Path,
 ) -> Result<PathBuf> {
@@ -336,9 +336,13 @@ pub(crate) fn tapped_meta_path_in_spool_prefix(
     }
 }
 
-/// Returns the .tap path for `source_db`'s manifest proto file, given the file's `spool_dir`.
+/// Returns the .tap path for `source_db`'s manifest proto file, given
+/// the file's `spool_dir`.
 #[instrument(level = "debug", err)]
-pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> Result<PathBuf> {
+pub(crate) fn construct_tapped_manifest_path(
+    spool_dir: &Path,
+    source_db: &Path,
+) -> Result<PathBuf> {
     // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to the prefix, `...`.
     let base = spool_dir
         .parent()
@@ -346,12 +350,12 @@ pub(crate) fn construct_tapped_meta_path(spool_dir: &Path, source_db: &Path) -> 
         .flatten()
         .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
 
-    tapped_meta_path_in_spool_prefix(Some(base.to_path_buf()), source_db)
+    tapped_manifest_path_in_spool_prefix(Some(base.to_path_buf()), source_db)
 }
 
 /// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
 #[instrument(level = "debug", err)]
-pub(crate) fn tap_meta_file(
+pub(crate) fn tap_manifest_file(
     spool_dir: &Path,
     name: &std::ffi::OsStr,
     file: &mut File,
@@ -385,7 +389,7 @@ pub(crate) fn tap_meta_file(
         .map_err(|e| chain_error!(e, "failed to copy .tap file", ?tap))?;
 
     temp.persist(&tap)
-        .map_err(|e| chain_warn!(e, "failed to tap update meta file"))?;
+        .map_err(|e| chain_warn!(e, "failed to tap updated manifest file"))?;
     Ok(())
 }
 
