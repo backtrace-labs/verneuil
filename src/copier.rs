@@ -783,18 +783,6 @@ async fn copy_file(
     }
 
     for target in targets {
-        // Apparently we can force S3 to behave better when repeatedly
-        // writing to the same object by reading before every PUT.
-        // We're only asking for a couple bytes, and GETs cost 1/10 as
-        // much as PUTs, so we can afford to issue redundant GETs
-        // unconditionally.
-        let _ = await_with_slow_logging(
-            Duration::from_secs(5),
-            || target.get_object_range(&blob_name, 0, Some(1)),
-            |duration| tracing::info!(?duration, ?blob_name, "slow S3 RANGE GET"),
-        )
-        .await;
-
         for i in 0..=COPY_RETRY_LIMIT {
             match await_with_slow_logging(
                 Duration::from_secs(10),
