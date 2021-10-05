@@ -466,6 +466,27 @@ fn db_file_key(fd: &File) -> Result<String> {
     Ok(format!("{}.{}", meta.dev(), meta.ino()))
 }
 
+/// Determines whether the file at `path` has been untouched for
+/// `max_age` or longer.
+fn file_is_stale(path: &Path, max_age: Duration) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path).map_err(|e| {
+        filtered_io_error!(e,
+                           ErrorKind::NotFound => Level::DEBUG,
+                           "failed to stat file", ?path)
+    })?;
+    let changed = Duration::new(meta.ctime() as u64, meta.ctime_nsec() as u32);
+
+    let ctime = std::time::UNIX_EPOCH
+        .checked_add(changed)
+        .unwrap_or_else(std::time::SystemTime::now);
+    let elapsed = ctime
+        .elapsed()
+        .map_err(|e| chain_warn!(e, "time went backward", ?path))?;
+    Ok(elapsed >= max_age)
+}
+
 /// Attempts to delete all directories in the parent of `goal_path`
 /// except `goal_path`.
 #[instrument(err)]
@@ -1250,24 +1271,8 @@ impl ReplicationBuffer {
     /// Attempts to delete all temporary files and directory from "staging/scratch."
     #[instrument(err)]
     pub fn cleanup_scratch_directory(&self) -> Result<()> {
-        fn file_is_stale(path: &Path) -> Result<bool> {
-            use std::os::unix::fs::MetadataExt;
-
-            let meta = std::fs::metadata(path)
-                .map_err(|e| filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG, "failed to stat file", ?path))?;
-            let changed = Duration::new(meta.ctime() as u64, meta.ctime_nsec() as u32);
-
-            let ctime = std::time::UNIX_EPOCH
-                .checked_add(changed)
-                .unwrap_or_else(std::time::SystemTime::now);
-            let elapsed = ctime
-                .elapsed()
-                .map_err(|e| chain_warn!(e, "time went backward", ?path))?;
-            Ok(elapsed >= SCRATCH_FILE_GRACE_PERIOD)
-        }
-
         fn remove_file_if_stale(path: &Path) {
-            if matches!(file_is_stale(path), Ok(false)) {
+            if matches!(file_is_stale(path, SCRATCH_FILE_GRACE_PERIOD), Ok(false)) {
                 return;
             }
 
