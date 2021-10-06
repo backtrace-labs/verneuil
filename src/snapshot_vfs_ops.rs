@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::time::SystemTime;
 
 use crate::chain_error;
 use crate::fresh_error;
@@ -18,7 +19,13 @@ use crate::Result;
 use crate::Snapshot;
 
 struct Data {
+    /// URI for the manifest.
     path: String,
+
+    /// A lower bound on the time at which we updated the manifest for `data`.
+    updated: SystemTime,
+
+    /// Replica data.
     data: Snapshot,
 }
 
@@ -98,6 +105,7 @@ impl Drop for Data {
 fn fetch_new_data(path: String) -> Result<Arc<Data>> {
     use prost::Message;
 
+    let start = SystemTime::now();
     let bytes = match crate::manifest_bytes_for_path(None, &path)? {
         Some(bytes) => bytes,
         None => return Err(fresh_error!("manifest not found", %path)),
@@ -108,6 +116,7 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
 
     let data = Arc::new(Data {
         path: path.clone(),
+        updated: start,
         data: Snapshot::new_with_default_targets(&manifest)?,
     });
 
