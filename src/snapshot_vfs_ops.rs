@@ -343,6 +343,14 @@ extern "C" fn verneuil__snapshot_ctime(file: &SnapshotFile) -> Timestamp {
         .unwrap_or_default()
 }
 
+/// Returns the `updated` time for the file's current snapshot.
+#[no_mangle]
+extern "C" fn verneuil__snapshot_updated(file: &SnapshotFile) -> Timestamp {
+    file.snapshot()
+        .map(|data| data.updated.into())
+        .unwrap_or_default()
+}
+
 impl SnapshotFile {
     fn read(&self, mut dst: &mut [u8], offset: u64) -> Result<u64> {
         let snapshot = &self

@@ -2216,6 +2216,14 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
                      return snapshot_refresh(vfile, dst, force);
              }
 
+             if (strcmp(pragma, "verneuil_snapshot_updated") == 0) {
+                     struct timestamp updated;
+
+                     updated = verneuil__snapshot_updated((void *)vfile);
+                     *dst = sqlite3_mprintf(TIMESTAMP_FMT, TIMESTAMP_ARG(updated));
+                     return SQLITE_OK;
+             }
+
              return SQLITE_NOTFOUND;
         }
 

@@ -191,3 +191,9 @@ const char *verneuil__snapshot_refresh(struct snapshot_file *, struct timestamp 
  * Returns the `ctime` for the connection's current data snapshot.
  */
 struct timestamp verneuil__snapshot_ctime(struct snapshot_file *);
+
+/**
+ * Returns the system time when we updated the connection's current
+ * data snapshot.
+ */
+struct timestamp verneuil__snapshot_updated(struct snapshot_file *);
