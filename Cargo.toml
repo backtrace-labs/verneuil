@@ -8,7 +8,7 @@ authors = ["Backtrace I/O <team@backtrace.io>"]
 edition = "2018"
 
 [lib]
-crate-type = ["lib", "staticlib", "cdylib"]
+crate-type = ["lib", "staticlib"]
 
 [[example]]
 name = "verneuil_vfs"
