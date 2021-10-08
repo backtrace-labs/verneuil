@@ -173,8 +173,9 @@ int verneuil__file_unlock(sqlite3_file *, int level);
 int verneuil__snapshot_unlock(sqlite3_file *, int level);
 
 /**
- * Refreshes the snapshot's underlying data.  If `force`, always
- * updates to a new version; otherwise, uses the latest version
+ * Refreshes the snapshot's underlying data.  If `force > 1`, always
+ * updates to a new version; if `force == 1`, updates to a new version
+ * when no fetch is in flight; otherwise, uses the latest version
  * already available.
  *
  * Returns NULL on success, and an error message on failure; that
@@ -185,7 +186,7 @@ int verneuil__snapshot_unlock(sqlite3_file *, int level);
  * time at which we fetched the now-current snapshot.
  */
 const char *verneuil__snapshot_refresh(struct snapshot_file *, struct timestamp *,
-    size_t *OUT_len, bool force);
+    size_t *OUT_len, uint32_t force_level);
 
 /**
  * Refreshes the snapshot's underlying data.  If that's a no-op,

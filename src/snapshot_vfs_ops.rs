@@ -334,26 +334,45 @@ extern "C" fn verneuil__snapshot_unlock(file: &SnapshotFile, level: LockLevel) -
     SqliteCode::Ok
 }
 
-/// Refreshes the snapshot data.  If `force`, always gets a fresh
-/// snapshot; otherwise, uses the latest available data.
+/// Refreshes the snapshot data.
+///
+/// Force == 0: use the latest available data
+/// Force == 1: fetch a new snapshot, unless there's already an update in flight,
+///             in which case use the latest available one.
+/// Force >= 2: fetch a new snapshot
 #[no_mangle]
 extern "C" fn verneuil__snapshot_refresh(
     file: &SnapshotFile,
     update_ts: &mut Timestamp,
     len: &mut usize,
-    force: bool,
+    force_level: u32,
 ) -> *const c_char {
-    fn doit(file: &SnapshotFile, force: bool) -> Result<SystemTime> {
+    fn doit(file: &SnapshotFile, force_level: u32) -> Result<SystemTime> {
         let path = &file
             .snapshot()
             .ok_or_else(|| fresh_error!("attempted to read uninitialised SnapshotFile"))?
             .path;
 
-        let data = if force {
-            fetch_new_data(path.clone())
-        } else {
-            get_data(path.into())
-        }?;
+        let mut data = get_data(path.into())?;
+
+        if force_level >= 1 {
+            let old_flag = data.reload_queued.swap(true, Ordering::Relaxed);
+
+            let update = if !old_flag || force_level >= 2 {
+                Some(fetch_new_data(path.clone()))
+            } else {
+                None
+            };
+
+            // Only clear the flag if we were the ones to set it.
+            if !old_flag {
+                data.reload_queued.store(false, Ordering::Relaxed);
+            }
+
+            if let Some(update) = update {
+                data = update?;
+            }
+        }
 
         let ts = data.updated;
         file.set_snapshot(data);
@@ -362,7 +381,7 @@ extern "C" fn verneuil__snapshot_refresh(
 
     *update_ts = Default::default();
     *len = 0;
-    match doit(file, force) {
+    match doit(file, force_level) {
         Ok(updated) => {
             *update_ts = updated.into();
             std::ptr::null()

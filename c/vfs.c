@@ -2114,7 +2114,7 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
 }
 
 static int
-snapshot_refresh(sqlite3_file *vfile, char **dst, bool force)
+snapshot_refresh(sqlite3_file *vfile, char **dst, uint32_t force_level)
 {
         struct snapshot_file *file = (void *)vfile;
         struct timestamp updated = { 0 };
@@ -2124,18 +2124,18 @@ snapshot_refresh(sqlite3_file *vfile, char **dst, bool force)
         if (file->locked == true) {
                 *dst = sqlite3_mprintf(
                     "verneuil snapshot may not be %srefreshed within a transaction",
-                    (force ? "force " : ""));
+                    (force_level > 1 ? "force " : ""));
                 return SQLITE_LOCKED;
         }
 
-        result = verneuil__snapshot_refresh(file, &updated, &len, force);
+        result = verneuil__snapshot_refresh(file, &updated, &len, force_level);
         if (result == NULL) {
                 *dst = sqlite3_mprintf(TIMESTAMP_FMT, TIMESTAMP_ARG(updated));
                 return SQLITE_OK;
         }
 
         *dst = sqlite3_mprintf("failed to %srefresh verneuil snapshot: %*s",
-            (force ? "force " : ""), (int)len, result);
+            (force_level > 1 ? "force " : ""), (int)len, result);
         return SQLITE_ERROR;
 }
 
@@ -2237,16 +2237,18 @@ snapshot_file_control(sqlite3_file *vfile, int op, void *arg)
              }
 
              if (strcmp(pragma, "verneuil_snapshot_refresh") == 0) {
-                     bool force;
+                     uint32_t force_level;
 
-                     if (param != NULL &&
+                     if (param == NULL) {
+                             force_level = 0;
+                     } else if (strcmp(param, "2") == 0 ||
                          strncasecmp(param, "force", strlen("force")) == 0) {
-                             force = true;
+                             force_level = 2;
                      } else {
-                             force = parse_bool_param(param, false);
+                             force_level = parse_bool_param(param, false) ? 1 : 0;
                      }
 
-                     return snapshot_refresh(vfile, dst, force);
+                     return snapshot_refresh(vfile, dst, force_level);
              }
 
              if (strcmp(pragma, "verneuil_snapshot_updated") == 0) {
