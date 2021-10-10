@@ -1480,3 +1480,12 @@ fn replace_slashes_invertible() {
         &restore_slashes(&converted).expect("must decode")
     );
 }
+
+/// The mapping function should be constant across versions.
+#[test]
+fn test_manifest_name_for_hostname_path() {
+    assert_eq!(
+        manifest_name_for_hostname_path(Some("test.com"), Path::new("/tmp/test.db")).unwrap(),
+        "7cb1-verneuil%3Atest.com%3A80ad%2F%2Ftmp%2Ftest.db"
+    );
+}

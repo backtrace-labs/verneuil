@@ -124,3 +124,10 @@ fn print_hostname() {
         hostname_hash(hostname())
     );
 }
+
+/// Changing the hostname hash function is a backward incompatible
+/// change in storage format.  Test against that.
+#[test]
+fn test_hostname_hash() {
+    assert_eq!(hostname_hash("example.com"), "7010");
+}

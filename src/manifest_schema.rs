@@ -432,13 +432,26 @@ pub(crate) fn parse_manifest_chunks(path: &std::path::Path) -> Result<Vec<Finger
 #[test]
 fn check_fingerprint_v1_reference() {
     // The parameters are part of the wire format, and should never change for v1.
-    let params = umash::Params::derive(0, "verneuil db directory params");
+    assert_eq!(
+        fingerprint_v1_chunk_list(&[1, 516]),
+        Fingerprint {
+            hash: [7575684803259252638, 13253811199699765610]
+        }
+    );
+}
 
-    let bytes: [u8; 16] = [
-        1, 0, 0, 0, 0, 0, 0, 0, // 1 in little endian
-        4, 2, 0, 0, 0, 0, 0, 0, // 2 * 256 + 4 = 516 in LE
-    ];
+/// The chunk fingerprint / hash are part of the wire format, and
+/// should not change (for v1, at least).
+#[test]
+fn check_chunk_fingerprint() {
+    let zeros = vec![0u8; 1usize << 16];
 
-    let expected = Fingerprint::generate(&params, 0, &bytes);
-    assert_eq!(fingerprint_v1_chunk_list(&[1, 516]), expected);
+    assert_eq!(
+        fingerprint_file_chunk(&zeros),
+        Fingerprint {
+            hash: [8155395758008617606, 2728302605148947890],
+        }
+    );
+
+    assert_eq!(hash_file_chunk(&zeros), 8155395758008617606);
 }
