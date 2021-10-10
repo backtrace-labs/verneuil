@@ -42,6 +42,8 @@ use crate::manifest_schema::parse_manifest_chunks;
 use crate::manifest_schema::parse_manifest_info;
 use crate::ofd_lock::OfdLock;
 use crate::racy_time::RacySystemTime;
+use crate::recent_work_set::RecentWorkSet;
+use crate::recent_work_set::WorkUnit;
 use crate::replication_buffer;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
@@ -87,6 +89,20 @@ const COPY_RETRY_BASE_WAIT: Duration = Duration::from_millis(100);
 /// Grow the back-off delay by `COPY_RETRY_MULTIPLIER` after
 /// consecutive failures.
 const COPY_RETRY_MULTIPLIER: f64 = 10.0;
+
+/// Remember up to this many recent copy requests for deduplication.
+///
+/// This value should ideally be proportional to the maximum copy rate
+/// (`COPY_RATE_QUOTA`) and `COPY_REQUEST_MIN_AGE`.
+const COPY_REQUEST_MEMORY: usize = 30 * 3600;
+
+/// Avoid executing duplicate copy requests that are separated by less
+/// than `COPY_REQUEST_MIN_AGE`.
+const COPY_REQUEST_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// When comparing against `COPY_REQUEST_MIN_AGE`, jitter the
+/// timestamp by up to this duration.
+const COPY_REQUEST_JITTER: Duration = Duration::from_secs(600);
 
 /// Perform background work for one spooling directory approximately
 /// once per BACKGROUND_SCAN_PERIOD.
@@ -182,6 +198,10 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 0;
 
 /// Disable compression with a negative level value.
 const ZSTD_COMPRESSION_DISABLE: i32 = -1;
+
+lazy_static::lazy_static! {
+    static ref RECENT_WORK: Mutex<RecentWorkSet> = Mutex::new(RecentWorkSet::new(COPY_REQUEST_MEMORY, COPY_REQUEST_JITTER));
+}
 
 /// Messages to maintain the set of active spooling directory: `Join`
 /// adds a new directory, `Leave` removes it.  There may be multiple
@@ -795,6 +815,10 @@ async fn copy_file(
                     break;
                 }
                 Ok((body, code)) if code < 500 && code != 408 && code != 429 => {
+                    // If something went wrong, clear the recent
+                    // wrong: maybe the remote is in a bad state.
+                    RECENT_WORK.lock().unwrap().clear();
+
                     // Permanent failure.  In theory, we should maybe
                     // retry on 400: RequestTimeout, but we'll catch
                     // it in the next background scan.
@@ -887,6 +911,10 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                     break;
                 }
                 Ok((body, 404)) => {
+                    // If something went wrong, clear the recent
+                    // wrong: maybe the remote is in a bad state.
+                    RECENT_WORK.lock().unwrap().clear();
+
                     // Something's definitely wrong with our
                     // replication data if we can't find the blob.
                     return Err(chain_error!(
@@ -898,6 +926,8 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                 }
                 // If it's a non-404 error, don't retry.
                 Ok((body, code)) if (400..500).contains(&code) && code != 408 && code != 429 => {
+                    RECENT_WORK.lock().unwrap().clear();
+
                     let _ = chain_warn!((body, code), "failed to touch chunk", %target.name, ?blob_name);
                     break;
                 }
@@ -1183,12 +1213,28 @@ impl CopierWorker {
             consume_directory(
                 replication_buffer::directory_chunks(consuming.clone()),
                 |name, mut file| {
+                    let work_unit = WorkUnit::new((targets, name));
+
+                    // Maybe we recently handled this work unit, and
+                    // there's nothing to do.
+                    if RECENT_WORK
+                        .lock()
+                        .unwrap()
+                        .has_recent(&work_unit, COPY_REQUEST_MIN_AGE)
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+
                     self.pace();
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets).await
+                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets)
+                            .await?;
+                        RECENT_WORK.lock().unwrap().observe(&work_unit);
+                        Ok(())
                     }))
                 },
                 ConsumeDirectoryPolicy::RemoveFilesAndDirectory,
@@ -1336,6 +1382,19 @@ impl CopierWorker {
             consume_directory(
                 chunks_directory.clone(),
                 |name: &OsStr, mut file| {
+                    let work_unit = WorkUnit::new((targets, name));
+
+                    // Maybe we recently handled this work unit, and
+                    // there's nothing to do.
+                    if RECENT_WORK
+                        .lock()
+                        .unwrap()
+                        .has_recent(&work_unit, COPY_REQUEST_MIN_AGE)
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+
                     self.pace();
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
@@ -1347,6 +1406,7 @@ impl CopierWorker {
                         // Always upload the contents of the meta
                         // directory if we found chunks to upload.
                         force_meta.store(true, Ordering::Relaxed);
+                        RECENT_WORK.lock().unwrap().observe(&work_unit);
                         Ok(())
                     }))
                 },

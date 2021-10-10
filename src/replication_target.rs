@@ -15,7 +15,7 @@ use std::sync::RwLock;
 
 /// A S3 replication target sends content-addressed chunks to one
 /// S3-compatible bucket, and named directory blobs to another.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct S3ReplicationTarget {
     /// Region for the blob store.  Either one of the hardcoded strings
     /// supported by Rust-S3 (https://github.com/durch/rust-s3/blob/0.26.3/aws-region/src/region.rs#L132-L160),
@@ -47,7 +47,7 @@ pub struct S3ReplicationTarget {
 
 /// A replication target tells us where to replicate data, but not
 /// with what credentials.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicationTarget {
     S3(S3ReplicationTarget),
@@ -55,7 +55,7 @@ pub enum ReplicationTarget {
 
 /// Verneuil will replicate content-addressed chunks and named
 /// directory blobs to all the replication targets in the list.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct ReplicationTargetList {
     // Use a long and distinctive name for this field because, while
     // the list of replication targets is the only metadata we
