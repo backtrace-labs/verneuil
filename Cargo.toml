@@ -57,7 +57,7 @@ tokio = { version = "1", features = ["rt", "time"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.2", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "2"
-umash = "0.1.2"
+umash = "0.4"
 uuid = { version = "0.8", features = ["v4"] }
 zstd = "0.9"
 

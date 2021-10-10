@@ -100,9 +100,7 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
     let mut ret = Vec::with_capacity(flattened.len() / 2);
 
     for i in 0..flattened.len() / 2 {
-        ret.push(Fingerprint {
-            hash: [flattened[2 * i], flattened[2 * i + 1]],
-        });
+        ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
     }
 
     Some(ret)
@@ -291,7 +289,7 @@ impl Tracker {
         };
 
         // And make sure list's size matches the file's.
-        chunk_fprints.resize(num_chunks as usize, Fingerprint { hash: [0, 0] });
+        chunk_fprints.resize(num_chunks as usize, Fingerprint::new(0, 0));
 
         // Box this allocation to avoid a 64KB stack allocation.
         let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);

@@ -734,7 +734,7 @@ pub fn manifest_name_for_hostname_path(hostname_or: Option<&str>, path: &Path) -
         .remove(b')');
 
     lazy_static::lazy_static! {
-        static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil path params");
+        static ref PARAMS: umash::Params = umash::Params::derive(0, b"verneuil path params");
     }
 
     let hostname: &str = hostname_or.unwrap_or_else(|| instance_id::hostname());
@@ -743,7 +743,7 @@ pub fn manifest_name_for_hostname_path(hostname_or: Option<&str>, path: &Path) -
         .as_os_str()
         .to_str()
         .ok_or_else(|| fresh_error!("failed to convert path to string", ?path))?;
-    let path_hash = umash::full_str(&PARAMS, 0, 0, &string);
+    let path_hash = PARAMS.hasher(0).write(&string.as_bytes()).digest();
 
     let name = format!(
         "{}-verneuil:{}:{:04x}/{}",

@@ -28,25 +28,21 @@ impl From<Fingerprint> for Fprint {
 impl From<&Fingerprint> for Fprint {
     fn from(fp: &Fingerprint) -> Fprint {
         Fprint {
-            major: fp.hash[0],
-            minor: fp.hash[1],
+            major: fp.hash(),
+            minor: fp.secondary(),
         }
     }
 }
 
 impl From<Fprint> for Fingerprint {
     fn from(fp: Fprint) -> Fingerprint {
-        Fingerprint {
-            hash: [fp.major, fp.minor],
-        }
+        Fingerprint::new(fp.major, fp.minor)
     }
 }
 
 impl From<&Fprint> for Fingerprint {
     fn from(fp: &Fprint) -> Fingerprint {
-        Fingerprint {
-            hash: [fp.major, fp.minor],
-        }
+        Fingerprint::new(fp.major, fp.minor)
     }
 }
 
@@ -116,7 +112,7 @@ pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerpr
     const HEADER_SIZE: usize = 100;
 
     lazy_static::lazy_static! {
-        static ref HEADER_PARAMS: umash::Params = umash::Params::derive(0, "verneuil sqlite header params");
+        static ref HEADER_PARAMS: umash::Params = umash::Params::derive(0, b"verneuil sqlite header params");
     }
 
     let mut buf = [0u8; HEADER_SIZE];
@@ -133,7 +129,7 @@ pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerpr
             tracing::info!(%error, "failed to read sqlite header");
             None
         }
-        Ok(_) => Some(Fingerprint::generate(&HEADER_PARAMS, 0, &buf)),
+        Ok(_) => Some(HEADER_PARAMS.fingerprinter(0).write(&buf).digest()),
     }
 }
 
@@ -311,17 +307,17 @@ pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
 }
 
 lazy_static::lazy_static! {
-    static ref CHUNK_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db chunk params");
+    static ref CHUNK_PARAMS: umash::Params = umash::Params::derive(0, b"verneuil db chunk params");
 }
 
 /// Computes the fingerprint for a chunk of sqlite db file.
 pub(crate) fn fingerprint_file_chunk(bytes: &[u8]) -> Fingerprint {
-    Fingerprint::generate(&CHUNK_PARAMS, 0, bytes)
+    CHUNK_PARAMS.fingerprinter(0).write(bytes).digest()
 }
 
 /// Computes the first half of the fingerprint for a chunk of sqlite db file.
 pub(crate) fn hash_file_chunk(bytes: &[u8]) -> u64 {
-    umash::full(&CHUNK_PARAMS, 0, 0, bytes)
+    CHUNK_PARAMS.hasher(0).write(bytes).digest()
 }
 
 /// Computes the `contents_fprint` for a given `chunks` array of u64.
@@ -332,8 +328,10 @@ pub(crate) fn hash_file_chunk(bytes: &[u8]) -> u64 {
 pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
     lazy_static::lazy_static! {
     // Manifest files used to be called "directory" files.
-        static ref MANIFEST_PARAMS: umash::Params = umash::Params::derive(0, "verneuil db directory params");
+        static ref MANIFEST_PARAMS: umash::Params = umash::Params::derive(0, b"verneuil db directory params");
     }
+
+    let mut fingerprinter = MANIFEST_PARAMS.fingerprinter(0);
 
     if cfg!(target_endian = "little") {
         let slice = unsafe {
@@ -343,7 +341,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
             )
         };
 
-        return Fingerprint::generate(&MANIFEST_PARAMS, 0, &slice);
+        return fingerprinter.write(&slice).digest();
     }
 
     let mut bytes = Vec::with_capacity(chunks.len() * 8);
@@ -352,7 +350,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
         bytes.extend(&word.to_le_bytes());
     }
 
-    Fingerprint::generate(&MANIFEST_PARAMS, 0, &bytes)
+    fingerprinter.write(&bytes).digest()
 }
 
 /// Returns the header Fingerprint and ctime stored in the manifest
@@ -393,9 +391,7 @@ pub(crate) fn extract_manifest_chunks(manifest: &Manifest) -> Result<Vec<Fingerp
             let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
 
             for i in 0..v1.chunks.len() / 2 {
-                ret.push(Fingerprint {
-                    hash: [v1.chunks[2 * i], v1.chunks[2 * i + 1]],
-                });
+                ret.push(Fingerprint::new(v1.chunks[2 * i], v1.chunks[2 * i + 1]));
             }
 
             Ok(ret)
@@ -434,9 +430,7 @@ fn check_fingerprint_v1_reference() {
     // The parameters are part of the wire format, and should never change for v1.
     assert_eq!(
         fingerprint_v1_chunk_list(&[1, 516]),
-        Fingerprint {
-            hash: [7575684803259252638, 13253811199699765610]
-        }
+        Fingerprint::new(7575684803259252638, 13253811199699765610)
     );
 }
 
@@ -448,9 +442,7 @@ fn check_chunk_fingerprint() {
 
     assert_eq!(
         fingerprint_file_chunk(&zeros),
-        Fingerprint {
-            hash: [8155395758008617606, 2728302605148947890],
-        }
+        Fingerprint::new(8155395758008617606, 2728302605148947890)
     );
 
     assert_eq!(hash_file_chunk(&zeros), 8155395758008617606);

@@ -79,10 +79,10 @@ pub fn hostname() -> &'static str {
 /// Returns a high-entropy short string hash of the hostname.
 pub(crate) fn hostname_hash(hostname: &str) -> String {
     lazy_static::lazy_static! {
-        static ref PARAMS: umash::Params = umash::Params::derive(0, "verneuil hostname params");
+        static ref PARAMS: umash::Params = umash::Params::derive(0, b"verneuil hostname params");
     }
 
-    let hash = umash::full_str(&PARAMS, 0, 0, hostname);
+    let hash = PARAMS.hasher(0).write(hostname.as_bytes()).digest();
     format!("{:04x}", hash % (1 << (4 * 4)))
 }
 
