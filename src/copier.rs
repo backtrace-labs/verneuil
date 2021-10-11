@@ -1692,6 +1692,7 @@ impl CopierWorker {
         };
 
         // Similarly, a failure here shouldn't trigger a full snapshot.
+        s3::creds::set_request_timeout(Some(CREDENTIALS_REQUEST_TIMEOUT));
         let creds = match Credentials::default() {
             Ok(creds) => creds,
             Err(e) => {

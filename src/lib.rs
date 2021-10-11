@@ -454,6 +454,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
             }
         };
 
+        s3::creds::set_request_timeout(Some(DOWNLOAD_TIMEOUT));
         let creds =
             Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 

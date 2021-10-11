@@ -162,6 +162,7 @@ pub(crate) fn fetch_manifest(
     }
 
     if !remote.is_empty() {
+        s3::creds::set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
         let creds =
             Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
@@ -186,6 +187,7 @@ impl Loader {
         let mut remote_sources = Vec::new();
 
         if !remote.is_empty() {
+            s3::creds::set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
             let creds =
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
