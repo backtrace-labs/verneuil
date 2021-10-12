@@ -368,18 +368,33 @@ pub fn manifest_bytes_for_hostname_path(
     hostname_or: Option<&str>,
     path: &Path,
 ) -> Result<Option<Vec<u8>>> {
+    use replication_buffer::tap_path_in_spool_prefix;
+
     let manifest_name = manifest_name_for_hostname_path(hostname_or, path)?;
 
     let default_targets;
-    let targets = match config {
-        Some(options) => &options.replication_targets,
+    let (targets, tap_path) = match config {
+        Some(options) => (
+            &options.replication_targets,
+            tap_path_in_spool_prefix(options.replication_spooling_dir.as_ref().map(|x| x.into())),
+        ),
         None => {
             default_targets = replication_target::get_default_replication_targets();
-            &default_targets.replication_targets
+            (
+                &default_targets.replication_targets,
+                tap_path_in_spool_prefix(None),
+            )
         }
     };
 
-    loader::fetch_manifest(&manifest_name, &[], targets)
+    loader::fetch_manifest(
+        &manifest_name,
+        &tap_path
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<&Path>>(),
+        targets,
+    )
 }
 
 fn retry_loop<T, E>(body: impl Fn() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
@@ -674,7 +689,15 @@ pub unsafe extern "C" fn verneuil_replication_info_for_manifest(
     };
 
     let targets = replication_target::get_default_replication_targets();
-    let info_or = match loader::fetch_manifest(&manifest_name, &[], &targets.replication_targets) {
+    let tap_path = replication_buffer::tap_path_in_spool_prefix(None);
+    let info_or = match loader::fetch_manifest(
+        &manifest_name,
+        &tap_path
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<&Path>>(),
+        &targets.replication_targets,
+    ) {
         Ok(Some(bytes)) => match ReplicationProtoData::new(bytes) {
             Ok(info_or) => info_or,
             Err(e) => {

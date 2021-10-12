@@ -319,6 +319,17 @@ fn append_subdirectory(mut base: PathBuf) -> PathBuf {
     base
 }
 
+/// Returns the .tap path given the path prefix for spooling
+/// directories (or None to use the global default), if we can find
+/// it.
+#[instrument(level = "debug")]
+pub(crate) fn tap_path_in_spool_prefix(spool_prefix: Option<PathBuf>) -> Option<PathBuf> {
+    let mut prefix = spool_prefix.or_else(|| DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone())?;
+
+    prefix.push(DOT_TAP);
+    Some(prefix)
+}
+
 /// Returns the .tap path for `source_db`'s manifest proto file, given
 /// the path prefix for spooling directories (or None to use the
 /// global default).
@@ -327,17 +338,18 @@ pub(crate) fn tapped_manifest_path_in_spool_prefix(
     spool_prefix: Option<PathBuf>,
     source_db: &Path,
 ) -> Result<PathBuf> {
-    match spool_prefix.or_else(|| DEFAULT_SPOOLING_DIRECTORY.read().unwrap().clone()) {
-        None => Err(fresh_error!(
-            "no spool_prefix provided or defaulted",
-            ?source_db
-        )),
-        Some(mut tap) => {
-            tap.push(DOT_TAP);
-            tap.push(percent_encode_local_path_uri(source_db)?);
-            Ok(tap)
+    let mut tap = match tap_path_in_spool_prefix(spool_prefix) {
+        Some(path) => path,
+        None => {
+            return Err(fresh_error!(
+                "no spool_prefix provided or defaulted",
+                ?source_db
+            ))
         }
-    }
+    };
+
+    tap.push(percent_encode_local_path_uri(source_db)?);
+    Ok(tap)
 }
 
 /// Returns the .tap path for `source_db`'s manifest proto file, given
