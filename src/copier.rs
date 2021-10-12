@@ -708,7 +708,7 @@ fn create_target(
     target: &ReplicationTarget,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
     creds: Credentials,
-) -> Result<Bucket> {
+) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
 
     match target {
@@ -729,8 +729,9 @@ fn create_target(
             }
 
             bucket.set_request_timeout(Some(COPY_REQUEST_TIMEOUT));
-            Ok(bucket)
+            Ok(Some(bucket))
         }
+        ReadOnly(_) => Ok(None),
     }
 }
 
@@ -1201,6 +1202,7 @@ impl CopierWorker {
                 .iter()
                 .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
+                .flatten() // remove None
                 .collect::<Vec<_>>();
 
             // If we don't have replication target, best to leave the data
@@ -1250,6 +1252,7 @@ impl CopierWorker {
                 .iter()
                 .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
+                .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
             if meta_buckets.is_empty() {
@@ -1365,6 +1368,7 @@ impl CopierWorker {
                 .iter()
                 .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
+                .flatten() // Drop `None`.
                 .collect::<Vec<_>>();
 
             // If we don't have any replication target, best to leave
@@ -1468,6 +1472,7 @@ impl CopierWorker {
                 .iter()
                 .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // TODO: how do we want to handle failures here?
+                .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
             if meta_buckets.is_empty() {
@@ -1766,6 +1771,7 @@ impl CopierWorker {
             .iter()
             .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
             .flatten() // TODO: how do we want to handle failures here?
+            .flatten() // Drop `None`
             .collect::<Vec<_>>();
 
         if chunks_buckets.is_empty() {

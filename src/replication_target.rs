@@ -45,12 +45,34 @@ pub struct S3ReplicationTarget {
     pub create_buckets_on_demand: bool,
 }
 
-/// A replication target tells us where to replicate data, but not
-/// with what credentials.
+fn return_true() -> bool {
+    true
+}
+
+/// A read-only cache replication target loads content-addressed
+/// chunks from a directory of cached files.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub struct ReadOnlyCacheReplicationTarget {
+    /// The root directory for the cache.
+    pub directory: String,
+
+    /// The number of shards in the cache (0 or 1 for a plain
+    /// directory of files).
+    #[serde(default)]
+    pub num_shards: u32,
+
+    /// Whether to append the instance id to the `directory` path.
+    #[serde(default = "return_true")]
+    pub append_instance_id: bool,
+}
+
+/// A replication target tells us where to find or replicate data, but
+/// not with what credentials.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicationTarget {
     S3(S3ReplicationTarget),
+    ReadOnly(ReadOnlyCacheReplicationTarget),
 }
 
 /// Verneuil will replicate content-addressed chunks and named

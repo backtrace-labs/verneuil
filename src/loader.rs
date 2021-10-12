@@ -208,8 +208,10 @@ pub(crate) fn fetch_manifest(
 
         for source in remote {
             let bucket = create_source(source, &creds, |s3| &s3.manifest_bucket)?;
-            if let Some(fetched) = load_from_source(&bucket, name)? {
-                return Ok(Some(fetched));
+            if let Some(bucket) = bucket {
+                if let Some(fetched) = load_from_source(&bucket, name)? {
+                    return Ok(Some(fetched));
+                }
             }
         }
     }
@@ -229,13 +231,16 @@ impl Loader {
     ) -> Result<Loader> {
         let mut remote_sources = Vec::new();
 
-        if !remote.is_empty() {
+        // We only care about remote S3 sources.
+        if remote.iter().any(|x| matches!(x, ReplicationTarget::S3(_))) {
             s3::creds::set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
             let creds =
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
             for source in remote {
-                remote_sources.push(create_source(&source, &creds, |s3| &s3.chunk_bucket)?);
+                if let Some(bucket) = create_source(&source, &creds, |s3| &s3.chunk_bucket)? {
+                    remote_sources.push(bucket);
+                }
             }
         }
 
@@ -477,7 +482,7 @@ fn create_source(
     source: &ReplicationTarget,
     creds: &Credentials,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
-) -> Result<Bucket> {
+) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
 
     match source {
@@ -494,8 +499,9 @@ fn create_source(
             }
 
             bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
-            Ok(bucket)
+            Ok(Some(bucket))
         }
+        ReadOnly(_) => Ok(None),
     }
 }
 
