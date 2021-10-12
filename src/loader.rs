@@ -20,6 +20,7 @@ use crate::drop_result;
 use crate::fresh_error;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
+use crate::replication_target::apply_cache_replication_targets;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::S3ReplicationTarget;
@@ -243,6 +244,8 @@ impl Loader {
                 }
             }
         }
+
+        cache_builder = apply_cache_replication_targets(cache_builder, &remote);
 
         // In tests, check every potential cache hits to make sure
         // they have the same value.

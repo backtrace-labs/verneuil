@@ -9,9 +9,14 @@
 //! so schema evolution isn't an important concern.  We also only
 //! expect our own Rust code to deserialize the JSON we write, so
 //! we can use all the flexibility offered by serde_json.
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+use kismet_cache::CacheBuilder;
 use serde::Deserialize;
 use serde::Serialize;
-use std::sync::RwLock;
+
+use crate::instance_id::instance_id;
 
 /// A S3 replication target sends content-addressed chunks to one
 /// S3-compatible bucket, and named directory blobs to another.
@@ -99,6 +104,31 @@ pub(crate) fn get_default_replication_targets() -> ReplicationTargetList {
     ReplicationTargetList {
         replication_targets: DEFAULT_REPLICATION_TARGETS.read().unwrap().clone(),
     }
+}
+
+/// Updates `builder` with all the cache specs in `targets`.
+pub(crate) fn apply_cache_replication_targets(
+    mut builder: CacheBuilder,
+    targets: &[ReplicationTarget],
+) -> CacheBuilder {
+    use ReplicationTarget::*;
+
+    for target in targets {
+        match target {
+            ReadOnly(ro) => {
+                let mut target: PathBuf = ro.directory.clone().into();
+
+                if ro.append_instance_id {
+                    target.push(instance_id());
+                };
+
+                builder.reader(&target, ro.num_shards as usize);
+            }
+            S3(_) => {}
+        }
+    }
+
+    builder
 }
 
 /// Parses a S3-compatible region specification from a region and an
