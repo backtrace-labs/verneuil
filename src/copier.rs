@@ -731,7 +731,7 @@ fn create_target(
             bucket.set_request_timeout(Some(COPY_REQUEST_TIMEOUT));
             Ok(Some(bucket))
         }
-        ReadOnly(_) => Ok(None),
+        ReadOnly(_) | Local(_) => Ok(None),
     }
 }
 

@@ -66,9 +66,28 @@ pub struct ReadOnlyCacheReplicationTarget {
     #[serde(default)]
     pub num_shards: u32,
 
-    /// Whether to append the instance id to the `directory` path.
+    /// Whether to append the instance id to the `directory` path;
+    /// when `true` (the default), the path generation logic matches
+    /// that of read-write `LocalReplicationTarget`s.
     #[serde(default = "return_true")]
     pub append_instance_id: bool,
+}
+
+/// A local replication target loads and stores content-addressed
+/// chunks in a directory of cached files.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub struct LocalReplicationTarget {
+    /// The root directory for the cache; the instance id will be
+    /// appended to this path.
+    pub directory: String,
+
+    /// The number of shards in the cache (0 or 1 for a plain
+    /// directory of files).
+    pub num_shards: u32,
+
+    /// The total number of files approximately allowed in the cache,
+    /// across all shards.
+    pub capacity: u64,
 }
 
 /// A replication target tells us where to find or replicate data, but
@@ -78,10 +97,14 @@ pub struct ReadOnlyCacheReplicationTarget {
 pub enum ReplicationTarget {
     S3(S3ReplicationTarget),
     ReadOnly(ReadOnlyCacheReplicationTarget),
+    Local(LocalReplicationTarget),
 }
 
 /// Verneuil will replicate content-addressed chunks and named
 /// directory blobs to all the replication targets in the list.
+///
+/// If there are multiple `Local` targets, an the first one is used
+/// for writes, and the rest for reads.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct ReplicationTargetList {
     // Use a long and distinctive name for this field because, while
@@ -113,6 +136,8 @@ pub(crate) fn apply_cache_replication_targets(
 ) -> CacheBuilder {
     use ReplicationTarget::*;
 
+    let mut has_local = false;
+
     for target in targets {
         match target {
             ReadOnly(ro) => {
@@ -123,6 +148,21 @@ pub(crate) fn apply_cache_replication_targets(
                 };
 
                 builder.reader(&target, ro.num_shards as usize);
+            }
+            Local(rw) => {
+                let mut target: PathBuf = rw.directory.clone().into();
+                target.push(instance_id());
+
+                let num_shards = rw.num_shards as usize;
+                let capacity = rw.capacity.clamp(0, usize::MAX as u64) as usize;
+
+                if has_local {
+                    builder.reader(&target, num_shards);
+                } else {
+                    builder.writer(&target, num_shards, capacity);
+                }
+
+                has_local = true;
             }
             S3(_) => {}
         }

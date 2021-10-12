@@ -11,6 +11,13 @@
 		"domain_addressing": false,
 		"create_buckets_on_demand": true
 	    }
+	},
+	{
+	    "local": {
+		"directory": "/tmp/verneuil-cache",
+		"num_shards": 10,
+		"capacity": 1000
+	    }
 	}
     ]
 }

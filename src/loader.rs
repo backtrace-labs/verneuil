@@ -504,7 +504,7 @@ fn create_source(
             bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
             Ok(Some(bucket))
         }
-        ReadOnly(_) => Ok(None),
+        ReadOnly(_) | Local(_) => Ok(None),
     }
 }
 
