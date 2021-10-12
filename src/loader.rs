@@ -23,6 +23,12 @@ use crate::replication_target::ReplicationTarget;
 use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
 
+/// Writers clean up stale manifests in `.tap` on startup, but could
+/// miss some.  We also try to touch these manifest files fairly
+/// regularly.  If a tapped manifest is much more than a day old, it
+/// was most likely left behind accidentally.
+const CACHED_MANIFEST_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
+
 /// How long to wait for a request before giving up and trying again.
 const LOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -156,8 +162,40 @@ pub(crate) fn fetch_manifest(
     remote: &[ReplicationTarget],
 ) -> Result<Option<Vec<u8>>> {
     for path in local {
-        if let Some(cached) = load_from_cache(path, name)? {
-            return Ok(Some(cached));
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let path = path.join(name);
+
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(chain_error!(e, "failed to load from cache", ?path)),
+        };
+
+        let meta = file
+            .metadata()
+            .map_err(|e| chain_error!(e, "failed to stat file", ?path))?;
+        let ctime_secs = meta.ctime();
+        if ctime_secs < 0 {
+            continue;
+        }
+
+        let ctime = match std::time::UNIX_EPOCH.checked_add(Duration::from_secs(ctime_secs as u64))
+        {
+            Some(ctime) => ctime,
+            None => continue,
+        };
+
+        match std::time::SystemTime::now().duration_since(ctime) {
+            Ok(age) if age <= CACHED_MANIFEST_MAX_AGE => {
+                let mut dst = Vec::new();
+
+                file.read_to_end(&mut dst)
+                    .map_err(|e| chain_error!(e, "failed to read tapped manifest", ?path))?;
+                return Ok(Some(dst));
+            }
+            _ => {}
         }
     }
 
