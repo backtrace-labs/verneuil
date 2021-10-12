@@ -1,6 +1,4 @@
 //! `Loader`s are responsible for fetching chunks.
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -10,11 +8,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
+
+use s3::bucket::Bucket;
+use s3::creds::Credentials;
 use tracing::instrument;
 use umash::Fingerprint;
 
 use crate::chain_error;
+use crate::chain_info;
 use crate::chain_warn;
+use crate::drop_result;
 use crate::fresh_error;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
@@ -72,7 +75,7 @@ pub(crate) struct Chunk {
 
 #[derive(Debug)]
 pub(crate) struct Loader {
-    local_caches: Vec<PathBuf>,
+    cache: kismet_cache::Cache,
     remote_sources: Vec<Bucket>,
 }
 
@@ -234,8 +237,21 @@ impl Loader {
             }
         }
 
+        let mut cache = kismet_cache::CacheBuilder::new();
+        cache.plain_readers(local);
+
+        // In tests, check every potential cache hits to make sure
+        // they have the same value.
+        if cfg!(feature = "test_vfs") {
+            cache.panicking_byte_equality_checker();
+        }
+
+        // All cache directories should be tagged with the instance
+        // id; we don't have to worry about OS crashes.
+        cache.auto_sync(false);
+
         Ok(Loader {
-            local_caches: local,
+            cache: cache.build(),
             remote_sources,
         })
     }
@@ -278,51 +294,65 @@ impl Loader {
     /// Returns Ok(None) if nothing was found.
     #[instrument(level = "debug", skip(self), err)]
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
+        use std::io::Read;
+        use std::io::Write;
+
         if fprint == ZERO_FILLED_CHUNK.0 {
             return Ok(Some(ZERO_FILLED_CHUNK.1.clone()));
         }
 
-        let mut contents = fetch_from_cache(fprint);
+        let contents = fetch_from_cache(fprint);
+        let name = crate::replication_buffer::fingerprint_chunk_name(&fprint);
+        let key = kismet_cache::Key::new(&name, fprint.hash(), fprint.secondary());
 
         // Don't fast path in tests.
         #[cfg(not(feature = "test_vfs"))]
         if contents.is_some() {
+            // Signal that we're still interested in this file.
+            drop_result!(self.cache.touch(key),
+                         e => chain_info!(e, "failed to touch cached chunk", ?fprint));
             return Ok(contents);
         }
 
-        let mut update_contents = |new_contents: Vec<u8>| {
-            // If we already know the chunk's contents, the new ones
-            // must match.
-            if let Some(_old) = &contents {
-                #[cfg(feature = "test_vfs")]
-                assert_eq!(&*_old.payload, new_contents.as_slice());
-                return Ok(());
+        let cache_hit = self.cache.ensure(key, |dst| {
+            use std::io::Error;
+            use std::io::ErrorKind;
+
+            for source in &self.remote_sources {
+                if let Some(remote) = load_from_source(&source, &name)
+                    .map_err(|_| Error::new(ErrorKind::Other, "failed to fetch remote chunk"))?
+                {
+                    let bytes = maybe_decompress(remote, fprint)
+                        .map_err(|_| Error::new(ErrorKind::Other, "failed to decode chunk"))?;
+
+                    dst.write_all(&bytes)?;
+                    return Ok(());
+                }
             }
 
-            let chunk = Arc::new(Chunk::new(fprint, new_contents)?);
-            update_cache(chunk.clone());
-            contents = Some(chunk);
-            Ok(())
+            Err(Error::new(ErrorKind::NotFound, "chunk not found"))
+        });
+
+        let mut data_file = match cache_hit {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(chain_error!(e, "failed to fetch chunk", ?fprint)),
         };
 
-        let name = crate::replication_buffer::fingerprint_chunk_name(&fprint);
-        for path in &self.local_caches {
-            if let Some(cached) = load_from_cache(&path, &name)? {
-                update_contents(cached)?;
-                #[cfg(not(feature = "test_vfs"))]
-                return Ok(contents);
-            }
+        let mut data = Vec::new();
+        data_file
+            .read_to_end(&mut data)
+            .map_err(|e| chain_error!(e, "failed to read chunk data", ?fprint))?;
+
+        #[cfg(feature = "test_vfs")]
+        if let Some(cached) = contents {
+            assert_eq!(&*cached.payload, &data);
+            return Ok(Some(cached));
         }
 
-        for source in &self.remote_sources {
-            if let Some(remote) = load_from_source(&source, &name)? {
-                update_contents(maybe_decompress(remote, fprint)?)?;
-                #[cfg(not(feature = "test_vfs"))]
-                return Ok(contents);
-            }
-        }
-
-        Ok(contents)
+        let chunk = Arc::new(Chunk::new(fprint, data)?);
+        update_cache(chunk.clone());
+        Ok(Some(chunk))
     }
 }
 
@@ -467,18 +497,6 @@ fn create_source(
             bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
             Ok(bucket)
         }
-    }
-}
-
-/// Attempts to load file `name` in `prefix`.
-#[instrument(level = "trace")]
-fn load_from_cache(prefix: &Path, name: &str) -> Result<Option<Vec<u8>>> {
-    let path = prefix.join(name);
-
-    match std::fs::read(&path) {
-        Ok(buf) => Ok(Some(buf)),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(chain_error!(e, "failed to load from cache", ?path)),
     }
 }
 
