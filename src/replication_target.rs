@@ -171,6 +171,33 @@ pub(crate) fn apply_cache_replication_targets(
     builder
 }
 
+/// Updates `builder` with the first `Local` read-write cache specs in
+/// `targets`, if any.
+pub(crate) fn apply_local_cache_replication_target(
+    mut builder: CacheBuilder,
+    targets: &[ReplicationTarget],
+) -> CacheBuilder {
+    use ReplicationTarget::*;
+
+    for target in targets {
+        match target {
+            Local(rw) => {
+                let mut target: PathBuf = rw.directory.clone().into();
+                target.push(instance_id());
+
+                let num_shards = rw.num_shards as usize;
+                let capacity = rw.capacity.clamp(0, usize::MAX as u64) as usize;
+
+                builder.writer(&target, num_shards, capacity);
+                return builder;
+            }
+            ReadOnly(_) | S3(_) => {}
+        }
+    }
+
+    builder
+}
+
 /// Parses a S3-compatible region specification from a region and an
 /// optional endpoint.
 ///

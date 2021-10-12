@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
+use kismet_cache::Cache;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use tracing::info_span;
@@ -45,6 +46,7 @@ use crate::racy_time::RacySystemTime;
 use crate::recent_work_set::RecentWorkSet;
 use crate::recent_work_set::WorkUnit;
 use crate::replication_buffer;
+use crate::replication_target::apply_local_cache_replication_target;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
@@ -783,6 +785,8 @@ async fn copy_file(
 ) -> Result<()> {
     use rand::Rng;
     use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
 
     let mut rng = rand::thread_rng();
 
@@ -792,6 +796,9 @@ async fn copy_file(
 
     let mut bytes = Vec::new();
     // TODO: check that chunk fingerprints match, check that directories checksum?
+    contents
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| chain_error!(e, "failed to seek file"))?;
     contents
         .read_to_end(&mut bytes)
         .map_err(|e| chain_error!(e, "failed to read file contents", ?blob_name))?;
@@ -964,6 +971,55 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Attempts to publish the contents of `data` to the `cache`, for
+/// chunk id `chunk`.
+///
+/// Logs and drops any error: readers can always get the data they
+/// need from remote storage.  On the other hand, populating a local
+/// cache doesn't guarantee visibility (or durability).
+#[tracing::instrument(level = "debug")]
+fn publish_chunk_to_cache(cache: &Cache, chunk: &OsStr, data: &mut File) {
+    use kismet_cache::CacheHit::*;
+    use kismet_cache::CacheHitAction;
+
+    let chunk = match chunk.to_str() {
+        Some(chunk) => chunk,
+        None => {
+            tracing::info!(?chunk, "non-utf-8 chunk filename");
+            return;
+        }
+    };
+
+    let fprint = match replication_buffer::chunk_name_fingerprint(chunk) {
+        Some(fprint) => fprint,
+        None => {
+            tracing::info!(?chunk, "malformed chunk filename");
+            return;
+        }
+    };
+
+    match cache.get_or_update(
+        kismet_cache::Key::new(chunk, fprint.hash(), fprint.secondary()),
+        |hit| match hit {
+            Primary(_) => CacheHitAction::Accept,
+            Secondary(_) => CacheHitAction::Replace,
+        },
+        |dst, _| {
+            use std::io::Seek;
+            use std::io::SeekFrom;
+
+            data.seek(SeekFrom::Start(0))?;
+            std::io::copy(data, dst)?;
+            Ok(())
+        },
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            let _ = chain_warn!(e, "failed to publish chunk to cache", ?chunk);
+        }
+    };
 }
 
 /// Returns whether the directory at `path` is empty or just does
@@ -1187,6 +1243,7 @@ impl CopierWorker {
     fn handle_ready_directory(
         &self,
         last_manifest_copy: &RacySystemTime,
+        cache: &Cache,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
@@ -1229,6 +1286,8 @@ impl CopierWorker {
                     }
 
                     self.pace();
+                    publish_chunk_to_cache(cache, name, &mut file);
+
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
 
@@ -1314,12 +1373,14 @@ impl CopierWorker {
     ///
     /// This function can only make progress if the caller first
     /// calls `handle_ready_directory`.
+    #[allow(clippy::too_many_arguments)] // It's only called in one place.
     #[instrument(skip(self, creds), err)]
     fn handle_staging_directory(
         &self,
         last_manifest_copy: &RacySystemTime,
         state: &CopierUploadState,
         stale: bool,
+        cache: &Cache,
         targets: &ReplicationTargetList,
         creds: Credentials,
         parent: PathBuf,
@@ -1400,10 +1461,11 @@ impl CopierWorker {
                     }
 
                     self.pace();
+                    publish_chunk_to_cache(cache, name, &mut file);
+
                     let name = name.to_owned();
                     let chunks_buckets = chunks_buckets.clone();
                     let force_meta = force_meta.clone();
-
                     Ok(Some(async move {
                         copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets)
                             .await?;
@@ -1592,6 +1654,14 @@ impl CopierWorker {
             })?
         };
 
+        let cache = apply_local_cache_replication_target(
+            kismet_cache::CacheBuilder::new(),
+            &targets.replication_targets,
+        )
+        .auto_sync(false)
+        .take()
+        .build();
+
         // We want to treat these directories as missing if they're
         // empty.  Our logic should handle errors that way, but we can
         // get more useful logs if we clean up here.
@@ -1618,6 +1688,7 @@ impl CopierWorker {
             || {
                 self.handle_ready_directory(
                     &last_manifest_copy,
+                    &cache,
                     &targets,
                     creds.clone(),
                     spool.to_path_buf(),
@@ -1637,6 +1708,7 @@ impl CopierWorker {
                     &last_manifest_copy,
                     state,
                     stale,
+                    &cache,
                     &targets,
                     creds.clone(),
                     spool.to_path_buf(),
@@ -1665,6 +1737,7 @@ impl CopierWorker {
             || {
                 self.handle_ready_directory(
                     &last_manifest_copy,
+                    &cache,
                     &targets,
                     creds,
                     spool.to_path_buf(),
