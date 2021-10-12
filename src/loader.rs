@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -219,12 +218,15 @@ pub(crate) fn fetch_manifest(
 }
 
 impl Loader {
-    /// Creates a fresh `Loader` that looks for hits first in `local`,
-    /// and then in `remote`.  The `Loader` always check the sources
-    /// in order: low-to-high index in `local`, and then similarly in
-    /// `remote`.
+    /// Creates a fresh `Loader` that looks for hits first in the
+    /// cache built with `cache_builder`, and fill misses by fetching
+    /// from `remote`.  The `Loader` always fetches from `remote`
+    /// source in low-to-high index order.
     #[instrument(err)]
-    pub(crate) fn new(local: Vec<PathBuf>, remote: &[ReplicationTarget]) -> Result<Loader> {
+    pub(crate) fn new(
+        mut cache_builder: kismet_cache::CacheBuilder,
+        remote: &[ReplicationTarget],
+    ) -> Result<Loader> {
         let mut remote_sources = Vec::new();
 
         if !remote.is_empty() {
@@ -237,21 +239,18 @@ impl Loader {
             }
         }
 
-        let mut cache = kismet_cache::CacheBuilder::new();
-        cache.plain_readers(local);
-
         // In tests, check every potential cache hits to make sure
         // they have the same value.
         if cfg!(feature = "test_vfs") {
-            cache.panicking_byte_equality_checker();
+            cache_builder.panicking_byte_equality_checker();
         }
 
         // All cache directories should be tagged with the instance
         // id; we don't have to worry about OS crashes.
-        cache.auto_sync(false);
+        cache_builder.auto_sync(false);
 
         Ok(Loader {
-            cache: cache.build(),
+            cache: cache_builder.build(),
             remote_sources,
         })
     }

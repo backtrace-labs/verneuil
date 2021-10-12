@@ -1,8 +1,9 @@
 //! A Verneuil snapshot is constructed from a `Manifest` object,
 //! by fetching all its constituent chunks.
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
+
+use kismet_cache::CacheBuilder;
 
 use crate::fresh_error;
 use crate::loader::Chunk;
@@ -38,19 +39,19 @@ impl Snapshot {
     pub fn new_with_default_targets(manifest: &Manifest) -> Result<Snapshot> {
         let targets = crate::replication_target::get_default_replication_targets();
 
-        Snapshot::new(Vec::new(), &targets.replication_targets, manifest)
+        Snapshot::new(CacheBuilder::new(), &targets.replication_targets, manifest)
     }
 
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from `local_caches` directories and from `remote_sources`.
     pub fn new(
-        local_caches: Vec<PathBuf>,
+        cache_builder: CacheBuilder,
         remote_sources: &[ReplicationTarget],
         manifest: &Manifest,
     ) -> Result<Snapshot> {
         let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
 
-        let loader = Loader::new(local_caches, remote_sources)?;
+        let loader = Loader::new(cache_builder, remote_sources)?;
         let fetched = loader.fetch_all_chunks(&fprints)?;
 
         let mut len: u64 = 0;

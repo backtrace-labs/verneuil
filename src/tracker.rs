@@ -713,14 +713,16 @@ impl Tracker {
         source: ChunkSource,
     ) -> crate::snapshot::Snapshot {
         let buf = &self.buffer;
-        let mut local_chunk_dirs = Vec::new();
+        let mut cache_builder = kismet_cache::CacheBuilder::new();
+
         if source >= ChunkSource::Staged {
-            local_chunk_dirs.push(buf.staged_chunk_directory());
+            cache_builder = cache_builder.plain_reader(buf.staged_chunk_directory())
         }
 
         if source >= ChunkSource::Ready {
             let mut ready = buf.ready_chunk_directory();
-            local_chunk_dirs.push(ready.clone());
+
+            cache_builder = cache_builder.plain_reader(&ready);
 
             // Also derive what the path will become once it's moved
             // to `consuming`.
@@ -739,15 +741,16 @@ impl Tracker {
             ready.push("consuming");
             ready.push(chunks);
             ready.push(pseudo_unique);
-            local_chunk_dirs.push(ready);
+
+            cache_builder = cache_builder.plain_reader(&ready)
         }
 
         if source >= ChunkSource::Consuming {
-            local_chunk_dirs.push(buf.consuming_chunk_directory());
+            cache_builder = cache_builder.plain_reader(buf.consuming_chunk_directory());
         }
 
         crate::snapshot::Snapshot::new(
-            local_chunk_dirs,
+            cache_builder,
             &self.replication_targets.replication_targets,
             manifest,
         )
