@@ -772,24 +772,38 @@ fn percent_encode_local_path_uri(path: &Path) -> Result<String> {
     manifest_name_for_hostname_path(None, path)
 }
 
+lazy_static::lazy_static! {
+    // We separate the primary and secondary hashes with a
+    // percent-encoded slash: we don't expect many collisions in the
+    // primary hash, but some platforms seem to shard based on
+    // everything left of the last slash.  Without that separator, our
+    // data might end up hashing to the same shard, despite the high
+    // amount of entropy spread everywhere.
+    static ref CHUNK_HASH_SEPARATOR: String =
+        percent_encoding::utf8_percent_encode("/", percent_encoding::NON_ALPHANUMERIC).to_string();
+}
+
 /// Returns the chunk name for a given fingerprint.  This name is
 /// unambiguous and valid as both a POSIX filename and a S3 blob name.
 pub(crate) fn fingerprint_chunk_name(fprint: &Fingerprint) -> String {
-    lazy_static::lazy_static! {
-        // We separate the primary and secondary hashes with a
-        // percent-encoded slash: we don't expect many collisions in
-        // the primary hash, but some platforms seem to shard based on
-        // everything left of the last slash.  Without that separator,
-        // our data might end up hashing to the same shard, despite
-        // the high amount of entropy spread everywhere.
-        static ref SEPARATOR: String =
-            percent_encoding::utf8_percent_encode("/", percent_encoding::NON_ALPHANUMERIC).to_string();
-    }
-
     format!(
         "{:016x}{}{:016x}",
-        fprint.hash[0], &*SEPARATOR, fprint.hash[1]
+        fprint.hash(),
+        &*CHUNK_HASH_SEPARATOR,
+        fprint.secondary()
     )
+}
+
+/// Converts a potential chunk name back to a fingerprint.
+pub(crate) fn chunk_name_fingerprint(name: &str) -> Option<Fingerprint> {
+    if name.len() != (2 * 16) + CHUNK_HASH_SEPARATOR.len() {
+        return None;
+    }
+
+    let hash = u64::from_str_radix(&name[0..16], 16).ok()?;
+    let secondary = u64::from_str_radix(&name[16 + CHUNK_HASH_SEPARATOR.len()..], 16).ok()?;
+
+    Some(Fingerprint::new(hash, secondary))
 }
 
 /// Attempts to read a valid Manifest message from `file_path`.
@@ -1499,5 +1513,20 @@ fn test_manifest_name_for_hostname_path() {
     assert_eq!(
         manifest_name_for_hostname_path(Some("test.com"), Path::new("/tmp/test.db")).unwrap(),
         "7cb1-verneuil%3Atest.com%3A80ad%2F%2Ftmp%2Ftest.db"
+    );
+}
+
+#[test]
+fn test_chunk_name_roundtrip() {
+    let fprint1 = Fingerprint::new(1, 2);
+    assert_eq!(
+        fprint1,
+        chunk_name_fingerprint(&fingerprint_chunk_name(&fprint1)).expect("should parse")
+    );
+
+    let fprint2 = Fingerprint::new(u64::MAX, u64::MAX - 1);
+    assert_eq!(
+        fprint2,
+        chunk_name_fingerprint(&fingerprint_chunk_name(&fprint2)).expect("should parse")
     );
 }
