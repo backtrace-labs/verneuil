@@ -63,14 +63,16 @@ const DECODED_CHUNK_SIZE_LIMIT: usize = 1usize << 20;
 /// A zstd frame starts with 0xFD2FB528 in 4 little-endian bytes.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-#[derive(Eq, PartialEq, Debug)]
-// `#[non_exhaustive]` is too weak: it's a no-op within the crate.
-#[allow(clippy::manual_non_exhaustive)]
+#[derive(Debug)]
 pub(crate) struct Chunk {
     pub fprint: Fingerprint,
-    pub payload: Box<[u8]>,
+    payload: Box<[u8]>,
+}
 
-    _use_constructor: (),
+impl Chunk {
+    pub fn payload(&self) -> &[u8] {
+        &*self.payload
+    }
 }
 
 #[derive(Debug)]
@@ -135,7 +137,6 @@ impl Chunk {
         Ok(Chunk {
             fprint,
             payload: payload.into(),
-            _use_constructor: (),
         })
     }
 }

@@ -65,12 +65,13 @@ impl Snapshot {
         };
 
         let mut insert_chunk = |chunk: Arc<Chunk>| {
-            if !chunk.payload.is_empty() {
-                len = len.checked_add(chunk.payload.len() as u64).ok_or_else(|| {
+            let payload = chunk.payload();
+            if !payload.is_empty() {
+                len = len.checked_add(payload.len() as u64).ok_or_else(|| {
                     fresh_error!(
                         "total snapshot length overflowed",
                         len,
-                        payload_len = chunk.payload.len()
+                        payload_len = payload.len()
                     )
                 })?;
                 chunks.insert(len, chunk);
@@ -86,7 +87,7 @@ impl Snapshot {
                 // All but the last chunk must be exactly snapshot-sized.
                 #[cfg(feature = "test_vfs")]
                 assert_eq!(
-                    chunk.payload.len(),
+                    chunk.payload().len(),
                     crate::tracker::SNAPSHOT_GRANULARITY as usize
                 );
 
@@ -97,7 +98,7 @@ impl Snapshot {
 
             // The last chunk may be short.
             #[cfg(feature = "test_vfs")]
-            assert!(chunk.payload.len() <= crate::tracker::SNAPSHOT_GRANULARITY as usize);
+            assert!(chunk.payload().len() <= crate::tracker::SNAPSHOT_GRANULARITY as usize);
 
             insert_chunk(chunk)?;
         }
@@ -147,7 +148,7 @@ impl Snapshot {
         // Find the first chunk that ends after `initial_offset`.
         let mut chunks = self.chunks.range((initial_offset + 1)..=u64::MAX);
         let current_chunk = chunks.next().and_then(|(end, x)| {
-            let bytes = &*x.payload;
+            let bytes = x.payload();
             let count = bytes.len() as u64;
             // Figure out how many bytes we can to skip between `begin`
             // and `initial_offset`.
@@ -206,7 +207,7 @@ impl<'a> std::io::Read for SnapshotReader<'a> {
 
             self.current_chunk = self.chunks.next().and_then(|(end, chunk)| {
                 let bytes = SnapshotReader::drop_trailing_bytes(
-                    &*chunk.payload,
+                    chunk.payload(),
                     *end,
                     self.end_byte_offset,
                 );
@@ -330,8 +331,8 @@ fn test_reader_simple() {
 
     let chunk = create_chunk(base.clone());
     let snapshot = Snapshot {
-        len: chunk.payload.len() as u64,
-        chunks: [(chunk.payload.len() as u64, chunk)]
+        len: chunk.payload().len() as u64,
+        chunks: [(chunk.payload().len() as u64, chunk)]
             .iter()
             .cloned()
             .collect(),
