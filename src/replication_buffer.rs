@@ -1472,7 +1472,7 @@ fn replace_slashes_invertible() {
 
     let converted = replace_slashes(HARD_STRING);
     // There must not be any slash in the result.
-    assert_eq!(converted.find("/"), None);
+    assert_eq!(converted.find('/'), None);
 
     // And it must be invertible.
     assert_eq!(
