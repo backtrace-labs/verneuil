@@ -181,10 +181,46 @@ pub(crate) fn extract_version_id(
 
     // xattrs work, but we can't get one.  Assume the worst.
     if ret == 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::NotFound && error.raw_os_error() != Some(0) {
-            tracing::warn!(?error, "failed to read version xattr");
+        use std::time::Duration;
+
+        #[cfg(target_os = "linux")]
+        const ENODATA: i32 = 61;
+
+        #[cfg(not(target_os = "linux"))]
+        const ENODATA: i32 = 0;
+
+        /// Determines if `file` was definitely created recently (less
+        /// than two seconds ago).  If so returns the file's age.
+        ///
+        /// Otherwise (the file is old or we couldn't find its age),
+        /// returns `None`.
+        fn file_is_recent(file: &File) -> Option<Duration> {
+            const MAX_AGE: Duration = Duration::from_secs(2);
+
+            let age = file.metadata().ok()?.created().ok()?.elapsed().ok()?;
+            if age < MAX_AGE {
+                Some(age)
+            } else {
+                None
+            }
         }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound
+            && error.raw_os_error() != Some(0)
+            && error.raw_os_error() != Some(ENODATA)
+        {
+            if let Some(age) = file_is_recent(file) {
+                tracing::debug!(
+                    ?error,
+                    ?age,
+                    "failed to read version xattr on newly-created file"
+                );
+            } else {
+                tracing::warn!(?error, "failed to read version xattr");
+            }
+        }
+
         buf.clear();
         return buf;
     }
