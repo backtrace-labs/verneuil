@@ -1,5 +1,7 @@
 //! Replicated sqlite DBs are represented as protobuf "manifest"
 //! metadata that refer to content-addressed chunks by fingerprint.
+use std::fs::File;
+
 use tracing::instrument;
 use umash::Fingerprint;
 use uuid::Uuid;
@@ -106,7 +108,7 @@ pub struct Manifest {
 /// of a sqlite database should thus give us something that reliably changes
 /// whenever the file's contents are modified.
 #[instrument]
-pub(crate) fn fingerprint_sqlite_header(file: &std::fs::File) -> Option<Fingerprint> {
+pub(crate) fn fingerprint_sqlite_header(file: &File) -> Option<Fingerprint> {
     use std::os::unix::fs::FileExt;
 
     const HEADER_SIZE: usize = 100;
@@ -150,7 +152,7 @@ const XATTR_MAX_VALUE_SIZE: usize = 128;
 /// must assume nothing matches.
 #[instrument]
 pub(crate) fn extract_version_id(
-    file: &std::fs::File,
+    file: &File,
     mut fprint_or: Option<Fingerprint>,
     // Pass in a mutable buffer to enable reuse: this code touches
     // operations that are timing sensitive for sqlite's tests.
@@ -236,7 +238,7 @@ pub(crate) fn extract_version_id(
 /// and sqlite header, which can mostly be trusted to change whenever
 /// sqlite writes to the file.
 #[instrument(err)]
-pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>) -> Result<()> {
+pub(crate) fn update_version_id(file: &File, cached_uuid: Option<Uuid>) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     use uuid::adapter::Hyphenated;
 
@@ -279,7 +281,7 @@ pub(crate) fn update_version_id(file: &std::fs::File, cached_uuid: Option<Uuid>)
 /// Erases the version id on `file`.  Change `Tracker`s will have to
 /// rebuild the replication state from scratch.
 #[instrument(err)]
-pub(crate) fn clear_version_id(file: &std::fs::File) -> Result<()> {
+pub(crate) fn clear_version_id(file: &File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     extern "C" {
