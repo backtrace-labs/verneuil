@@ -66,12 +66,12 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 #[derive(Debug)]
 pub(crate) struct Chunk {
     pub fprint: Fingerprint,
-    payload: Box<[u8]>,
+    payload: memmap2::Mmap,
 }
 
 impl Chunk {
     pub fn payload(&self) -> &[u8] {
-        &*self.payload
+        &self.payload
     }
 }
 
@@ -105,17 +105,20 @@ lazy_static::lazy_static! {
     // of the fingerprint outside the `Arc` to minimise indirection
     // when this optimisation does not trigger.
     static ref ZERO_FILLED_CHUNK: (Fingerprint, Arc<Chunk>) = {
-        let payload = vec![0; crate::tracker::SNAPSHOT_GRANULARITY as usize];
+        let payload =
+            memmap2::MmapMut::map_anon(
+                crate::tracker::SNAPSHOT_GRANULARITY as usize)
+            .expect("failed to create anonymous mapping")
+            .make_read_only()
+            .expect("failed to make mapping read-only");
+
         let fprint = fingerprint_file_chunk(&payload);
         (fprint, Arc::new(Chunk::new(fprint, payload).expect("fprint must match")))
     };
 }
 
 impl Chunk {
-    /// Returns a fresh chunk for `fprint`.
-    ///
-    /// Returns `Err` when the payload's fingerprint does not match.
-    pub(crate) fn new(fprint: Fingerprint, payload: Vec<u8>) -> Result<Chunk> {
+    fn new(fprint: Fingerprint, payload: memmap2::Mmap) -> Result<Chunk> {
         // The contents of a content-addressed chunk must have the same
         // fingerprint as the chunk's name.
         #[cfg(feature = "test_vfs")]
@@ -130,14 +133,24 @@ impl Chunk {
                 "mismatching file contents",
                 ?fprint,
                 ?actual_hash,
-                len = payload.len()
+                len = payload.as_ref().len()
             ));
         }
 
-        Ok(Chunk {
-            fprint,
-            payload: payload.into(),
-        })
+        Ok(Chunk { fprint, payload })
+    }
+
+    /// Returns a fresh chunk for `fprint`.
+    #[cfg(test)]
+    pub(crate) fn new_from_bytes(payload: &[u8]) -> Chunk {
+        let mut map = memmap2::MmapMut::map_anon(payload.len()).unwrap();
+
+        map.as_mut().copy_from_slice(payload);
+        Chunk::new(
+            fingerprint_file_chunk(payload),
+            map.make_read_only().unwrap(),
+        )
+        .expect("must build: fingerprint matches")
     }
 }
 
@@ -302,7 +315,6 @@ impl Loader {
     /// Returns Ok(None) if nothing was found.
     #[instrument(level = "debug", skip(self), err)]
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
-        use std::io::Read;
         use std::io::Write;
 
         if fprint == ZERO_FILLED_CHUNK.0 {
@@ -341,24 +353,30 @@ impl Loader {
             Err(Error::new(ErrorKind::NotFound, "chunk not found"))
         });
 
-        let mut data_file = match cache_hit {
+        let data_file = match cache_hit {
             Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(chain_error!(e, "failed to fetch chunk", ?fprint)),
         };
 
-        let mut data = Vec::new();
-        data_file
-            .read_to_end(&mut data)
-            .map_err(|e| chain_error!(e, "failed to read chunk data", ?fprint))?;
-
         #[cfg(feature = "test_vfs")]
         if let Some(cached) = contents {
+            use std::io::Read;
+
+            let mut data_file = data_file;
+            let mut data = Vec::new();
+            data_file
+                .read_to_end(&mut data)
+                .map_err(|e| chain_error!(e, "failed to read chunk data", ?fprint))?;
+
             assert_eq!(&*cached.payload, &data);
             return Ok(Some(cached));
         }
 
-        let chunk = Arc::new(Chunk::new(fprint, data)?);
+        let map = unsafe { memmap2::Mmap::map(&data_file) }
+            .map_err(|e| chain_error!(e, "failed to map chunk file", ?fprint))?;
+
+        let chunk = Arc::new(Chunk::new(fprint, map)?);
         update_cache(chunk.clone());
         Ok(Some(chunk))
     }

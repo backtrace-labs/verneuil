@@ -235,11 +235,11 @@ impl<'a> std::io::Read for SnapshotReader<'a> {
     }
 }
 
+/// Creates a new chunk from `bytes`.  We don't need ownership, but
+/// more rigid type propagation makes test code easier to write.
 #[cfg(test)]
 fn create_chunk(bytes: Vec<u8>) -> Arc<Chunk> {
-    use crate::manifest_schema::fingerprint_file_chunk;
-
-    Arc::new(Chunk::new(fingerprint_file_chunk(&bytes), bytes).expect("must build: fprint matches"))
+    Arc::new(Chunk::new_from_bytes(&bytes))
 }
 
 /// Exercise all the ways to get an empty reader.
