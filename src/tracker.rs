@@ -716,13 +716,13 @@ impl Tracker {
         let mut cache_builder = kismet_cache::CacheBuilder::new();
 
         if source >= ChunkSource::Staged {
-            cache_builder = cache_builder.plain_reader(buf.staged_chunk_directory())
+            cache_builder.plain_reader(buf.staged_chunk_directory());
         }
 
         if source >= ChunkSource::Ready {
             let mut ready = buf.ready_chunk_directory();
 
-            cache_builder = cache_builder.plain_reader(&ready);
+            cache_builder.plain_reader(&ready);
 
             // Also derive what the path will become once it's moved
             // to `consuming`.
@@ -742,11 +742,11 @@ impl Tracker {
             ready.push(chunks);
             ready.push(pseudo_unique);
 
-            cache_builder = cache_builder.plain_reader(&ready)
+            cache_builder.plain_reader(&ready);
         }
 
         if source >= ChunkSource::Consuming {
-            cache_builder = cache_builder.plain_reader(buf.consuming_chunk_directory());
+            cache_builder.plain_reader(buf.consuming_chunk_directory());
         }
 
         crate::snapshot::Snapshot::new(
