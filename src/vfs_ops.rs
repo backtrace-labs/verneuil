@@ -2,6 +2,7 @@ use std::boxed::Box;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+use crate::chain_error;
 use crate::chain_warn;
 use crate::drop_result;
 use crate::sqlite_code::SqliteCode;
@@ -21,6 +22,7 @@ struct LinuxFile {
     tracker: *mut c_void, // Really a &mut crate::tracker::Tracker.
     lock_timeout_ms: u32,
     dirsync_pending: bool,
+    first_write_in_transaction: bool,
 }
 
 impl LinuxFile {
@@ -101,7 +103,7 @@ extern "C" fn verneuil__file_read(
 
 #[no_mangle]
 extern "C" fn verneuil__file_write(
-    file: &LinuxFile,
+    file: &mut LinuxFile,
     src: *const c_void,
     n: i32,
     offset: i64,
@@ -117,8 +119,22 @@ extern "C" fn verneuil__file_write(
 
     if let Some(tracker) = file.tracker() {
         tracker.flag_write(src as *const u8, offset as u64, n as u64);
+    } else if file.first_write_in_transaction && file.fd >= 0 {
+        use std::fs::File;
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::FromRawFd;
+
+        let db = ManuallyDrop::new(unsafe { File::from_raw_fd(file.fd) });
+
+        // A tracker has state to invoke this function more
+        // efficiently.  If we don't have one, let's still update the
+        // db file's version id, the slow way.
+        drop_result!(crate::manifest_schema::update_version_id(&*db, None),
+                     e => chain_error!(e, "failed to mark db file as updated",
+                                       %file.device, %file.inode));
     }
 
+    file.first_write_in_transaction = false;
     unsafe { verneuil__file_write_impl(file, src, n, offset) }
 }
 
@@ -180,6 +196,8 @@ extern "C" fn verneuil__file_lock(file: &mut LinuxFile, level: LockLevel) -> i32
         if let Some(tracker) = file.tracker() {
             tracker.note_exclusive_lock();
         }
+
+        file.first_write_in_transaction = true;
     }
 
     ret

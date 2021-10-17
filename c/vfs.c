@@ -135,6 +135,15 @@ struct linux_file {
          * tests.
          */
         bool dirsync_pending;
+
+        /*
+         * This flag is set to true once sqlite acquires the write
+         * lock, and cleared after the first write to the locked file.
+         *
+         * `verneuil__file_write` (in `vfs_ops.rs`) uses this to
+         * remember to update the file's xattr before the first write.
+         */
+        bool first_write_in_transaction;
 };
 
 static_assert(sizeof(struct sqlite3_file) == sizeof(void *),
