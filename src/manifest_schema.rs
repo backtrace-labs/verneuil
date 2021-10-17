@@ -158,7 +158,6 @@ pub(crate) fn extract_version_id(
     // operations that are timing sensitive for sqlite's tests.
     mut buf: Vec<u8>,
 ) -> Vec<u8> {
-    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
     extern "C" {
@@ -232,10 +231,10 @@ pub(crate) fn extract_version_id(
         fprint_or = fingerprint_sqlite_header(file);
 
         // If we don't have an xattr and we also don't have a header
-        // fprint, we don't want to *only* rely on ctime: it's too
-        // lossy.  Instead return an empty version id, which will
-        // be treated as different from every version id, including
-        // other empty ones.
+        // fprint, we don't want to *only* rely on ctime, even if
+        // enabled: it's too lossy.  Instead return an empty version
+        // id, which will be treated as different from every version
+        // id, including other empty ones.
         if buf.is_empty() && fprint_or.is_none() {
             return buf;
         }
@@ -244,8 +243,11 @@ pub(crate) fn extract_version_id(
     // Add a high resolution ctime if we can find it.  Unfortunately,
     // while the interface goes down to nanoseconds, reality is much
     // coarser, so the ctime by itself cannot suffice.
+    #[cfg(feature = "mix_ctime_in_version_id")]
     match file.metadata() {
         Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+
             buf.extend(&meta.ctime().to_le_bytes());
             buf.extend(&meta.ctime_nsec().to_le_bytes());
         }
@@ -255,10 +257,6 @@ pub(crate) fn extract_version_id(
     // Finally, always append the sqlite fingerprint.  This way we
     // never do worse at change tracking than by using the
     // fingerprint.
-    if fprint_or.is_none() {
-        fprint_or = fingerprint_sqlite_header(file);
-    }
-
     if let Some(fprint) = fprint_or {
         buf.extend(&fprint.hash[0].to_le_bytes());
         buf.extend(&fprint.hash[1].to_le_bytes());

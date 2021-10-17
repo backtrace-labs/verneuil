@@ -24,6 +24,21 @@ required-features = ["vendor_sqlite"]
 vendor_sqlite = []
 dynamic_vfs = []  # Build the runtime-loadable VFS shared object; conflicts with vendor_sqlite.
 
+# Consider the source db's ctime in the version id.
+#
+# This is more conservative (less likely to leave changes undetected),
+# but also more prone to false positives: we have observed no-op
+# writes to db files after empty "IMMEDIATE" transactions, mostly
+# after writes to scratch pages that are never committed into active
+# duty.  These false positive trigger a recovery path in Verneuil,
+# where the whole db is re-uploaded.
+#
+# It probably only makes sense to enable this feature when debugging
+# replication failures (not lag, but outright incorrect snapshots),
+# especially when writing to the same replicated db with both the
+# verneuil VFS and the regular Unix VFS on fault-prone storage.
+mix_ctime_in_version_id = []
+
 no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
 
 test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
