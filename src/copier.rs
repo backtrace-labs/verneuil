@@ -2211,10 +2211,12 @@ impl CopierBackend {
                         let json_stats = serde_json::to_string(&stats)
                             .expect("failed to serialise replication lag statistics");
 
-                        // If the headers match, this is probably a false positive.,
+                        // If the headers match, this is probably a
+                        // false positive.  For example, we have seen
+                        // this happen with no-op write transactions.
                         if stats.sqlite_headers_match {
-                            tracing::info!(?path, ?delay, %json_stats,
-                                           "replication lag exceeds threshold, but file headers are up to date");
+                            tracing::debug!(?path, ?delay, %json_stats,
+                                            "replication lag exceeds threshold, but file headers are up to date");
                             num_maybe_stale += 1;
                         } else {
                             tracing::warn!(?path, ?delay, %json_stats,
