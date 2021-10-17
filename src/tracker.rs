@@ -183,6 +183,71 @@ impl Tracker {
         self.previous_version_id = extract_version_id(&self.file, None, buf);
     }
 
+    /// Returns whether the sqlite db definitely has a hot rollback
+    /// journal: when sqlite releases the exclusive/reserved lock on a
+    /// db while the db still has a rollback journal, the write
+    /// transaction has failed, and we don't want to replicate the
+    /// current state of the db.  A temporary mismatch (until the
+    /// rollback goes through) is fine.
+    ///
+    /// This should only happen in extreme failure conditions.
+    pub fn has_hot_journal(&self) -> bool {
+        use std::io::ErrorKind;
+        use std::io::Read;
+
+        // https://www.sqlite.org/fileformat.html#:~:text=3.%20The%20Rollback%20Journal
+        // The rollback journal file is always located in the same
+        // directory as the database file and has the same name as the
+        // database file but with the string "-journal" appended.
+        const JOURNAL_SUFFIX: &str = "-journal";
+        let mut path = self.path.clone();
+        let mut name = match path.file_name() {
+            Some(name) => name.to_owned(),
+            None => return false,
+        };
+
+        path.pop();
+        name.push(JOURNAL_SUFFIX);
+        path.push(name);
+
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            // If the file doesn't exist, there's no journal
+            Err(e) if e.kind() == ErrorKind::NotFound => return false,
+            Err(e) => {
+                // If we failed to open the journal file we don't
+                // *definitely* know whether there is a hot journal.
+                chain_warn!(e, "failed to open journal path", ?path);
+                return false;
+            }
+        };
+
+        // Read the first 8 bytes of the potential journal file.  If
+        // there are at least 8 such bytes and they match the journal
+        // header string, we have what looks like a valid journal.
+        //
+        // https://www.sqlite.org/fileformat.html#:~:text=A%20valid%20rollback%20journal%20begins%20with%20a%20header%20in%20the%20following%20format%3A
+        //
+        // Offset 0, Size 8: Header string: 0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
+        const SQLITE_JOURNAL_HEADER: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        let mut buf = [0u8; SQLITE_JOURNAL_HEADER.len()];
+
+        match file.read_exact(&mut buf) {
+            // If the header matches, we most likely have a valid hot
+            // journal.
+            Ok(()) => buf == SQLITE_JOURNAL_HEADER,
+            // If the file is too short (likely truncated to 0), it's
+            // not a hot journal.
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => false,
+            Err(e) => {
+                // Any other error means we don't know for sure
+                // whether the journal is hot.
+                chain_warn!(e, "failed to read journal file", ?path);
+                false
+            }
+        }
+    }
+
     /// Notes that we are about to update the tracked file, and
     /// that bytes in [offset, offset + count) are about to change.
     #[instrument(level = "trace", skip(self))]
@@ -660,13 +725,26 @@ impl Tracker {
             #[cfg(feature = "test_validate_reads")]
             self.validate_all_snapshots();
             // Nothing to do if we know we're clean.
-            if self.backing_file_state != MutationState::Clean {
-                let _span = tracing::info_span!("snapshot",
-                                                path=?self.path, ?self.backing_file_state);
-                return self.snapshot_file_contents();
+            if self.backing_file_state == MutationState::Clean {
+                return Ok(());
             }
 
-            Ok(())
+            // We also don't want to replicate if there's a hot
+            // journal: a hot journal can only be present when sqlite
+            // releases its lock if the lock protected a failed
+            // transaction that will be rolled back.
+            if self.has_hot_journal() {
+                // Return an error to make sure we force a full snapshot
+                // for the next transaction on the db file.
+                return Err(fresh_warn!(
+                    "found hot journal while releasing write lock",
+                    path=?self.path, ?self.backing_file_state));
+            }
+
+            let _span = tracing::info_span!(
+                "snapshot",
+                path=?self.path, ?self.backing_file_state);
+            self.snapshot_file_contents()
         })();
 
         // Always reset our state after a snapshot attempt.
