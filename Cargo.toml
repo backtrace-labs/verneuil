@@ -62,7 +62,7 @@ libc = "0.2"
 lru = { version = "0.6", default-features = false }  # Disable hashbrown
 memmap2 = "0.5"
 percent-encoding = "2"
-prost = "0.7"
+prost = "0.9"
 rand = "0.8"
 rayon = "1.5"
 regex = "1"
