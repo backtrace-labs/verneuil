@@ -310,7 +310,7 @@ pub fn main() -> Result<()> {
 
     let opts = Opt::from_args();
 
-    // Send tracing calls to stdout, and converts any log! call to
+    // Send tracing calls to stderr, and convert any log! call to
     // traces.
     let filter = if let Some(log_level) = &opts.log {
         EnvFilter::try_new(log_level)
