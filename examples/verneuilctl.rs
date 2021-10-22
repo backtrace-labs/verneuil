@@ -142,7 +142,7 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
         } else if let Some(path) = &cmd.source_path {
             match verneuil::manifest_bytes_for_hostname_path(
                 Some(&config),
-                cmd.hostname.as_ref().map(String::as_str),
+                cmd.hostname.as_deref(),
                 path,
             )? {
                 Some(bytes) => Ok(bytes),
@@ -182,11 +182,8 @@ struct ManifestName {
 fn manifest_name(cmd: ManifestName) -> Result<()> {
     println!(
         "{}",
-        verneuil::manifest_name_for_hostname_path(
-            cmd.hostname.as_ref().map(String::as_str),
-            &cmd.source
-        )
-        .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?
+        verneuil::manifest_name_for_hostname_path(cmd.hostname.as_deref(), &cmd.source)
+            .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?
     );
     Ok(())
 }
@@ -215,7 +212,7 @@ struct Manifest {
 fn manifest(cmd: Manifest, config: Options) -> Result<()> {
     let bytes = match verneuil::manifest_bytes_for_hostname_path(
         Some(&config),
-        cmd.hostname.as_ref().map(String::as_str),
+        cmd.hostname.as_deref(),
         &cmd.source,
     )? {
         Some(bytes) => bytes,
