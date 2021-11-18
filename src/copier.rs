@@ -135,11 +135,6 @@ const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
 /// the end of the last manifest upload and the start of the next.
 const MIN_MANIFEST_COPY_DELAY: Duration = Duration::from_millis(1100);
 
-/// Wait up to this long for credentials HTTP requests.  The limit
-/// doesn't really matter, as long as we eventually stop waiting:
-/// we usually get a response in milliseconds.
-const CREDENTIALS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// When we fail to find credentials, sleep for at least this long
 /// before trying again: it's not particularly useful to log that we
 /// couldn't acquire credentials multiple times a second, especially
@@ -1623,7 +1618,6 @@ impl CopierWorker {
     ) -> Result<bool> {
         let mut did_something = false;
 
-        s3::creds::set_request_timeout(Some(CREDENTIALS_REQUEST_TIMEOUT));
         let creds = Credentials::default().map_err(|e| {
             use rand::Rng;
 
@@ -1830,7 +1824,6 @@ impl CopierWorker {
         };
 
         // Similarly, a failure here shouldn't trigger a full snapshot.
-        s3::creds::set_request_timeout(Some(CREDENTIALS_REQUEST_TIMEOUT));
         let creds = match Credentials::default() {
             Ok(creds) => creds,
             Err(e) => {
