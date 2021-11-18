@@ -11,9 +11,18 @@ fn build_sqlite() {
         .define("SQLITE_DEFAULT_WAL_SYNCHRONOUS", "1") // Sync WAL DBs "NORMAL"ly
         .define("SQLITE_LIKE_DOESNT_MATCH_BLOBS", None) // Don't run LIKE on blobs
         .define("SQLITE_OMIT_DEPRECATED", None)
-        .define("SQLITE_OMIT_SHARED_CACHE", None)
+        // We leave the shared cache enabled: verneuil is incompatible with a WAL
+        // DB, so applications may want to use the shared cache mode for to allow
+        // more query concurrency.
         .define("SQLITE_USE_ALLOCA", None)
         .define("SQLITE_OMIT_AUTOINIT", None)
+        // We only run on recent linux, which has these functions
+        .define("HAVE_FDATASYNC", None)
+        .define("HAVE_GMTIME_R", None)
+        .define("HAVE_LOCALTIME_R", None)
+        .define("HAVE_STRCHRNUL", None)
+        .define("HAVE_USLEEP", None)
+        .define("HAVE_UTIME", None)
         // We want larger pages for our replication.
         .define("SQLITE_DEFAULT_PAGE_SIZE", "65536")
         .define("SQLITE_MAX_DEFAULT_PAGE_SIZE", "65536")
@@ -26,6 +35,8 @@ fn build_sqlite() {
         .define("SQLITE_ENABLE_MATH_FUNCTIONS", None)
         // We use a lot of JSON; might be good to push down to sqlite.
         .define("SQLITE_ENABLE_JSON1", None)
+        .define("SQLITE_ENABLE_STAT4", None)
+        .define("SQLITE_ENABLE_UPDATE_DELETE_LIMIT", None)
         // Make sqlite use calloc instead of malloc: the pager likes to
         // malloc(3) full pages, but only populate them partially before
         // fully persisting them to disk.  That leaks nondeterministic
