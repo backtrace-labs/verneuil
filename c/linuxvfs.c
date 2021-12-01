@@ -483,14 +483,49 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          * and get an `O_TMPFILE` in `get_tempdir_base()`.
          */
         if (name == NULL || (flags & SQLITE_OPEN_DELETEONCLOSE) != 0) {
+                const char *base;
+
+                base = get_tempdir_base();
+
                 file->path = NULL;
-                fd = linux_safe_open(get_tempdir_base(),
-                     O_TMPFILE | O_EXCL | open_flags, 0600);
+                fd = linux_safe_open(base, O_TMPFILE | O_EXCL | open_flags, 0600);
+
                 if (fd < 0 && errno == EACCES) {
                         rc = SQLITE_READONLY_DIRECTORY;
                         goto fail;
                 }
-        } else {
+
+                /*
+                 * Some filesystems do not support O_TMPFILE.  Try a
+                 * minimalistic mkstemp-based fallback.  If anything
+                 * goes wrong, propagate the EOPNOTSUPP error: we
+                 * don't really care too much about such filesystems.
+                 */
+                if (fd < 0 && errno == EOPNOTSUPP) {
+                        char *path;
+
+                        if (asprintf(&path, "%s/verneuil.XXXXXX", base) < 0) {
+                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
+                                goto fail;
+                        }
+
+                        fd = mkostemp(path, O_CLOEXEC | O_LARGEFILE);
+                        if (fd >= 0)
+                                (void)unlink(path);
+
+                        free(path);
+                        if (fd < 0) {
+                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
+                                goto fail;
+                        }
+
+                        if (fd < SQLITE_MINIMUM_FILE_DESCRIPTOR) {
+                                close(fd);
+                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
+                                goto fail;
+                        }
+                }
+	} else {
                 if ((flags & SQLITE_OPEN_CREATE) != 0)
                         open_flags |= O_CREAT;
 
