@@ -89,7 +89,8 @@ Quick start
 
 There is more detailed setup information, including how to directly
 link against the verneuil crate instead of loading it as a sqlite
-extension, in `doc/VFS.md` and `doc/SNAPSHOT_VFS.md`.
+extension, in `doc/VFS.md` and `doc/SNAPSHOT_VFS.md`.  The
+`rusqlite_integration` example shows how that works for a Rust crate.
 
 For quick hacks and test drives, the easiest way to use Verneuil is to
 build it as a runtime loadable extension for sqlite
