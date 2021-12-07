@@ -8,7 +8,7 @@ mod process_id;
 mod racy_time;
 mod recent_work_set;
 mod replication_buffer;
-mod replication_target;
+pub mod replication_target;
 pub mod result; // Must be exposed for the helper functions
 mod snapshot;
 mod snapshot_vfs_ops;

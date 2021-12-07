@@ -23,7 +23,7 @@ use crate::instance_id::instance_id;
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct S3ReplicationTarget {
     /// Region for the blob store.  Either one of the hardcoded strings
-    /// supported by Rust-S3 (https://github.com/durch/rust-s3/blob/0.26.3/aws-region/src/region.rs#L132-L160),
+    /// supported by [Rust-S3](https://github.com/durch/rust-s3/blob/v0.28.0/aws-region/src/region.rs#L140-L170),
     /// or a local domain like "minio".
     pub region: String,
 
