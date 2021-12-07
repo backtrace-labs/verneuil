@@ -2394,6 +2394,10 @@ verneuil_configure_impl(const struct verneuil_options *options)
         if (rc != SQLITE_OK)
                 return rc;
 
+        rc = sqlite3_vfs_register(&verneuil_snapshot_vfs, /*makeDflt=*/0);
+        if (rc != SQLITE_OK)
+                return rc;
+
         if (options->tempdir != NULL)
                 return verneuil_set_tempdir(options->tempdir);
 
