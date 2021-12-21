@@ -423,6 +423,8 @@ out:
         return (success == true) ? SQLITE_OK : SQLITE_LOCKED;
 }
 
+char *sqlite3_temp_directory __attribute__((weak));
+
 static const char *
 compute_tempdir(void)
 {
