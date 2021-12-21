@@ -1,7 +1,7 @@
 Verneuil: streaming replication for sqlite
 ==========================================
 
-[![asciicast](https://asciinema.org/a/457886.svg)](https://asciinema.org/a/457886)
+[![asciicast](doc/demo.gif)](https://asciinema.org/a/457886)
 
 Verneuil[^verneuil-process] [[vɛʁnœj]](https://en.wikipedia.org/wiki/Auguste_Victor_Louis_Verneuil)
 is a [VFS (OS abstraction layer)](https://www.sqlite.org/vfs.html) for
