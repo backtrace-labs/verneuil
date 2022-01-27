@@ -493,6 +493,33 @@ get_tempdir_base(void)
 }
 
 /**
+ * Ensures that `fd >= SQLITE_MINIMUM_FILE_DESCRIPTOR`, or
+ * returns a negative value (failure).
+ *
+ * If `fd < 0`, it is immediately returned.
+ */
+static int
+linux_ensure_high_fd(int fd)
+{
+        int err, fd2;
+
+        if (fd < 0 || fd >= SQLITE_MINIMUM_FILE_DESCRIPTOR)
+                return fd;
+
+        /*
+         * This FD is too low.  Dup it up higher.
+         */
+        do {
+                fd2 = fcntl(fd, F_DUPFD_CLOEXEC, SQLITE_MINIMUM_FILE_DESCRIPTOR);
+        } while (fd2 < 0 && errno == EINTR);
+
+        err = errno;
+        close(fd);
+        errno = err;
+        return fd2;
+}
+
+/**
  * Wraps open(2) to retry on EINTR and avoid returning file
  * descriptors below `SQLITE_MINIMUM_FILE_DESCRIPTOR` (usually 3,
  * to avoid stdin/stdout/stderr).
@@ -500,51 +527,15 @@ get_tempdir_base(void)
 static int
 linux_safe_open(const char *path, int flags, mode_t mode)
 {
-        int dummy, err, fd, r;
+        int fd;
 
         do {
-                fd = open(path, flags, mode);
+                fd = open(path, flags | O_CLOEXEC, mode);
         } while (fd < 0 && errno == EINTR);
 
-        if (fd < 0)
-                return fd;
-
-        if (fd >= SQLITE_MINIMUM_FILE_DESCRIPTOR)
-                return fd;
-
-        /*
-         * This FD is too low.  Open `/dev/null` and dup3 in place.
-         */
-        do {
-                dummy = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        } while (dummy < 0 && errno == EINTR);
-
-        if (dummy < 0)
-                return dummy;
-
-        /* Copy `dummy` to `0 <= fd < SQLITE_MINIMUM_FILE_DESCRIPTOR`. */
-        do {
-                r = dup3(dummy, fd, O_CLOEXEC);
-        } while (r < 0 && errno == EINTR);
-
-        /*
-         * Regardless of what happened to `dup3`, we want to get rid
-         * of `dummy` if it's a file descriptor number we can use.
-         */
-        if (dummy >= SQLITE_MINIMUM_FILE_DESCRIPTOR) {
-                err = errno;
-                close(dummy);
-                errno = err;
-        }
-
-        if (r < 0)
-                return r;
-
-        /*
-         * We made some progress and populated at least one fd below
-         * SQLITE_MINIMUM_FILE_DESCRIPTOR.  Try again.
-         */
-        return linux_safe_open(path, flags, mode);
+        fd = linux_ensure_high_fd(fd);
+        assert(fd < 0 || fd >= SQLITE_MINIMUM_FILE_DESCRIPTOR);
+        return fd;
 }
 
 static bool
@@ -660,13 +651,8 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
                                 (void)unlink(path);
 
                         free(path);
+                        fd = linux_ensure_high_fd(fd);
                         if (fd < 0) {
-                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
-                                goto fail;
-                        }
-
-                        if (fd < SQLITE_MINIMUM_FILE_DESCRIPTOR) {
-                                close(fd);
                                 rc = SQLITE_CANTOPEN_NOTEMPDIR;
                                 goto fail;
                         }
