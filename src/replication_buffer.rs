@@ -224,6 +224,15 @@ const SCRATCH_FILE_GRACE_PERIOD: Duration = Duration::from_secs(10);
 /// this grace period.
 const ORPHAN_TAP_FILE_GRACE_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
+/// Contemporary file systems (unixen and windows) all let files and
+/// directories have up to 255 bytes or codepoints in their name.
+///
+/// Let invertibly mangled names go up to 230 *bytes*, just to avoid
+/// issues with boundary value.  In practice, invertible names are
+/// always strictly shorter than `MAX_MANGLED_NAME_LENGTH`, and
+/// uninvertible ones strictly longer.
+const MAX_MANGLED_NAME_LENGTH: usize = 230;
+
 /// Sets the default spooling directory for replication subdirectories,
 /// if it isn't already set.
 #[instrument]
@@ -451,12 +460,57 @@ fn replace_slashes(input: &str) -> String {
 pub(crate) fn restore_slashes(input: &str) -> Result<Option<String>> {
     let slashified = input.replace("#", "/");
 
-    Ok(Some(
-        percent_encoding::percent_decode_str(&slashified)
-            .decode_utf8()
-            .map_err(|e| chain_info!(e, "invalid utf-8 bytes"))?
-            .to_string(),
-    ))
+    // If the input string is more than `MAX_MANGLED_NAME_LENGTH`
+    // bytes, assume it had to be truncated.
+    if input.as_bytes().len() > MAX_MANGLED_NAME_LENGTH {
+        Ok(None)
+    } else {
+        Ok(Some(
+            percent_encoding::percent_decode_str(&slashified)
+                .decode_utf8()
+                .map_err(|e| chain_info!(e, "invalid utf-8 bytes"))?
+                .to_string(),
+        ))
+    }
+}
+
+fn mangle_string(string: &str) -> String {
+    let unslashified = replace_slashes(string);
+
+    // Avoid fencepost bugs and never generate a mangled string
+    // that's exactly MAX_MANGLED_NAME_LENGTH long.
+    if unslashified.as_bytes().len() < MAX_MANGLED_NAME_LENGTH {
+        return unslashified;
+    }
+
+    lazy_static::lazy_static! {
+        static ref MANGLE_PARAMS: umash::Params = umash::Params::derive(0, b"verneuil path mangling params");
+    }
+
+    // This fingerprint will be printed as 2x 16 hex char strings.
+    let fprint = MANGLE_PARAMS
+        .fingerprinter(0)
+        .write(unslashified.as_bytes())
+        .digest();
+
+    // MAX_MANGLED_NAME_LENGTH is a bit short of the expected
+    // limit on filenames; this lets us add a few extra bytes to
+    // make sure the mangled path exceeds MAX_MANGLED_NAME_LENGTH,
+    // even after round tripping to unicode codepoint and back to
+    // encoded bytes.
+    let fragment_len = 5 + (MAX_MANGLED_NAME_LENGTH - 32) / 2;
+    // The conversion back from truncated bytes to codepoint to utf-8
+    // bytes might add a couple bytes on each end, but
+    // MAX_MANGLED_NAME_LENGTH is comfortable less than 255, so the
+    // final mangled name is both definitely longer than
+    // MAX_MANGLED_NAME_LENGTH and shorter than 255.
+    let left = String::from_utf8_lossy(&unslashified.as_bytes()[..fragment_len]);
+    let right =
+        String::from_utf8_lossy(&unslashified.as_bytes()[unslashified.len() - fragment_len..]);
+    format!(
+        "{}{:016x}{:016x}{}",
+        left, fprint.hash[0], fprint.hash[1], right
+    )
 }
 
 /// Mangles a path to an extent database into a directory name:
@@ -469,8 +523,7 @@ fn mangle_path(path: &Path) -> Result<String> {
         .as_os_str()
         .to_str()
         .ok_or_else(|| fresh_error!("unable to convert canonical path to string", ?canonical))?;
-
-    Ok(replace_slashes(string))
+    Ok(mangle_string(string))
 }
 
 /// Constructs a unique human-readable filename for `fd`: we derive a
@@ -1509,6 +1562,46 @@ fn replace_slashes_invertible() {
             .expect("must decode")
             .expect("must be reversible")
     );
+}
+
+/// A short path should be invertible.
+#[test]
+fn mangle_path_short() {
+    let path = format!("/foo/bar/{}", String::from_utf8(vec![b'X'; 220]).unwrap());
+
+    let mangled = mangle_string(&path);
+
+    assert!(mangled.as_bytes().len() < MAX_MANGLED_NAME_LENGTH);
+    assert_eq!(
+        path,
+        restore_slashes(&mangled)
+            .expect("must decode")
+            .expect("must be reversible")
+    );
+}
+
+/// A long path should be clearly not invertible.
+#[test]
+fn mangle_path_long() {
+    let path = format!("/foo/bar/{}", String::from_utf8(vec![b'X'; 221]).unwrap());
+
+    let mangled = mangle_string(&path);
+
+    assert!(mangled.as_bytes().len() > MAX_MANGLED_NAME_LENGTH);
+    assert_eq!(None, restore_slashes(&mangled).expect("must decode"));
+}
+
+/// A long path should mangle to comfortable less than 255 bytes
+/// (NAME_MAX on most platforms).
+#[test]
+fn mangle_path_over_name_max() {
+    let path = format!("/foo/bar/{}", String::from_utf8(vec![b'X'; 1000]).unwrap());
+
+    let mangled = mangle_string(&path);
+
+    assert!(mangled.as_bytes().len() > MAX_MANGLED_NAME_LENGTH);
+    assert_eq!(240, mangled.as_bytes().len());
+    assert_eq!(None, restore_slashes(&mangled).expect("must decode"));
 }
 
 /// The mapping function should be constant across versions.
