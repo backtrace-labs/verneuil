@@ -447,14 +447,16 @@ fn replace_slashes(input: &str) -> String {
         .collect()
 }
 
-/// Reverses `replace_slashes`.
-pub(crate) fn restore_slashes(input: &str) -> Result<String> {
+/// Reverses `replace_slashes` if possible.
+pub(crate) fn restore_slashes(input: &str) -> Result<Option<String>> {
     let slashified = input.replace("#", "/");
 
-    Ok(percent_encoding::percent_decode_str(&slashified)
-        .decode_utf8()
-        .map_err(|e| chain_info!(e, "invalid utf-8 bytes"))?
-        .to_string())
+    Ok(Some(
+        percent_encoding::percent_decode_str(&slashified)
+            .decode_utf8()
+            .map_err(|e| chain_info!(e, "invalid utf-8 bytes"))?
+            .to_string(),
+    ))
 }
 
 /// Mangles a path to an extent database into a directory name:
@@ -565,10 +567,10 @@ fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
         }
 
         let base_file = match restore_slashes(&name) {
-            Ok(base_file) => base_file,
+            Ok(Some(base_file)) => base_file,
             // If we couldn't decode the file name, it's probably
             // not ours?
-            Err(_) => continue,
+            Ok(None) | Err(_) => continue,
         };
 
         // If the file definitely does not exist, delete the
@@ -1503,7 +1505,9 @@ fn replace_slashes_invertible() {
     // And it must be invertible.
     assert_eq!(
         HARD_STRING,
-        &restore_slashes(&converted).expect("must decode")
+        &restore_slashes(&converted)
+            .expect("must decode")
+            .expect("must be reversible")
     );
 }
 

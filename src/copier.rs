@@ -2002,7 +2002,7 @@ impl CopierWorker {
 }
 
 /// Returns the path for the source db given the spool directory path.
-fn source_db_for_spool(spool_path: &Path) -> Result<PathBuf> {
+fn source_db_for_spool(spool_path: &Path) -> Result<Option<PathBuf>> {
     let file_name = spool_path
         .parent()
         .ok_or_else(|| fresh_warn!("Spool path does not have an inode component", ?spool_path))?
@@ -2011,7 +2011,7 @@ fn source_db_for_spool(spool_path: &Path) -> Result<PathBuf> {
         .to_str()
         .ok_or_else(|| fresh_warn!("Final spool path component is not valid utf-8", ?spool_path))?;
 
-    Ok(replication_buffer::restore_slashes(file_name)?.into())
+    Ok(replication_buffer::restore_slashes(file_name)?.map(|x| x.into()))
 }
 
 impl CopierSpoolState {
@@ -2264,7 +2264,13 @@ impl CopierBackend {
             recv(self.maintenance) -> maintenance => match maintenance {
                 Ok(Join(spool_path, source_or)) => {
                     let mut source = match source_db_for_spool(&spool_path) {
-                        Ok(path) => path,
+                        Ok(Some(path)) => path,
+                        Ok(None) => if let Some(path) = &source_or {
+                            path.clone()
+                        } else {
+                            tracing::debug!(?spool_path, "unable to decode overlong source db path");
+                            return true;
+                        }
                         Err(err) => {
                             tracing::warn!(?spool_path, ?err, "failed to decode source db path");
                             return true;
