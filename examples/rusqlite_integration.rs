@@ -34,17 +34,17 @@ fn main() {
     // variables, or hardcoded values here.
     let options =
         verneuil::load_configuration_from_env(None).unwrap_or_else(|| verneuil::Options {
-            make_default: env!("MAKE_DEFAULT") == "true",
+            make_default: option_env!("MAKE_DEFAULT").unwrap() == "true",
             replication_spooling_dir: Some("/tmp/verneuil-spool".into()),
             replication_targets: vec![
                 verneuil::replication_target::ReplicationTarget::S3(
                     verneuil::replication_target::S3ReplicationTarget {
-                        region: env!("DEFAULT_REGION").into(),
+                        region: option_env!("DEFAULT_REGION").unwrap().into(),
                         endpoint: None,
                         // You will want to rename these two buckets to
                         // something for which you have credentials.
-                        chunk_bucket: env!("DEFAULT_CHUNK_BUCKET").into(),
-                        manifest_bucket: env!("DEFAULT_MANIFEST_BUCKET").into(),
+                        chunk_bucket: option_env!("DEFAULT_CHUNK_BUCKET").unwrap().into(),
+                        manifest_bucket: option_env!("DEFAULT_MANIFEST_BUCKET").unwrap().into(),
                         domain_addressing: true,
                         create_buckets_on_demand: false,
                     },
