@@ -172,7 +172,7 @@ pub(crate) fn extract_version_id(
     let ret = unsafe {
         verneuil__getxattr(
             file.as_raw_fd(),
-            XATTR_NAME.as_ptr(),
+            XATTR_NAME.as_ptr() as *const _,
             buf.as_mut_ptr(),
             buf.len(),
         )
@@ -299,7 +299,7 @@ pub(crate) fn update_version_id(file: &File, cached_uuid: Option<Uuid>) -> Resul
     let ret = unsafe {
         verneuil__setxattr(
             file.as_raw_fd(),
-            XATTR_NAME.as_ptr(),
+            XATTR_NAME.as_ptr() as *const _,
             tag.as_ptr(),
             tag.len(),
         )
@@ -327,7 +327,14 @@ pub(crate) fn clear_version_id(file: &File) -> Result<()> {
         let _ = warn_from_os!("failed to touch file");
     }
 
-    let ret = unsafe { verneuil__setxattr(file.as_raw_fd(), XATTR_NAME.as_ptr(), [].as_ptr(), 0) };
+    let ret = unsafe {
+        verneuil__setxattr(
+            file.as_raw_fd(),
+            XATTR_NAME.as_ptr() as *const _,
+            [].as_ptr(),
+            0,
+        )
+    };
     let result = if ret >= 0 {
         Ok(())
     } else {
