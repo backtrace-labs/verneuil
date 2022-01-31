@@ -1,3 +1,10 @@
+0.1.4 2022-01-31
+-----------------
+* Enable dynamic linking against older sqlites (b834c18d)
+* Simplify the logic to avoid low fd numbers (2be8aeac)
+* Support long paths (> NAME_MAX) (5689ff3d) [#1]
+* Upgrade to governor 0.4 to drop one dependency on hash brown.
+
 0.1.3 2021-12-07
 ----------------
 * Make it possible to build the `libverneuil_vfs` and `verneuilctl`
