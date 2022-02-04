@@ -284,16 +284,13 @@ impl ReplicationProtoData {
     /// `Ok(None)` if the bytes encode protobuf data, but fail
     /// application-level validation.
     fn new(bytes: Vec<u8>) -> Result<Option<ReplicationProtoData>> {
-        use prost::Message;
-
-        let v1 = match manifest_schema::Manifest::decode(&*bytes)
-            .map_err(|e| chain_error!(e, "failed to decode proto bytes"))?
-            .v1
-        {
+        let v1 = match manifest_schema::Manifest::decode_and_validate(&*bytes, "bytes")?.v1 {
             Some(v1) => v1,
             None => return Ok(None),
         };
 
+        // The branches below are checked by `decode_and_validate`,
+        // but it doesn't hurt to be safe.
         let header_fprint = if let Some(fprint) = v1.header_fprint {
             fprint.into()
         } else {

@@ -162,7 +162,6 @@ use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::instance_id;
-use crate::manifest_schema::fingerprint_v1_chunk_list;
 use crate::manifest_schema::Manifest;
 use crate::ofd_lock::OfdLock;
 use crate::process_id::process_id;
@@ -865,28 +864,13 @@ pub(crate) fn chunk_name_fingerprint(name: &str) -> Option<Fingerprint> {
 /// Returns Ok(None) if the file does not exist.
 #[instrument(level = "trace", err)]
 fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
-    use prost::Message;
-
     let contents = match std::fs::read(file_path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(chain_error!(e, "failed to read manifest", ?file_path)),
     };
-    let manifest = Manifest::decode(&*contents)
-        .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?file_path))?;
 
-    match &manifest.v1 {
-        Some(v1)
-            // We must have a v1 entry, the chunk fingerprints must match, and there
-            // must be an even number of u64 in the list (we need two per fingerprint).
-            if Some(fingerprint_v1_chunk_list(&v1.chunks).into()) == v1.contents_fprint
-                && (v1.chunks.len() % 2) == 0 =>
-        {
-            Ok(Some(manifest))
-        },
-        Some(_) => Err(fresh_error!("invalid chunk list", ?manifest)),
-        None => Err(fresh_error!("v1 format not found", ?manifest)),
-    }
+    Ok(Some(Manifest::decode_and_validate(&*contents, file_path)?))
 }
 
 /// Returns the path to the staging directory under `parent`; it may

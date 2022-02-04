@@ -1,4 +1,3 @@
-use prost::Message;
 use std::path::PathBuf;
 use structopt::StructOpt;
 use verneuil::chain_error;
@@ -157,8 +156,7 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
     };
 
     let manifest_contents = read_manifest()?;
-    let manifest = verneuil::Manifest::decode(&*manifest_contents)
-        .map_err(|e| chain_error!(e, "failed to parse manifest file", path=?cmd.manifest))?;
+    let manifest = verneuil::Manifest::decode_and_validate(&*manifest_contents, &cmd.manifest)?;
     let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
     let reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
     output_reader(reader, &cmd.out)

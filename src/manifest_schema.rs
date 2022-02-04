@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::chain_error;
 use crate::drop_result;
+use crate::fresh_error;
 use crate::fresh_warn;
 use crate::result::Result;
 use crate::warn_from_os;
@@ -99,6 +100,44 @@ pub struct ManifestV1 {
 pub struct Manifest {
     #[prost(message, tag = "1")]
     pub v1: Option<ManifestV1>,
+}
+
+impl Manifest {
+    /// Attempts to decode the protobuf bytes in `buf` and
+    /// rejects clearly invalid data.
+    pub fn decode_and_validate(buf: &[u8], description: impl std::fmt::Debug) -> Result<Manifest> {
+        use prost::Message;
+
+        let manifest = Manifest::decode(buf)
+            .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?description))?;
+
+        let v1 = match &manifest.v1 {
+            Some(v1) => v1,
+            None => return Err(fresh_error!("v1 format not found", ?manifest)),
+        };
+
+        if v1.contents_fprint.is_none() {
+            return Err(fresh_error!("missing contents_fprint", ?manifest));
+        }
+
+        if v1.header_fprint.is_none() {
+            return Err(fresh_error!("missing header_fprint", ?manifest));
+        }
+
+        if v1.ctime <= 0 {
+            return Err(fresh_error!("missing or negative ctime", ?manifest));
+        }
+
+        // Check the chunk fingerprints: their fingerprint must match, and
+        // there must be an even number of u64s (two per fingerprint).
+        if Some(fingerprint_v1_chunk_list(&v1.chunks).into()) != v1.contents_fprint
+            || (v1.chunks.len() % 2) != 0
+        {
+            return Err(fresh_error!("invalid chunk list", ?manifest));
+        }
+
+        Ok(manifest)
+    }
 }
 
 /// Computes the `header_fprint` for a sqlite database.  The 100-byte header
@@ -425,22 +464,18 @@ pub(crate) fn parse_manifest_info(
 
 /// Returns the list of chunks in `manifest`.
 pub(crate) fn extract_manifest_chunks(manifest: &Manifest) -> Result<Vec<Fingerprint>> {
-    match &manifest.v1 {
-        Some(v1)
-            if v1.chunks.len() % 2 == 0
-                && Some(fingerprint_v1_chunk_list(&v1.chunks))
-                    == v1.contents_fprint.as_ref().map(Into::into) =>
-        {
-            let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
+    let v1 = if let Some(v1) = &manifest.v1 {
+        v1
+    } else {
+        return Err(fresh_warn!("manifest proto v1 not found", ?manifest));
+    };
 
-            for i in 0..v1.chunks.len() / 2 {
-                ret.push(Fingerprint::new(v1.chunks[2 * i], v1.chunks[2 * i + 1]));
-            }
-
-            Ok(ret)
-        }
-        _ => Err(fresh_warn!("invalid manifest proto v1", ?manifest)),
+    let mut ret = Vec::with_capacity(v1.chunks.len() / 2);
+    for i in 0..v1.chunks.len() / 2 {
+        ret.push(Fingerprint::new(v1.chunks[2 * i], v1.chunks[2 * i + 1]));
     }
+
+    Ok(ret)
 }
 
 pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
@@ -455,14 +490,9 @@ pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
 /// an empty list if there is no such file.
 #[instrument]
 pub(crate) fn parse_manifest_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
-    use prost::Message;
-
     match std::fs::read(path) {
-        Ok(contents) => {
-            let manifest = Manifest::decode(&*contents)
-                .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?path))?;
-            extract_manifest_chunks(&manifest)
-        }
+        Ok(contents) => extract_manifest_chunks(&Manifest::decode_and_validate(&*contents, path)?),
+
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),
     }

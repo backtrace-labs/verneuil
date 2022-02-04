@@ -141,15 +141,13 @@ impl Drop for Data {
 /// Constructs a fresh snapshot for `path`, updates the global cache,
 /// and returns the result.
 fn fetch_new_data(path: String) -> Result<Arc<Data>> {
-    use prost::Message;
-
     let start = SystemTime::now();
     let bytes = match crate::manifest_bytes_for_path(None, &path)? {
         Some(bytes) => bytes,
         None => return Err(fresh_error!("manifest not found", %path)),
     };
 
-    let manifest = crate::Manifest::decode(&*bytes)
+    let manifest = crate::Manifest::decode_and_validate(&*bytes, &path)
         .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
 
     let (ctime, ctime_ns) = match &manifest.v1 {
