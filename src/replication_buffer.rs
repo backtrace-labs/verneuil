@@ -165,6 +165,7 @@ use crate::instance_id;
 use crate::manifest_schema::Manifest;
 use crate::ofd_lock::OfdLock;
 use crate::process_id::process_id;
+use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
 use crate::result::Result;
 
@@ -863,8 +864,15 @@ pub(crate) fn chunk_name_fingerprint(name: &str) -> Option<Fingerprint> {
 
 /// Attempts to read a valid Manifest message from `file_path`.
 /// Returns Ok(None) if the file does not exist.
+///
+/// Any chunk necessary to decode the Manifest will be fetched from
+/// a cache built with the `cache_builder` and from the `targets`.
 #[instrument(level = "trace", err)]
-fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
+fn read_manifest_at_path(
+    file_path: &Path,
+    cache_builder: kismet_cache::CacheBuilder,
+    targets: &[ReplicationTarget],
+) -> Result<Option<Manifest>> {
     let contents = match std::fs::read(file_path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -872,7 +880,7 @@ fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
     };
 
     Ok(Some(
-        Manifest::decode_and_validate(&*contents, Default::default(), Some(&[]), file_path)?.0,
+        Manifest::decode_and_validate(&*contents, cache_builder, Some(targets), file_path)?.0,
     ))
 }
 
@@ -1197,34 +1205,49 @@ impl ReplicationBuffer {
 
     /// Attempts to parse the current "consuming" manifest file.
     #[instrument(level = "trace", err)]
-    pub fn read_consuming_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
+    pub fn read_consuming_manifest(
+        &self,
+        db_path: &Path,
+        cache_builder: kismet_cache::CacheBuilder,
+        targets: &[ReplicationTarget],
+    ) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(CONSUMING);
         src = append_subdirectory(src);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
-        read_manifest_at_path(&src)
+        read_manifest_at_path(&src, cache_builder, targets)
     }
 
     /// Attempts to parse the current ready manifest file.
     #[instrument(level = "trace", err)]
-    pub fn read_ready_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
+    pub fn read_ready_manifest(
+        &self,
+        db_path: &Path,
+        cache_builder: kismet_cache::CacheBuilder,
+        targets: &[ReplicationTarget],
+    ) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src = append_subdirectory(src);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
-        read_manifest_at_path(&src)
+        read_manifest_at_path(&src, cache_builder, targets)
     }
 
     /// Attempts to parse the current staged manifest file.
     #[instrument(level = "trace", err)]
-    pub fn read_staged_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {
+    pub fn read_staged_manifest(
+        &self,
+        db_path: &Path,
+        cache_builder: kismet_cache::CacheBuilder,
+        targets: &[ReplicationTarget],
+    ) -> Result<Option<Manifest>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
-        read_manifest_at_path(&src)
+        read_manifest_at_path(&src, cache_builder, targets)
     }
 
     /// Returns the path prefix for staged chunks.
