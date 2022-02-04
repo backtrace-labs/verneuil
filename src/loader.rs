@@ -68,12 +68,18 @@ const DECODED_CHUNK_SIZE_LIMIT: usize = 3usize << 27;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Debug)]
-pub(crate) struct Chunk {
-    pub fprint: Fingerprint,
+pub struct Chunk {
+    fprint: Fingerprint,
     payload: memmap2::Mmap,
 }
 
 impl Chunk {
+    /// Returns the fingerprint for this chunk's data.
+    pub fn fprint(&self) -> Fingerprint {
+        self.fprint
+    }
+
+    /// Returns the chunk's byte data.
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
