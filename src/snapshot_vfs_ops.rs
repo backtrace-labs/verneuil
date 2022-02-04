@@ -147,8 +147,11 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
         None => return Err(fresh_error!("manifest not found", %path)),
     };
 
-    let manifest = crate::Manifest::decode_and_validate(&*bytes, &path)
-        .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
+    // Use the global list of replication targets, same as the
+    // `Snapshot` below.
+    let manifest = crate::Manifest::decode_and_validate(&*bytes, None, &path)
+        .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?
+        .0;
 
     let (ctime, ctime_ns) = match &manifest.v1 {
         Some(v1) => (

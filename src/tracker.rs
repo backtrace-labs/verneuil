@@ -622,6 +622,7 @@ impl Tracker {
                     len,
                     ctime,
                     ctime_ns,
+                    base_chunks_fprint: None,
                     chunks: flattened,
                 }),
             };
