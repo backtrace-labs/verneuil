@@ -134,7 +134,7 @@ struct Restore {
 fn restore(cmd: Restore, config: Options) -> Result<()> {
     let read_manifest = || {
         if let Some(path) = &cmd.manifest {
-            match verneuil::manifest_bytes_for_path(None, &path)? {
+            match verneuil::manifest_bytes_for_path(None, path)? {
                 Some(bytes) => Ok(bytes),
                 None => Err(fresh_error!("manifest not found", ?path)),
             }

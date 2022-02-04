@@ -591,7 +591,7 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                         };
 
                     match consumer(&name, contents) {
-                        Ok(None) => cleanup(Ok(()), &name, &to_consume),
+                        Ok(None) => cleanup(Ok(()), &name, to_consume),
                         Ok(Some(continuation)) => {
                             let name = name.to_owned();
                             let to_consume = to_consume.clone();
@@ -617,7 +617,7 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                                 std::mem::drop(token);
                             });
                         }
-                        Err(e) => cleanup(Err(e), &name, &to_consume),
+                        Err(e) => cleanup(Err(e), &name, to_consume),
                     };
                 }
 
@@ -711,7 +711,7 @@ fn create_target(
     match target {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
-            let bucket_name = bucket_extractor(&s3);
+            let bucket_name = bucket_extractor(s3);
             let mut bucket = Bucket::new(bucket_name, region, creds)
                 .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
 
@@ -890,7 +890,7 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
         // given that blob names are themselves percent encoded).
         let url_encoded_name = percent_encoding::utf8_percent_encode(
             &location_name,
-            &percent_encoding::NON_ALPHANUMERIC,
+            percent_encoding::NON_ALPHANUMERIC,
         );
 
         target.add_header(COPY_SOURCE, &url_encoded_name.to_string());
@@ -1665,7 +1665,7 @@ impl CopierWorker {
         ]
         .iter()
         {
-            let is_empty = directory_is_empty_or_absent(&cleanup)
+            let is_empty = directory_is_empty_or_absent(cleanup)
                 .map_err(|e| chain_debug!(e, "failed to list directory", ?cleanup));
             if matches!(is_empty, Ok(true)) {
                 // It's not an error if this fails: we expect failures
@@ -1681,7 +1681,7 @@ impl CopierWorker {
             Duration::from_secs(60),
             || {
                 self.handle_ready_directory(
-                    &last_manifest_copy,
+                    last_manifest_copy,
                     &cache,
                     &targets,
                     creds.clone(),
@@ -1699,7 +1699,7 @@ impl CopierWorker {
             Duration::from_secs(60),
             || {
                 self.handle_staging_directory(
-                    &last_manifest_copy,
+                    last_manifest_copy,
                     state,
                     stale,
                     &cache,
@@ -1730,7 +1730,7 @@ impl CopierWorker {
             Duration::from_secs(60),
             || {
                 self.handle_ready_directory(
-                    &last_manifest_copy,
+                    last_manifest_copy,
                     &cache,
                     &targets,
                     creds,
@@ -1847,7 +1847,7 @@ impl CopierWorker {
         for fprint in shuffled {
             self.pace();
             touch_blob(
-                &replication_buffer::fingerprint_chunk_name(&fprint),
+                &replication_buffer::fingerprint_chunk_name(fprint),
                 &mut chunks_buckets,
             )?;
         }
@@ -2254,7 +2254,7 @@ impl CopierBackend {
                     // Data in `ready_buffer` is only advisory, it's
                     // never incorrect to drop the work unit.
                     if let Some(state) = self.active_spool_paths.get(&ready) {
-                        self.queue_active_state(&state);
+                        self.queue_active_state(state);
                     }
                 },
                 // Errors only happen when there is no more sender.

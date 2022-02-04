@@ -450,7 +450,7 @@ pub(crate) fn reset_meta_copy_lock(spool_dir: PathBuf) -> Result<()> {
 fn replace_slashes(input: &str) -> String {
     const ESCAPED: percent_encoding::AsciiSet = percent_encoding::CONTROLS.add(b'#').add(b'%');
 
-    percent_encoding::utf8_percent_encode(&input, &ESCAPED)
+    percent_encoding::utf8_percent_encode(input, &ESCAPED)
         .map(|fragment| fragment.replace("/", "#"))
         .collect()
 }
@@ -803,13 +803,14 @@ pub fn manifest_name_for_hostname_path(hostname_or: Option<&str>, path: &Path) -
         static ref PARAMS: umash::Params = umash::Params::derive(0, b"verneuil path params");
     }
 
+    #[allow(clippy::redundant_closure)] // we need to adjust hostname()'s lifetime
     let hostname: &str = hostname_or.unwrap_or_else(|| instance_id::hostname());
 
     let string = path
         .as_os_str()
         .to_str()
         .ok_or_else(|| fresh_error!("failed to convert path to string", ?path))?;
-    let path_hash = PARAMS.hasher(0).write(&string.as_bytes()).digest();
+    let path_hash = PARAMS.hasher(0).write(string.as_bytes()).digest();
 
     let name = format!(
         "{}-verneuil:{}:{:04x}/{}",

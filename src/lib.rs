@@ -78,7 +78,7 @@ extern "C" {
 /// "@/path/to/config_file.json".
 #[tracing::instrument]
 pub fn parse_configuration_string(config: &str) -> Option<Options> {
-    if let Some(path) = config.strip_prefix("@") {
+    if let Some(path) = config.strip_prefix('@') {
         let contents = match std::fs::read(path) {
             Ok(contents) => contents,
             Err(e) => {
@@ -117,7 +117,7 @@ pub fn parse_configuration_string(config: &str) -> Option<Options> {
 /// an `Options` struct, or "@/path/to/config_file.json".
 #[tracing::instrument]
 pub fn load_configuration_from_env(var_name_or: Option<&str>) -> Option<Options> {
-    let var_name = var_name_or.unwrap_or(&VERNEUIL_CONFIG_ENV_VAR);
+    let var_name = var_name_or.unwrap_or(VERNEUIL_CONFIG_ENV_VAR);
 
     let os_value = std::env::var_os(var_name)?;
     let value = if let Some(value) = os_value.to_str() {

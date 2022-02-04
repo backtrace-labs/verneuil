@@ -270,7 +270,7 @@ impl Tracker {
             // configured with 64 KB pages.
             let slice = unsafe { std::slice::from_raw_parts(buf, count as usize) };
             let value = {
-                let fprint = fingerprint_file_chunk(&slice);
+                let fprint = fingerprint_file_chunk(slice);
 
                 // Remember the chunk's fingerprint if it's now staged.
                 match self.buffer.stage_chunk(fprint, slice) {

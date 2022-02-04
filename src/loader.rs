@@ -251,13 +251,13 @@ impl Loader {
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
             for source in remote {
-                if let Some(bucket) = create_source(&source, &creds, |s3| &s3.chunk_bucket)? {
+                if let Some(bucket) = create_source(source, &creds, |s3| &s3.chunk_bucket)? {
                     remote_sources.push(bucket);
                 }
             }
         }
 
-        cache_builder = apply_cache_replication_targets(cache_builder, &remote);
+        cache_builder = apply_cache_replication_targets(cache_builder, remote);
 
         // In tests, check every potential cache hits to make sure
         // they have the same value.
@@ -337,7 +337,7 @@ impl Loader {
             use std::io::ErrorKind;
 
             for source in &self.remote_sources {
-                if let Some(remote) = load_from_source(&source, &name)
+                if let Some(remote) = load_from_source(source, &name)
                     .map_err(|_| Error::new(ErrorKind::Other, "failed to fetch remote chunk"))?
                 {
                     let bytes = maybe_decompress(remote, fprint)
@@ -385,11 +385,11 @@ fn maybe_decompress(payload: Vec<u8>, fprint: Fingerprint) -> Result<Vec<u8>> {
     let hash_matches = |payload: &[u8]| -> bool {
         // Only check the first 64-bit half of the fingerprint, for
         // speed.
-        hash_file_chunk(&payload) == fprint.hash[0]
+        hash_file_chunk(payload) == fprint.hash[0]
     };
 
     let compare_hash = |payload: &[u8]| -> Result<()> {
-        let actual_hash = hash_file_chunk(&payload);
+        let actual_hash = hash_file_chunk(payload);
 
         if actual_hash == fprint.hash[0] {
             Ok(())
@@ -508,7 +508,7 @@ fn create_source(
     match source {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
-            let bucket_name = bucket_extractor(&s3);
+            let bucket_name = bucket_extractor(s3);
             let mut bucket = Bucket::new(bucket_name, region, creds.clone())
                 .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
 

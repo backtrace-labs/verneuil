@@ -54,7 +54,7 @@ pub(crate) fn boot_id() -> &'static str {
         static ref ID: &'static str = find_boot_id().expect("`/proc/sys/kernel/random/boot_id` should be set");
     }
 
-    &*ID
+    &ID
 }
 
 fn find_hostname() -> Result<&'static str> {
@@ -73,7 +73,7 @@ pub fn hostname() -> &'static str {
         static ref NAME: &'static str = find_hostname().unwrap_or(DEFAULT_HOSTNAME);
     }
 
-    &*NAME
+    &NAME
 }
 
 /// Returns a high-entropy short string hash of the hostname.
@@ -95,7 +95,7 @@ pub(crate) fn instance_id() -> &'static str {
         static ref INSTANCE: &'static str = Box::leak(format!("{}.{}", boot_timestamp(), boot_id()).into_boxed_str());
     }
 
-    &*INSTANCE
+    &INSTANCE
 }
 
 #[test]

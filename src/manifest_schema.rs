@@ -96,6 +96,9 @@ pub struct ManifestV1 {
     pub chunks: Vec<u64>,
 }
 
+/// When deserialising a `Manifest`, it usually makes sense to use
+/// `Manifest::decode_and_validate` and not the prost-derived
+/// `Manifest::decode`: the former checks for important invariants.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Manifest {
     #[prost(message, tag = "1")]
@@ -122,10 +125,6 @@ impl Manifest {
 
         if v1.header_fprint.is_none() {
             return Err(fresh_error!("missing header_fprint", ?manifest));
-        }
-
-        if v1.ctime <= 0 {
-            return Err(fresh_error!("missing or negative ctime", ?manifest));
         }
 
         // Check the chunk fingerprints: their fingerprint must match, and
@@ -423,7 +422,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
             )
         };
 
-        return fingerprinter.write(&slice).digest();
+        return fingerprinter.write(slice).digest();
     }
 
     let mut bytes = Vec::with_capacity(chunks.len() * 8);
