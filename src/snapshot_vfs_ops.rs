@@ -87,11 +87,11 @@ impl SnapshotFile {
     /// Exchanges the snapshot pointer with `new` and returns the old
     /// value, if any.
     #[inline]
-    fn exchange(&self, new: *mut Arc<Data>) -> Option<Box<Arc<Data>>> {
+    fn exchange(&self, new: *mut Arc<Data>) -> Option<Arc<Data>> {
         let ptr = self.snapshot.swap(new as *mut _, Ordering::Relaxed) as *mut Arc<Data>;
 
         let snapshot = unsafe { ptr.as_mut() }?;
-        Some(unsafe { Box::from_raw(snapshot) })
+        Some(*unsafe { Box::from_raw(snapshot) })
     }
 
     /// Replaces the data in this `SnapshotFile` with `data`.
@@ -109,7 +109,7 @@ impl SnapshotFile {
     /// NULL pointer, and returns the old `Data`, if it was
     /// populated.
     #[inline]
-    fn consume_snapshot(&self) -> Option<Box<Arc<Data>>> {
+    fn consume_snapshot(&self) -> Option<Arc<Data>> {
         self.exchange(std::ptr::null_mut())
     }
 }
