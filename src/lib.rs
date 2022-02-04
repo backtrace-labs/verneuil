@@ -286,9 +286,14 @@ impl ReplicationProtoData {
     /// `Ok(None)` if the bytes encode protobuf data, but fail
     /// application-level validation.
     fn new(bytes: Vec<u8>) -> Result<Option<ReplicationProtoData>> {
-        let v1 = match manifest_schema::Manifest::decode_and_validate(&*bytes, None, "bytes")?
-            .0
-            .v1
+        let v1 = match manifest_schema::Manifest::decode_and_validate(
+            &*bytes,
+            Default::default(),
+            None,
+            "bytes",
+        )?
+        .0
+        .v1
         {
             Some(v1) => v1,
             None => return Ok(None),
