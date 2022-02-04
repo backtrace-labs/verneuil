@@ -871,7 +871,9 @@ fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
         Err(e) => return Err(chain_error!(e, "failed to read manifest", ?file_path)),
     };
 
-    Ok(Some(Manifest::decode_and_validate(&*contents, file_path)?))
+    Ok(Some(
+        Manifest::decode_and_validate(&*contents, Some(&[]), file_path)?.0,
+    ))
 }
 
 /// Returns the path to the staging directory under `parent`; it may

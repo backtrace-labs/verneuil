@@ -276,7 +276,9 @@ pub struct ReplicationProtoData {
 }
 
 impl ReplicationProtoData {
-    /// Attempts to parse the replication proto in `bytes`.
+    /// Attempts to parse the replication proto in `bytes`, using
+    /// the globally configured list of replication targets if it
+    /// needs access to a base chunk.
     ///
     /// # Errors
     ///
@@ -284,7 +286,10 @@ impl ReplicationProtoData {
     /// `Ok(None)` if the bytes encode protobuf data, but fail
     /// application-level validation.
     fn new(bytes: Vec<u8>) -> Result<Option<ReplicationProtoData>> {
-        let v1 = match manifest_schema::Manifest::decode_and_validate(&*bytes, "bytes")?.v1 {
+        let v1 = match manifest_schema::Manifest::decode_and_validate(&*bytes, None, "bytes")?
+            .0
+            .v1
+        {
             Some(v1) => v1,
             None => return Ok(None),
         };
