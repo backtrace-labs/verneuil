@@ -463,6 +463,29 @@ impl Tracker {
         Ok((len, chunk_fprints, num_snapshotted))
     }
 
+    /// Reads the current staged manifest, if any.
+    fn read_current_manifest(&self) -> Result<Option<Manifest>> {
+        let buf = &self.buffer;
+        let mut builder = kismet_cache::CacheBuilder::new();
+
+        // We assume any chunk needed to parse the manifest is always
+        // available in the staged chunk directory, and make sure to
+        // save such chunks during GC.
+        //
+        // We do that instead of using the test-only
+        // `cache_builder_for_source` because the latter does a lot
+        // more work in order to look into `ready` and `consuming`
+        // subdirectories for data chunk.  However, we (should) always
+        // keep the current base chunk in `staged`, so that extra work
+        // is useless and could hide logic bugs.
+        builder.plain_reader(buf.staged_chunk_directory());
+        buf.read_staged_manifest(
+            &self.path,
+            builder,
+            &self.replication_targets.replication_targets,
+        )
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -498,8 +521,8 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let mut current_manifest: Option<Manifest> = buf
-            .read_staged_manifest(&self.path)
+        let mut current_manifest: Option<Manifest> = self
+            .read_current_manifest()
             .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
             .ok()
             .flatten();
@@ -860,14 +883,28 @@ impl Tracker {
     #[cfg(feature = "test_validate_reads")]
     fn validate_all_snapshots(&self) {
         let buf = &self.buffer;
+        let targets = &self.replication_targets.replication_targets;
+
         self.validate_snapshot(
-            buf.read_consuming_manifest(&self.path),
+            buf.read_consuming_manifest(
+                &self.path,
+                self.cache_builder_for_source(ChunkSource::Consuming),
+                targets,
+            ),
             ChunkSource::Consuming,
         )
         .expect("consuming snapshot must be valid");
-        self.validate_snapshot(buf.read_ready_manifest(&self.path), ChunkSource::Ready)
-            .expect("ready snapshot must be valid");
-        self.validate_snapshot(buf.read_staged_manifest(&self.path), ChunkSource::Staged)
+        self.validate_snapshot(
+            buf.read_ready_manifest(
+                &self.path,
+                self.cache_builder_for_source(ChunkSource::Ready),
+                targets,
+            ),
+            ChunkSource::Ready,
+        )
+        .expect("ready snapshot must be valid");
+
+        self.validate_snapshot(self.read_current_manifest(), ChunkSource::Staged)
             .expect("staged snapshot must be valid");
     }
 
@@ -877,14 +914,26 @@ impl Tracker {
         use blake2b_simd::Params;
 
         let buf = &self.buffer;
+        let targets = &self.replication_targets.replication_targets;
 
         self.validate_snapshot(
-            buf.read_consuming_manifest(&self.path),
+            buf.read_consuming_manifest(
+                &self.path,
+                self.cache_builder_for_source(ChunkSource::Consuming),
+                targets,
+            ),
             ChunkSource::Consuming,
         )
         .expect("consuming snapshot must be valid");
-        self.validate_snapshot(buf.read_ready_manifest(&self.path), ChunkSource::Ready)
-            .expect("ready snapshot must be valid");
+        self.validate_snapshot(
+            buf.read_ready_manifest(
+                &self.path,
+                self.cache_builder_for_source(ChunkSource::Ready),
+                targets,
+            ),
+            ChunkSource::Ready,
+        )
+        .expect("ready snapshot must be valid");
 
         // The VFS layer doesn't do anything with the file's offset,
         // and all locking uses OFD locks, so this `dup(2)` is fine.
@@ -905,8 +954,8 @@ impl Tracker {
         };
 
         let mut hasher = Params::new().hash_length(32).to_state();
-        let manifest = buf
-            .read_staged_manifest(&self.path)
+        let manifest = self
+            .read_current_manifest()
             .expect("manifest must parse")
             .expect("manifest must exist");
 
