@@ -1780,32 +1780,6 @@ impl CopierWorker {
             return Ok(());
         }
 
-        // Compute what fraction of the file's current chunks we want to touch.
-        let coverage_fraction = (time_since_last_patrol.as_secs_f64()
-            / PATROL_TOUCH_PERIOD.as_secs_f64())
-        .clamp(0.0, 1.0);
-        let tap_file = replication_buffer::construct_tapped_manifest_path(spool_path, source)?;
-        let mut chunks = parse_manifest_chunks(&tap_file)?;
-        let mut rng = rand::thread_rng();
-
-        // Touch that fraction of the chunks list, with randomised
-        // rounding for any fractional number of chunks: rounding
-        // down might consistently round to 0, and rounding up
-        // ends up triggering a lot of useless work.
-        let desired_touch_count = chunks.len() as f64 * coverage_fraction;
-        // Bump the randomised rounding probability up a little: we'd
-        // rather touch too many chunks than too few, if something goes
-        // wrong with the PRNG.
-        let round_up_probability = (desired_touch_count.fract() * 2.0).clamp(0.0, 1.0);
-        let touch_count = (desired_touch_count.floor() as usize)
-            .saturating_add(rng.gen_bool(round_up_probability) as usize)
-            .clamp(0, chunks.len());
-
-        let (shuffled, _) = chunks.partial_shuffle(&mut rng, touch_count);
-        if shuffled.is_empty() {
-            return Ok(());
-        }
-
         let targets: ReplicationTargetList = {
             let metadata = replication_buffer::buffer_metadata_file(spool_path.to_path_buf());
 
@@ -1827,6 +1801,32 @@ impl CopierWorker {
                 }
             }
         };
+
+        // Compute what fraction of the file's current chunks we want to touch.
+        let coverage_fraction = (time_since_last_patrol.as_secs_f64()
+            / PATROL_TOUCH_PERIOD.as_secs_f64())
+        .clamp(0.0, 1.0);
+        let tap_file = replication_buffer::construct_tapped_manifest_path(spool_path, source)?;
+        let mut chunks = parse_manifest_chunks(&tap_file, &targets.replication_targets)?;
+        let mut rng = rand::thread_rng();
+
+        // Touch that fraction of the chunks list, with randomised
+        // rounding for any fractional number of chunks: rounding
+        // down might consistently round to 0, and rounding up
+        // ends up triggering a lot of useless work.
+        let desired_touch_count = chunks.len() as f64 * coverage_fraction;
+        // Bump the randomised rounding probability up a little: we'd
+        // rather touch too many chunks than too few, if something goes
+        // wrong with the PRNG.
+        let round_up_probability = (desired_touch_count.fract() * 2.0).clamp(0.0, 1.0);
+        let touch_count = (desired_touch_count.floor() as usize)
+            .saturating_add(rng.gen_bool(round_up_probability) as usize)
+            .clamp(0, chunks.len());
+
+        let (shuffled, _) = chunks.partial_shuffle(&mut rng, touch_count);
+        if shuffled.is_empty() {
+            return Ok(());
+        }
 
         // Similarly, a failure here shouldn't trigger a full snapshot.
         let creds = match Credentials::default() {

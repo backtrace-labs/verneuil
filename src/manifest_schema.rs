@@ -151,6 +151,7 @@ impl Manifest {
     /// in the second return value.
     pub fn decode_and_validate(
         buf: &[u8],
+        cache_builder: kismet_cache::CacheBuilder,
         targets: Option<&[ReplicationTarget]>,
         description: impl std::fmt::Debug,
     ) -> Result<(Manifest, Option<Arc<Chunk>>)> {
@@ -188,7 +189,7 @@ impl Manifest {
                 default_targets = crate::replication_target::get_default_replication_targets();
                 &default_targets.replication_targets
             };
-            let loader = Loader::new(Default::default(), targets)?;
+            let loader = Loader::new(cache_builder, targets)?;
 
             let chunk = if let Some(chunk) = loader.fetch_chunk(base_fprint)? {
                 chunk
@@ -592,11 +593,20 @@ pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
 /// Returns the list of chunks in the manifest proto at `Path`, or
 /// an empty list if there is no such file.
 #[instrument]
-pub(crate) fn parse_manifest_chunks(path: &std::path::Path) -> Result<Vec<Fingerprint>> {
+pub(crate) fn parse_manifest_chunks(
+    path: &std::path::Path,
+    replication_targets: &[ReplicationTarget],
+) -> Result<Vec<Fingerprint>> {
     match std::fs::read(path) {
-        Ok(contents) => {
-            extract_manifest_chunks(&Manifest::decode_and_validate(&*contents, Some(&[]), path)?.0)
-        }
+        Ok(contents) => extract_manifest_chunks(
+            &Manifest::decode_and_validate(
+                &*contents,
+                Default::default(),
+                Some(replication_targets),
+                path,
+            )?
+            .0,
+        ),
 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),

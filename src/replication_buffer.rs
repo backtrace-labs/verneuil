@@ -872,7 +872,7 @@ fn read_manifest_at_path(file_path: &Path) -> Result<Option<Manifest>> {
     };
 
     Ok(Some(
-        Manifest::decode_and_validate(&*contents, Some(&[]), file_path)?.0,
+        Manifest::decode_and_validate(&*contents, Default::default(), Some(&[]), file_path)?.0,
     ))
 }
 
