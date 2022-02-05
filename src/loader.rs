@@ -556,8 +556,10 @@ pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec
             |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
         ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
-            Ok((_, 404)) => return Ok(None),
-            Ok((body, code)) if code < 500 && code != 429 => {
+            // All callers propagate 404s as hard failures.  We might
+            // as try a little bit harder if we get a 404.
+            Ok((_, 404)) if i > 0 => return Ok(None),
+            Ok((body, code)) if code < 500 && ![404, 429].contains(&code) => {
                 return Err(
                     chain_error!((body, code), "failed to fetch chunk", %source.name, %name),
                 )
