@@ -782,11 +782,7 @@ enum ChunkSource {
 
 #[cfg(feature = "test_vfs")]
 impl Tracker {
-    fn fetch_snapshot_or_die(
-        &self,
-        manifest: &Manifest,
-        source: ChunkSource,
-    ) -> crate::snapshot::Snapshot {
+    fn cache_builder_for_source(&self, source: ChunkSource) -> kismet_cache::CacheBuilder {
         let buf = &self.buffer;
         let mut cache_builder = kismet_cache::CacheBuilder::new();
 
@@ -824,8 +820,16 @@ impl Tracker {
             cache_builder.plain_reader(buf.consuming_chunk_directory());
         }
 
+        cache_builder
+    }
+
+    fn fetch_snapshot_or_die(
+        &self,
+        manifest: &Manifest,
+        source: ChunkSource,
+    ) -> crate::snapshot::Snapshot {
         crate::snapshot::Snapshot::new(
-            cache_builder,
+            self.cache_builder_for_source(source),
             &self.replication_targets.replication_targets,
             manifest,
         )
