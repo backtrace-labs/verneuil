@@ -17,6 +17,7 @@ use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
+use crate::executor::block_on_with_executor;
 use crate::fresh_error;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
@@ -552,7 +553,7 @@ pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec
     for i in 0..=LOAD_RETRY_LIMIT {
         match call_with_slow_logging(
             LOAD_REQUEST_TIMEOUT,
-            || source.get_object_blocking(name),
+            || block_on_with_executor(|| source.get_object(name)),
             |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
         ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
