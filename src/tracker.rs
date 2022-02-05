@@ -93,6 +93,28 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
     ret
 }
 
+/// Re-encodes `chunks` to expose a more compressible list of `u64`s
+/// in the manifest.
+fn reencode_flattened_chunks(
+    repl: &ReplicationBuffer,
+    mut chunks: Vec<u64>,
+) -> Result<(Vec<u64>, Option<Fingerprint>)> {
+    // Dummy implementation: always publish the list as a base
+    // reference chunk.
+    let mut base = Vec::new();
+
+    base.reserve(chunks.len() * std::mem::size_of::<u64>());
+    for chunk in chunks.iter() {
+        base.extend(chunk.to_le_bytes());
+    }
+
+    chunks.fill(0);
+
+    let base_fprint = fingerprint_file_chunk(&base);
+    repl.stage_chunk(base_fprint, &base)?;
+    Ok((chunks, Some(base_fprint)))
+}
+
 fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
     if (flattened.len() % 2) != 0 {
         return None;
@@ -625,8 +647,15 @@ impl Tracker {
             }
         }
 
-        let (copied, chunks) = {
-            let (len, chunks, copied) = self.snapshot_chunks(base_fprints)?;
+        // `copied` and `chunks` always take the both
+        // newly-snapshotted chunks and the base chunk into account.
+        //
+        // The base chunk, if any, is also available on its own for
+        // full GCs after publishing: if we just published a new ready
+        // manifest, we can delete all chunks *except the current base
+        // chunk*.
+        let (copied, chunks, base_chunk) = {
+            let (len, mut chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
 
             let (ctime, ctime_ns) = match self.file.metadata() {
                 Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
@@ -638,6 +667,7 @@ impl Tracker {
 
             let flattened = flatten_chunk_fprints(&chunks);
             let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
+            let (compressible, base_chunk) = reencode_flattened_chunks(&self.buffer, flattened)?;
             let manifest = Manifest {
                 v1: Some(ManifestV1 {
                     header_fprint: Some(header_fprint.into()),
@@ -646,14 +676,19 @@ impl Tracker {
                     len,
                     ctime,
                     ctime_ns,
-                    base_chunks_fprint: None,
-                    chunks: flattened,
+                    base_chunks_fprint: base_chunk.map(|fp| fp.into()),
+                    chunks: compressible,
                 }),
             };
 
             buf.publish_manifest(&self.path, &manifest)?;
 
-            (copied, chunks)
+            if let Some(base_chunk) = base_chunk {
+                copied += 1;
+                chunks.push(base_chunk);
+            }
+
+            (copied, chunks, base_chunk)
         };
 
         let mut published = false;
@@ -677,9 +712,11 @@ impl Tracker {
         // the copier that we only remove chunks after attempting
         // to publish the ready buffer.
         if published {
-            // If we just published our snapshot to the ready
-            // buffer, we can delete all chunks.
-            drop_result!(buf.gc_chunks(&[]),
+            // If we just published our snapshot to the ready buffer,
+            // we can delete all chunks... except the base chunk for
+            // the current manifest, which must remain readable.
+            let chunks = base_chunk.iter().copied().collect::<Vec<_>>();
+            drop_result!(buf.gc_chunks(&chunks),
                          e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
             self.chunk_counter.store(0, Ordering::Relaxed);
         } else {
