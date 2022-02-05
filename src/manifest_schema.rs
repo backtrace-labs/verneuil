@@ -597,7 +597,7 @@ pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
 pub(crate) fn parse_manifest_chunks(
     path: &std::path::Path,
     replication_targets: &[ReplicationTarget],
-) -> Result<(Vec<Fingerprint>, Option<Fingerprint>)> {
+) -> Result<(Vec<Fingerprint>, Option<Arc<Chunk>>)> {
     match std::fs::read(path) {
         Ok(contents) => {
             let (manifest, base_or) = Manifest::decode_and_validate(
@@ -606,10 +606,7 @@ pub(crate) fn parse_manifest_chunks(
                 Some(replication_targets),
                 path,
             )?;
-            Ok((
-                extract_manifest_chunks(&manifest)?,
-                base_or.map(|base| base.fprint()),
-            ))
+            Ok((extract_manifest_chunks(&manifest)?, base_or))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), None)),
         Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),
