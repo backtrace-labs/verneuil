@@ -629,7 +629,6 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
     match std::fs::read_dir(&to_consume) {
         Ok(dirents) => {
             call_with_executor(|runtime| {
-                let _scope = runtime.enter();
                 let local_set = tokio::task::LocalSet::new();
                 consume_files(runtime, &local_set, dirents, &mut to_consume);
                 // Wait for any pending task before returning.

@@ -4,7 +4,9 @@ use tokio::runtime;
 use tokio::runtime::Runtime;
 
 /// Invokes `fun` with a reference to the thread-local tokio runtime,
-/// or panics if the thread is being unwound.
+/// or panics if the thread is being unwound.  The function is called
+/// within the runtime's context
+/// (https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#method.enter).
 ///
 /// `tokio::runtime::Handle`s are broken when wrapping "current
 /// thread" executors.  Always use this function to get an executor.
@@ -16,5 +18,8 @@ pub(crate) fn call_with_executor<T>(fun: impl FnOnce(&Runtime) -> T) -> T {
             .expect("failed to create a new tokio runtime");
     }
 
-    RUNTIME.with(fun)
+    RUNTIME.with(|rt| {
+        let _scope = rt.enter();
+        fun(rt)
+    })
 }
