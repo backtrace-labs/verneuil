@@ -1174,6 +1174,25 @@ impl ReplicationBuffer {
         Ok(())
     }
 
+    /// Returns true if there is definitely a ready manifest file for
+    /// `db_path`.
+    pub fn has_ready_manifest(&self, db_path: &Path) -> bool {
+        let src = || -> Result<PathBuf> {
+            let mut src = self.spooling_directory.clone();
+            src.push(READY);
+            src = append_subdirectory(src);
+            src.push(META);
+            src.push(&percent_encode_local_path_uri(db_path)?);
+
+            Ok(src)
+        };
+
+        match src() {
+            Ok(src) => std::fs::symlink_metadata(&src).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     /// Attempts to parse the current "consuming" manifest file.
     #[instrument(level = "trace", err)]
     pub fn read_consuming_manifest(&self, db_path: &Path) -> Result<Option<Manifest>> {

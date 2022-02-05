@@ -632,12 +632,8 @@ impl Tracker {
         };
 
         let mut published = false;
-        // If we can publish a new ready manifest, try to do so.
-        if matches!(
-            buf.read_ready_manifest(&self.path)
-                .map_err(|e| chain_info!(e, "failed to read ready manifest", path=?self.path)),
-            Ok(None)
-        ) {
+        // Unless there obviously is a ready manifest, try to publish our own.
+        if !buf.has_ready_manifest(&self.path) {
             let ready = buf.prepare_ready_buffer(&chunks)?;
 
             published = buf
