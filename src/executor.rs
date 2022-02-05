@@ -23,3 +23,11 @@ pub(crate) fn call_with_executor<T>(fun: impl FnOnce(&Runtime) -> T) -> T {
         fun(rt)
     })
 }
+
+/// Invokes `fun` within the context of the current thread's executor,
+/// and blocks on the resulting future.
+pub(crate) fn block_on_with_executor<T, F: std::future::Future<Output = T>>(
+    fun: impl FnOnce() -> F,
+) -> T {
+    call_with_executor(|rt| rt.block_on(fun()))
+}
