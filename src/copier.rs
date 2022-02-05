@@ -1810,7 +1810,9 @@ impl CopierWorker {
         let (mut chunks, base) = parse_manifest_chunks(&tap_file, &targets.replication_targets)?;
         let mut rng = rand::thread_rng();
 
-        chunks.extend(base);
+        if let Some(base) = base.as_ref() {
+            chunks.push(base.fprint());
+        }
 
         // Touch that fraction of the chunks list, with randomised
         // rounding for any fractional number of chunks: rounding

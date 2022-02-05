@@ -22,6 +22,7 @@ use crate::copier::Copier;
 use crate::drop_result;
 use crate::fresh_error;
 use crate::fresh_warn;
+use crate::loader::Chunk;
 use crate::manifest_schema::clear_version_id;
 use crate::manifest_schema::extract_version_id;
 use crate::manifest_schema::fingerprint_file_chunk;
@@ -464,7 +465,7 @@ impl Tracker {
     }
 
     /// Reads the current staged manifest, if any.
-    fn read_current_manifest(&self) -> Result<Option<Manifest>> {
+    fn read_current_manifest(&self) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
         let buf = &self.buffer;
         let mut builder = kismet_cache::CacheBuilder::new();
 
@@ -521,7 +522,7 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let mut current_manifest: Option<Manifest> = self
+        let mut current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
             .read_current_manifest()
             .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
             .ok()
@@ -539,7 +540,7 @@ impl Tracker {
         if self.backing_file_state == MutationState::Dirty {
             let mut up_to_date = false;
 
-            if let Some(manifest) = &current_manifest {
+            if let Some((manifest, _)) = &current_manifest {
                 if let Some(v1) = &manifest.v1 {
                     // The current snapshot seems to have everything
                     // up to our last write transaction.  We can use that!
@@ -595,7 +596,7 @@ impl Tracker {
             // to do.  We don't even have to update "ready": the `Copier`
             // will read from the staging directory when we don't change it.
             if !version_id.is_empty() {
-                if let Some(manifest) = &current_manifest {
+                if let Some((manifest, _)) = &current_manifest {
                     if matches!(&manifest.v1, Some(v1) if v1.version_id == version_id) {
                         return Ok(());
                     }
@@ -618,7 +619,7 @@ impl Tracker {
 
         // Try to get an initial list of chunks to work off.
         let mut base_fprints = None;
-        if let Some(manifest) = current_manifest {
+        if let Some((manifest, _)) = current_manifest {
             if let Some(v1) = manifest.v1 {
                 base_fprints = rebuild_chunk_fprints(&v1.chunks);
             }
@@ -863,14 +864,14 @@ impl Tracker {
     /// every chunk in that snapshot.
     fn validate_snapshot(
         &self,
-        manifest_or: crate::result::Result<Option<Manifest>>,
+        manifest_or: crate::result::Result<Option<(Manifest, Option<Arc<Chunk>>)>>,
         source: ChunkSource,
     ) -> Result<()> {
         let manifest = match manifest_or {
             // If the manifest file can't be found, assume it was
             // replicated correctly, and checked earlier.
             Ok(None) => return Ok(()),
-            Ok(Some(manifest)) => manifest,
+            Ok(Some((manifest, _))) => manifest,
             Err(err) => return Err(err),
         };
 
@@ -954,7 +955,7 @@ impl Tracker {
         };
 
         let mut hasher = Params::new().hash_length(32).to_state();
-        let manifest = self
+        let (manifest, _) = self
             .read_current_manifest()
             .expect("manifest must parse")
             .expect("manifest must exist");

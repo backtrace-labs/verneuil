@@ -147,6 +147,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -162,6 +163,7 @@ use crate::filtered_io_error;
 use crate::fresh_error;
 use crate::fresh_info;
 use crate::instance_id;
+use crate::loader::Chunk;
 use crate::manifest_schema::Manifest;
 use crate::ofd_lock::OfdLock;
 use crate::process_id::process_id;
@@ -872,7 +874,7 @@ fn read_manifest_at_path(
     file_path: &Path,
     cache_builder: kismet_cache::CacheBuilder,
     targets: &[ReplicationTarget],
-) -> Result<Option<Manifest>> {
+) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
     use std::io::Read;
 
     let mut file = match std::fs::File::open(file_path) {
@@ -886,7 +888,7 @@ fn read_manifest_at_path(
         .map_err(|e| chain_error!(e, "failed to read manifest", ?file_path))?;
 
     match Manifest::decode_and_validate(&*contents, cache_builder, Some(targets), file_path) {
-        Ok((manifest, _base)) => Ok(Some(manifest)),
+        Ok(ret) => Ok(Some(ret)),
         Err(e) => {
             use std::os::unix::fs::MetadataExt;
 
@@ -1232,14 +1234,16 @@ impl ReplicationBuffer {
         }
     }
 
-    /// Attempts to parse the current "consuming" manifest file.
+    /// Attempts to parse the current "consuming" manifest file, and
+    /// returns the current base chunk for the list of chunk
+    /// fingerprints, if any.
     #[instrument(level = "trace", err)]
     pub fn read_consuming_manifest(
         &self,
         db_path: &Path,
         cache_builder: kismet_cache::CacheBuilder,
         targets: &[ReplicationTarget],
-    ) -> Result<Option<Manifest>> {
+    ) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
         let mut src = self.spooling_directory.clone();
         src.push(CONSUMING);
         src = append_subdirectory(src);
@@ -1248,14 +1252,16 @@ impl ReplicationBuffer {
         read_manifest_at_path(&src, cache_builder, targets)
     }
 
-    /// Attempts to parse the current ready manifest file.
+    /// Attempts to parse the current ready manifest file, and
+    /// returns the current base chunk for the list of chunk
+    /// fingerprints, if any.
     #[instrument(level = "trace", err)]
     pub fn read_ready_manifest(
         &self,
         db_path: &Path,
         cache_builder: kismet_cache::CacheBuilder,
         targets: &[ReplicationTarget],
-    ) -> Result<Option<Manifest>> {
+    ) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
         let mut src = self.spooling_directory.clone();
         src.push(READY);
         src = append_subdirectory(src);
@@ -1264,14 +1270,16 @@ impl ReplicationBuffer {
         read_manifest_at_path(&src, cache_builder, targets)
     }
 
-    /// Attempts to parse the current staged manifest file.
+    /// Attempts to parse the current staged manifest file, and
+    /// returns the current base chunk for the list of chunk
+    /// fingerprints, if any.
     #[instrument(level = "trace", err)]
     pub fn read_staged_manifest(
         &self,
         db_path: &Path,
         cache_builder: kismet_cache::CacheBuilder,
         targets: &[ReplicationTarget],
-    ) -> Result<Option<Manifest>> {
+    ) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
