@@ -34,6 +34,7 @@ use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
+use crate::executor::block_on_with_executor;
 use crate::executor::call_with_executor;
 use crate::filtered_io_error;
 use crate::fresh_error;
@@ -657,7 +658,7 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
 /// Creates `bucket` if it does not already exists.
 #[instrument(level = "debug", skip(bucket), err)]
 fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
-    let bucket_location = bucket.location_blocking().map_err(|e| {
+    let bucket_location = block_on_with_executor(|| bucket.location()).map_err(|e| {
         chain_debug!(
             e,
             "failed to get buccket location",
@@ -669,16 +670,23 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
         return Ok(());
     }
 
-    let result = if bucket.is_subdomain_style() {
-        Bucket::create_blocking
-    } else {
-        Bucket::create_with_path_style_blocking
-    }(
-        &bucket.name(),
-        bucket.region(),
-        bucket.credentials().clone(),
-        s3::bucket_ops::BucketConfiguration::private(),
-    );
+    let result = call_with_executor(|rt| {
+        if bucket.is_subdomain_style() {
+            rt.block_on(Bucket::create(
+                &bucket.name(),
+                bucket.region(),
+                bucket.credentials().clone(),
+                s3::bucket_ops::BucketConfiguration::private(),
+            ))
+        } else {
+            rt.block_on(Bucket::create_with_path_style(
+                &bucket.name(),
+                bucket.region(),
+                bucket.credentials().clone(),
+                s3::bucket_ops::BucketConfiguration::private(),
+            ))
+        }
+    });
 
     match result {
         Ok(response)
@@ -901,11 +909,9 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
             match call_with_slow_logging(
                 Duration::from_secs(10),
                 || {
-                    target.put_object_with_content_type_blocking(
-                        &blob_name,
-                        &[],
-                        CHUNK_CONTENT_TYPE,
-                    )
+                    block_on_with_executor(|| {
+                        target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE)
+                    })
                 },
                 |duration| tracing::info!(?duration, ?blob_name, "slow S3 COPY"),
             ) {
