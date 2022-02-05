@@ -1807,8 +1807,10 @@ impl CopierWorker {
             / PATROL_TOUCH_PERIOD.as_secs_f64())
         .clamp(0.0, 1.0);
         let tap_file = replication_buffer::construct_tapped_manifest_path(spool_path, source)?;
-        let mut chunks = parse_manifest_chunks(&tap_file, &targets.replication_targets)?;
+        let (mut chunks, base) = parse_manifest_chunks(&tap_file, &targets.replication_targets)?;
         let mut rng = rand::thread_rng();
+
+        chunks.extend(base);
 
         // Touch that fraction of the chunks list, with randomised
         // rounding for any fractional number of chunks: rounding
