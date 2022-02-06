@@ -102,16 +102,42 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
 /// in the manifest.
 fn reencode_flattened_chunks(
     repl: &ReplicationBuffer,
-    _prev_base: Option<Arc<Chunk>>,
+    prev_base: Option<Arc<Chunk>>,
     mut chunks: Vec<u64>,
 ) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
-    // Dummy implementation: always publish the list as a base
+    use std::convert::TryInto;
+
+    let mut _non_zero = 0;
+    // Apply `prev_base`, the previous base chunk, to see what's left.
+    if let Some(prev) = prev_base.as_ref() {
+        let base_words = prev
+            .payload()
+            .chunks_exact(std::mem::size_of::<u64>())
+            // Safe to unwrap: we get slices of exactly 8 bytes.
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+
+        for (word, base) in chunks.iter_mut().zip(base_words) {
+            let result = *word ^ base;
+            *word = result;
+
+            _non_zero += (result != 0) as usize;
+        }
+    }
+
+    // Dummy implementation: always publish a new reference chunk
     // reference chunk.
     let mut base = Vec::new();
 
     base.reserve(chunks.len() * std::mem::size_of::<u64>());
     for chunk in chunks.iter() {
         base.extend(chunk.to_le_bytes());
+    }
+
+    // And now un-apply `prev_base`.
+    if let Some(prev) = prev_base {
+        for (base, prev) in base.iter_mut().zip(prev.payload()) {
+            *base ^= prev;
+        }
     }
 
     chunks.fill(0);
