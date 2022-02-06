@@ -148,6 +148,29 @@ impl Chunk {
         Ok(Chunk { fprint, payload })
     }
 
+    /// Returns a chunk (potentially cached) from `payload`.
+    pub(crate) fn arc_from_bytes(payload: &[u8]) -> Arc<Chunk> {
+        let fprint = fingerprint_file_chunk(payload);
+
+        if let Some(ret) = fetch_from_cache(fprint) {
+            return ret;
+        }
+
+        let mut map = memmap2::MmapMut::map_anon(payload.len()).unwrap();
+
+        map.as_mut().copy_from_slice(payload);
+        let ret = Arc::new(
+            Chunk::new(
+                fingerprint_file_chunk(payload),
+                map.make_read_only().unwrap(),
+            )
+            .expect("must build: fingerprint matches"),
+        );
+
+        update_cache(ret.clone());
+        ret
+    }
+
     /// Returns a fresh chunk for `fprint`.
     #[cfg(test)]
     pub(crate) fn new_from_bytes(payload: &[u8]) -> Chunk {
