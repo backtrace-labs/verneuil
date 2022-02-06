@@ -300,6 +300,17 @@ struct CopierSpoolState {
     // Copier workers attempt to acquire this mutex before processing
     // the spool path's contents.
     upload_lock: Mutex<CopierUploadState>,
+
+    // A shared mutable cell to retain the most recent base chunk for
+    // this db's manifest.  Keeping this chunk alive guarantees we can
+    // find it in the global cache, and thus avoids useless GETs.
+    //
+    // We `Arc` the `Mutex` because we want to capture a reference to
+    // the `Mutex` in a closure, and the lifetime gets complex.  The
+    // inner value, `Arc<Chunk>`, is refcounted because that's how the
+    // loader subsystem manages its cache, but should be treated as an
+    // opaque token that we only keep around to delay its `Drop::drop`.
+    recent_base_chunk: Arc<Mutex<Option<Arc<crate::loader::Chunk>>>>,
 }
 
 type DateTime = chrono::DateTime<chrono::Utc>;
@@ -1774,7 +1785,7 @@ impl CopierWorker {
         Ok(did_something)
     }
 
-    /// Attempts to touch a small pseudrandom subset of the chunks
+    /// Attempts to touch a small pseudorandom subset of the chunks
     /// referred by the latest uploaded manifest.
     ///
     /// Only errors out if we successfully connected to remote storage
@@ -1784,6 +1795,7 @@ impl CopierWorker {
         &self,
         spool_path: &Path,
         source: &Path,
+        recent_base_chunk: Arc<Mutex<Option<Arc<crate::loader::Chunk>>>>,
         time_since_last_patrol: Duration,
     ) -> Result<()> {
         use rand::seq::SliceRandom;
@@ -1829,6 +1841,10 @@ impl CopierWorker {
         if let Some(base) = base.as_ref() {
             chunks.push(base.fprint());
         }
+
+        // And always overwrite the base chunk with the one we just
+        // found (or `None`).
+        *recent_base_chunk.lock().unwrap() = base;
 
         // Touch that fraction of the chunks list, with randomised
         // rounding for any fractional number of chunks: rounding
@@ -1952,11 +1968,13 @@ impl CopierWorker {
             if last_scanned > SystemTime::UNIX_EPOCH {
                 let spool_path = state.spool_path.clone();
                 let source = state.source.clone();
+                let recent_base_chunk = state.recent_base_chunk.clone();
 
                 Some(move |this: &CopierWorker| {
                     if let Err(e) = this.patrol_touch_chunks(
                         &spool_path,
                         &source,
+                        recent_base_chunk,
                         SystemTime::now()
                             .duration_since(last_scanned)
                             .unwrap_or_default(),
