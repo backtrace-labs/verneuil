@@ -15,7 +15,14 @@ use crate::loader::Chunk;
 use crate::loader::Loader;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
+use crate::unzstd::try_to_unzstd;
 use crate::warn_from_os;
+
+/// Size limit for manifests after decompression.
+///
+/// Even a 1TB database fits its manifest in slightly more than 256 MB
+/// (2**28 bytes), so this ought to be large enough.
+const MANIFEST_SIZE_LIMIT: usize = 3usize << 27;
 
 /// A umash fingerprint.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -132,11 +139,17 @@ pub struct ManifestV1 {
 pub struct Manifest {
     #[prost(message, tag = "1")]
     pub v1: Option<ManifestV1>,
+    // If we ever have a field #5 in this toplevel `Manifest` message,
+    // it must not be a varint: that could result in protobuf bytes
+    // that match the zstd magic header (whose first byte is 0x28).
+    //
+    // In fact, we might want to consider marking 5 as reserved, or
+    // guarantee we'll always zstd-compress manifest blob contents.
 }
 
 impl Manifest {
-    /// Attempts to decode the protobuf bytes in `buf` and
-    /// rejects clearly invalid data.
+    /// Attempts to decode the protobuf bytes in `buf`, potentially
+    /// after zstd-decompression, and rejects clearly invalid data.
     ///
     /// Uses the `targets` to fetch the base chunk if any is defined
     /// in the return `Manifest`.  If there is such a chunk, it will
@@ -158,8 +171,22 @@ impl Manifest {
         use prost::Message;
         use std::convert::TryInto;
 
-        let mut manifest = Manifest::decode(buf)
-            .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?description))?;
+        let try_parse = |buf: &[u8]| -> Result<Manifest> {
+            Manifest::decode(buf)
+                .map_err(|e| chain_error!(e, "failed to parse proto manifest", ?description))
+        };
+
+        let mut manifest = match try_to_unzstd(buf, MANIFEST_SIZE_LIMIT) {
+            None => try_parse(buf)?,
+            Some(Err(e)) => {
+                if let Ok(manifest) = try_parse(buf) {
+                    manifest
+                } else {
+                    return Err(chain_error!(e, "failed to unzstd manifest", ?description));
+                }
+            }
+            Some(Ok(decoded)) => try_parse(&decoded)?,
+        };
 
         let mut base_chunk = None;
 
