@@ -190,12 +190,14 @@ const REPLICATION_LAG_REPORT_THRESHOLD: Duration = Duration::from_secs(120);
 /// Time background "touch" to fully cover each db file once per period.
 const PATROL_TOUCH_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
-/// Compression level for zstd. 0 maps to zstd's internal default
-/// compression level.
-const ZSTD_COMPRESSION_LEVEL: i32 = 0;
+/// Zstd compression level for chunk data. 0 maps to zstd's internal
+/// default compression level.
+const CHUNK_COMPRESSION_LEVEL: i32 = 0;
 
-/// Disable compression with a negative level value.
-const ZSTD_COMPRESSION_DISABLE: i32 = -1;
+/// Fast compression level.  We use this zstd level for manifests
+/// because we expect data to either be incompressible, or feature
+/// long spans of trivially compressible 0s.
+const FAST_COMPRESSION_LEVEL: i32 = 1;
 
 lazy_static::lazy_static! {
     static ref RECENT_WORK: Mutex<RecentWorkSet> = Mutex::new(RecentWorkSet::new(COPY_REQUEST_MEMORY, COPY_REQUEST_JITTER));
@@ -1292,7 +1294,7 @@ impl CopierWorker {
                     let chunks_buckets = chunks_buckets.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets)
+                        copy_file(&name, &mut file, CHUNK_COMPRESSION_LEVEL, &chunks_buckets)
                             .await?;
                         RECENT_WORK.lock().unwrap().observe(&work_unit);
                         Ok(())
@@ -1331,8 +1333,7 @@ impl CopierWorker {
                     let parent = parent.to_owned();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
-                            .await?;
+                        copy_file(&name, &mut file, FAST_COMPRESSION_LEVEL, &meta_buckets).await?;
                         replication_buffer::tap_manifest_file(&parent, &name, &mut file).map_err(
                             |e| {
                                 chain_warn!(
@@ -1467,7 +1468,7 @@ impl CopierWorker {
                     let chunks_buckets = chunks_buckets.clone();
                     let force_meta = force_meta.clone();
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, ZSTD_COMPRESSION_LEVEL, &chunks_buckets)
+                        copy_file(&name, &mut file, CHUNK_COMPRESSION_LEVEL, &chunks_buckets)
                             .await?;
                         // Always upload the contents of the meta
                         // directory if we found chunks to upload.
@@ -1579,8 +1580,7 @@ impl CopierWorker {
                     let recent_staged_directories = state.recent_staged_directories.clone();
 
                     Ok(Some(async move {
-                        copy_file(&name, &mut file, ZSTD_COMPRESSION_DISABLE, &meta_buckets)
-                            .await?;
+                        copy_file(&name, &mut file, FAST_COMPRESSION_LEVEL, &meta_buckets).await?;
                         replication_buffer::tap_manifest_file(&parent, &name, &mut file).map_err(
                             |e| {
                                 chain_warn!(
