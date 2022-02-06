@@ -81,6 +81,11 @@ pub(crate) struct Tracker {
     // The version id we observed at the beginning of the write
     // transaction, if any.
     previous_version_id: Vec<u8>,
+
+    // A shared mutable cell to retain the most recent base chunk for
+    // this db's manifest.  Keeping this chunk alive guarantees we can
+    // find it in the global cache, and thus avoids useless GETs.
+    recent_base_chunk: Option<Arc<crate::loader::Chunk>>,
 }
 
 fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
@@ -98,7 +103,7 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
 fn reencode_flattened_chunks(
     repl: &ReplicationBuffer,
     mut chunks: Vec<u64>,
-) -> Result<(Vec<u64>, Option<Fingerprint>)> {
+) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
     // Dummy implementation: always publish the list as a base
     // reference chunk.
     let mut base = Vec::new();
@@ -110,9 +115,11 @@ fn reencode_flattened_chunks(
 
     chunks.fill(0);
 
-    let base_fprint = fingerprint_file_chunk(&base);
-    repl.stage_chunk(base_fprint, &base)?;
-    Ok((chunks, Some(base_fprint)))
+    let base_chunk = Chunk::arc_from_bytes(&base);
+    std::mem::drop(base);
+
+    repl.stage_chunk(base_chunk.fprint(), base_chunk.payload())?;
+    Ok((chunks, Some(base_chunk)))
 }
 
 fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
@@ -187,6 +194,7 @@ impl Tracker {
             dirty_chunks: BTreeMap::new(),
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
+            recent_base_chunk: None,
         }))
     }
 
@@ -514,7 +522,7 @@ impl Tracker {
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     #[instrument(skip(self), err)]
-    fn snapshot_file_contents(&self) -> Result<()> {
+    fn snapshot_file_contents(&mut self) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
         let buf = &self.buffer;
@@ -668,6 +676,9 @@ impl Tracker {
             let flattened = flatten_chunk_fprints(&chunks);
             let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
             let (compressible, base_chunk) = reencode_flattened_chunks(&self.buffer, flattened)?;
+
+            let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
+
             let manifest = Manifest {
                 v1: Some(ManifestV1 {
                     header_fprint: Some(header_fprint.into()),
@@ -676,19 +687,24 @@ impl Tracker {
                     len,
                     ctime,
                     ctime_ns,
-                    base_chunks_fprint: base_chunk.map(|fp| fp.into()),
+                    base_chunks_fprint: base_fprint.map(|fp| fp.into()),
                     chunks: compressible,
                 }),
             };
 
             buf.publish_manifest(&self.path, &manifest)?;
 
-            if let Some(base_chunk) = base_chunk {
+            // We published our new manifest, we should find a
+            // reference to `base_chunk` the next time we load the
+            // staged manifest.
+            self.recent_base_chunk = base_chunk;
+
+            if let Some(base_fprint) = base_fprint {
                 copied += 1;
-                chunks.push(base_chunk);
+                chunks.push(base_fprint);
             }
 
-            (copied, chunks, base_chunk)
+            (copied, chunks, base_fprint)
         };
 
         let mut published = false;
