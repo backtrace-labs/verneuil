@@ -59,7 +59,10 @@ const LOADER_POOL_SIZE: usize = 10;
 
 /// Size limit for chunks after decompression.  We expect
 /// all real chunks to be strictly shorter.
-const DECODED_CHUNK_SIZE_LIMIT: usize = 1usize << 20;
+///
+/// Even a base chunk for a 1TB database only needs 256 MB (2**28
+/// bytes) for its references to data chunks.
+const DECODED_CHUNK_SIZE_LIMIT: usize = 3usize << 27;
 
 /// A zstd frame starts with 0xFD2FB528 in 4 little-endian bytes.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
