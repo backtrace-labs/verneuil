@@ -15,6 +15,7 @@ mod snapshot_vfs_ops;
 mod sqlite_code;
 mod sqlite_lock_level;
 mod tracker;
+mod unzstd;
 mod vfs_ops;
 
 use std::ffi::CStr;

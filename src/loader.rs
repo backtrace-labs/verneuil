@@ -26,6 +26,7 @@ use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
+use crate::unzstd::try_to_unzstd;
 
 /// Writers clean up stale manifests in `.tap` on startup, but could
 /// miss some.  We also try to touch these manifest files fairly
@@ -63,9 +64,6 @@ const LOADER_POOL_SIZE: usize = 10;
 /// Even a base chunk for a 1TB database only needs 256 MB (2**28
 /// bytes) for its references to data chunks.
 const DECODED_CHUNK_SIZE_LIMIT: usize = 3usize << 27;
-
-/// A zstd frame starts with 0xFD2FB528 in 4 little-endian bytes.
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Debug)]
 pub struct Chunk {
@@ -413,31 +411,13 @@ fn maybe_decompress(payload: Vec<u8>, fprint: Fingerprint) -> Result<Vec<u8>> {
         }
     };
 
-    let decompress = |payload: &[u8]| -> std::io::Result<Vec<u8>> {
-        use std::io::Read;
-
-        let mut decoder = zstd::Decoder::new(&*payload)?;
-        let mut decompressed = vec![0; DECODED_CHUNK_SIZE_LIMIT];
-
-        match decoder.read(&mut decompressed) {
-            Ok(n) if n < DECODED_CHUNK_SIZE_LIMIT => {
-                decompressed.resize(n, 0u8);
-                decompressed.shrink_to_fit();
-                Ok(decompressed)
-            }
-            Ok(_) => Err(std::io::Error::new(
-                ErrorKind::Other,
-                "decoded zstd data >= DECODED_CHUNK_SIZE_LIMIT",
-            )),
-            Err(e) => Err(e),
-        }
+    let decompression_result = if let Some(r) = try_to_unzstd(&payload, DECODED_CHUNK_SIZE_LIMIT) {
+        r
+    } else {
+        return Ok(payload);
     };
 
-    if !payload.starts_with(&ZSTD_MAGIC) {
-        return Ok(payload);
-    }
-
-    match decompress(&payload) {
+    match decompression_result {
         Ok(decompressed) => {
             match compare_hash(&decompressed) {
                 Ok(()) => Ok(decompressed),
