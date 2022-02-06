@@ -61,9 +61,10 @@ const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
 /// We want to guarantee a low average rate (e.g., 30 per second)
 /// to bound our costs, but also avoid slowing down replication in
 /// the common case, when write transactions are rare.
+const COPY_RATE: NonZeroU32 = unsafe { NonZeroU32::new_unchecked(30) };
+
 const COPY_RATE_QUOTA: governor::Quota =
-    governor::Quota::per_second(unsafe { NonZeroU32::new_unchecked(30) })
-        .allow_burst(unsafe { NonZeroU32::new_unchecked(100) });
+    governor::Quota::per_second(COPY_RATE).allow_burst(unsafe { NonZeroU32::new_unchecked(100) });
 
 /// Rate limit when copying synchronously.
 ///
@@ -93,12 +94,6 @@ const COPY_RETRY_BASE_WAIT: Duration = Duration::from_millis(100);
 /// consecutive failures.
 const COPY_RETRY_MULTIPLIER: f64 = 10.0;
 
-/// Remember up to this many recent copy requests for deduplication.
-///
-/// This value should ideally be proportional to the maximum copy rate
-/// (`COPY_RATE_QUOTA`) and `COPY_REQUEST_MIN_AGE`.
-const COPY_REQUEST_MEMORY: usize = 30 * 3600;
-
 /// Avoid executing duplicate copy requests that are separated by less
 /// than `COPY_REQUEST_MIN_AGE`.
 const COPY_REQUEST_MIN_AGE: Duration = Duration::from_secs(3600);
@@ -106,6 +101,17 @@ const COPY_REQUEST_MIN_AGE: Duration = Duration::from_secs(3600);
 /// When comparing against `COPY_REQUEST_MIN_AGE`, jitter the
 /// timestamp by up to this duration.
 const COPY_REQUEST_JITTER: Duration = Duration::from_secs(600);
+
+/// Remember up to this many recent copy requests for deduplication.
+///
+/// We would like to scale `COPY_REQUEST_MIN_AGE /
+/// COPY_RATE_QUOTA.replenish_interval()`, but `const` isn't there
+/// yet.  The memory size is a bit larger than the number of uploads
+/// we expect during `COPY_REQUEST_MIN_AGE` to avoid spuriously losing
+/// useful entries to LRU... but we still want a bound on the capacity,
+/// because unbounded data structures are a bad idea.
+const COPY_REQUEST_MEMORY: usize =
+    (1.5 * (COPY_RATE.get() as f64) * (COPY_REQUEST_MIN_AGE.as_secs() as f64)) as usize;
 
 /// Perform background work for one spooling directory approximately
 /// once per BACKGROUND_SCAN_PERIOD.
