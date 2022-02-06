@@ -102,6 +102,7 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
 /// in the manifest.
 fn reencode_flattened_chunks(
     repl: &ReplicationBuffer,
+    _prev_base: Option<Arc<Chunk>>,
     mut chunks: Vec<u64>,
 ) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
     // Dummy implementation: always publish the list as a base
@@ -649,8 +650,8 @@ impl Tracker {
 
         // Try to get an initial list of chunks to work off.
         let mut base_fprints = None;
-        if let Some((manifest, _)) = current_manifest {
-            if let Some(v1) = manifest.v1 {
+        if let Some((manifest, _)) = current_manifest.as_ref() {
+            if let Some(v1) = &manifest.v1 {
                 base_fprints = rebuild_chunk_fprints(&v1.chunks);
             }
         }
@@ -675,7 +676,11 @@ impl Tracker {
 
             let flattened = flatten_chunk_fprints(&chunks);
             let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
-            let (compressible, base_chunk) = reencode_flattened_chunks(&self.buffer, flattened)?;
+            let (compressible, base_chunk) = reencode_flattened_chunks(
+                &self.buffer,
+                current_manifest.map(|x| x.1).flatten(),
+                flattened,
+            )?;
 
             let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
 
