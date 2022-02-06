@@ -199,6 +199,11 @@ const CHUNK_COMPRESSION_LEVEL: i32 = 0;
 /// long spans of trivially compressible 0s.
 const FAST_COMPRESSION_LEVEL: i32 = 1;
 
+/// When the raw data is at least this large, convert default (0)
+/// compression to `FAST_COMPRESSION_LEVEL`: we assume that's not
+/// sqlite db data, and probably incompressible.
+const FAST_COMPRESSION_AUTO_SIZE: usize = (crate::tracker::SNAPSHOT_GRANULARITY as usize) + 1;
+
 lazy_static::lazy_static! {
     static ref RECENT_WORK: Mutex<RecentWorkSet> = Mutex::new(RecentWorkSet::new(COPY_REQUEST_MEMORY, COPY_REQUEST_JITTER));
 }
@@ -808,6 +813,17 @@ async fn copy_file(
         .map_err(|e| chain_error!(e, "failed to read file contents", ?blob_name))?;
 
     if level >= 0 {
+        // `level == 0` tells zstd to use its internal default
+        // compression level.  If the input bytes are larger than the
+        // maximum we expect for a db chunk, assume it's probably
+        // fingerprints (incompressible), and override that by telling
+        // zstd to optimise for speed over quality.
+        let level = if level == 0 && bytes.len() >= FAST_COMPRESSION_AUTO_SIZE {
+            FAST_COMPRESSION_LEVEL
+        } else {
+            level
+        };
+
         match zstd::encode_all(bytes.as_slice(), level) {
             Ok(encoded) => bytes = encoded,
             Err(e) => tracing::warn!(?e, "failed to zstd-compress data"),
