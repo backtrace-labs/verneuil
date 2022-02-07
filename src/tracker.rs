@@ -488,6 +488,31 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
 
 // This impl block has all the snapshot update logic.
 impl Tracker {
+    /// Computes the new fingerprint for the sqlite header.
+    ///
+    /// Returns Ok(None) if the sqlite file is empty (i.e., not created
+    /// yet).
+    fn generate_header_fprint(&self) -> Result<Option<Fingerprint>> {
+        match fingerprint_sqlite_header(&self.file) {
+            Some(fprint) => Ok(Some(fprint)),
+            None => {
+                if let Ok(meta) = self.file.metadata() {
+                    if meta.len() == 0 {
+                        // If the file is empty, the failure is
+                        // benign.  Make sure the next snapshot
+                        // definitely starts from scratch.
+                        clear_version_id(&self.file).map_err(|e| {
+                            chain_error!(e, "failed to clear version xattr on empty db file")
+                        })?;
+                        return Ok(None);
+                    }
+                }
+
+                Err(fresh_warn!("invalid db file", path=?self.path))
+            }
+        }
+    }
+
     /// Snapshots all the 64KB chunks in the tracked file, and returns
     /// the file's size as well, a list of chunk fingerprints, and the
     /// number of chunks that were actually snapshotted.
@@ -688,23 +713,11 @@ impl Tracker {
         use std::os::unix::fs::MetadataExt;
 
         let buf = &self.buffer;
-        let header_fprint = match fingerprint_sqlite_header(&self.file) {
+        let header_fprint = match self.generate_header_fprint()? {
             Some(fprint) => fprint,
-            None => {
-                if let Ok(meta) = self.file.metadata() {
-                    if meta.len() == 0 {
-                        // If the file is empty, the failure is
-                        // benign.  Make sure the next snapshot
-                        // definitely starts from scratch.
-                        clear_version_id(&self.file).map_err(|e| {
-                            chain_error!(e, "failed to clear version xattr on empty db file")
-                        })?;
-                        return Ok(());
-                    }
-                }
-
-                return Err(fresh_warn!("invalid db file", path=?self.path));
-            }
+            // If there's no header, we don't have a sqlite DB file to
+            // snapshot yet.
+            None => return Ok(()),
         };
 
         let version_id = extract_version_id(&self.file, Some(header_fprint), Vec::new());
