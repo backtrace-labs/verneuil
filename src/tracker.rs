@@ -910,6 +910,48 @@ impl Tracker {
         self.chunk_counter.store(0, Ordering::Relaxed);
     }
 
+    /// Potentially performs a GC that keeps around all the `chunks`
+    /// used in the manifest we just staged.
+    ///
+    /// We only perform that GC from time to time to amortise the cost
+    /// of listing all the staged chunks, the chunks we won't delete,
+    /// in particular.
+    fn maybe_partial_gc(&self, copied: usize, chunks: Vec<Fingerprint>) {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+        // Always increment the chunk counter by at least one:
+        // we did *some* work here.
+        let work = (copied as u64).saturating_add(1);
+        let total_count = self
+            .chunk_counter
+            .fetch_add(work, Ordering::Relaxed)
+            .saturating_add(work);
+
+        // If the ready buffer is stale, we can only remove
+        // now-useless chunks, with probability slightly
+        // greater than copied / chunks.len(): a GC wastes
+        // time linear in `chunks.len()` (the time it takes to
+        // scan chunks we don't want to delete), so we
+        // amortise that with randomised counting.
+        //
+        // We trigger a gc with low probability even when
+        // `copied == 0` to help eventually clear up unused
+        // chunks.  The probability is low enough that we can
+        // amortise the wasted work as constant overhead for
+        // each call to `snapshot_file_contents`.
+        //
+        // We also trigger based on a deterministic counter, but
+        // hopefully much more rarely than via the random
+        // criterion: we want to avoid really long delays between
+        // GCs, however unlikely they may be.
+        if copied >= rng.gen_range(0..=chunks.len() / 4) || total_count / 2 >= chunks.len() as u64 {
+            drop_result!(self.buffer.gc_chunks(&chunks),
+                         e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
+            self.chunk_counter.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -956,49 +998,13 @@ impl Tracker {
         // We did something.  Tell the copier.
         self.copier.signal_ready_buffer();
 
-        let buf = &self.buffer;
-
         // GC is opportunistic, failure is OK.  What's important to
         // the copier is that we only remove chunks after attempting
         // to publish the ready buffer.
         if published {
             self.full_gc(base_chunk);
         } else {
-            use rand::Rng;
-
-            let mut rng = rand::thread_rng();
-            // Always increment the chunk counter by at least one:
-            // we did *some* work here.
-            let work = (copied as u64).saturating_add(1);
-            let total_count = self
-                .chunk_counter
-                .fetch_add(work, Ordering::Relaxed)
-                .saturating_add(work);
-
-            // If the ready buffer is stale, we can only remove
-            // now-useless chunks, with probability slightly
-            // greater than copied / chunks.len(): a GC wastes
-            // time linear in `chunks.len()` (the time it takes to
-            // scan chunks we don't want to delete), so we
-            // amortise that with randomised counting.
-            //
-            // We trigger a gc with low probability even when
-            // `copied == 0` to help eventually clear up unused
-            // chunks.  The probability is low enough that we can
-            // amortise the wasted work as constant overhead for
-            // each call to `snapshot_file_contents`.
-            //
-            // We also trigger based on a deterministic counter, but
-            // hopefully much more rarely than via the random
-            // criterion: we want to avoid really long delays between
-            // GCs, however unlikely they may be.
-            if copied >= rng.gen_range(0..=chunks.len() / 4)
-                || total_count / 2 >= chunks.len() as u64
-            {
-                drop_result!(buf.gc_chunks(&chunks),
-                             e => chain_info!(e, "failed to gc staged chunks", path=?self.path));
-                self.chunk_counter.store(0, Ordering::Relaxed);
-            }
+            self.maybe_partial_gc(copied, chunks);
         }
 
         // There is no further work to do while the sqlite read
@@ -1009,7 +1015,7 @@ impl Tracker {
         //
         // Either way, we can delete everything; clean up is
         // also opportunistic, so failure is OK.
-        drop_result!(buf.cleanup_scratch_directory(),
+        drop_result!(self.buffer.cleanup_scratch_directory(),
                      e => chain_info!(e, "failed to clear scratch directory", path=?self.path));
 
         #[cfg(feature = "test_validate_writes")]
