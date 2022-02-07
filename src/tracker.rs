@@ -814,15 +814,78 @@ impl Tracker {
         Ok((len, chunk_fprints, num_snapshotted))
     }
 
+    /// Stages a new snapshot for the db file's current contents,
+    /// based off the current manifest (soon to be previous), if
+    /// applicable.
+    ///
+    /// On success, returns the number of new chunks staged, the list
+    /// of chunks referenced by the new manifest, and the new
+    /// manifest's base chunk (for xor-diffing), if any.
+    fn stage_new_snapshot(
+        &mut self,
+        header_fprint: Fingerprint,
+        version_id: Vec<u8>,
+        current_manifest: Option<(Manifest, Option<Arc<Chunk>>)>,
+    ) -> Result<(usize, Vec<Fingerprint>, Option<Fingerprint>)> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Try to get an initial list of chunks to work off.
+        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
+
+        let (len, mut chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
+
+        let (ctime, ctime_ns) = match self.file.metadata() {
+            Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
+            Err(e) => {
+                let _ = chain_warn!(e, "failed to fetch file metadata", ?self.path);
+                (0, 0)
+            }
+        };
+
+        let flattened = flatten_chunk_fprints(&chunks);
+        let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
+        let (compressible, base_chunk) = reencode_flattened_chunks(
+            &self.buffer,
+            current_manifest.map(|x| x.1).flatten(),
+            flattened,
+        )?;
+
+        let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
+
+        let manifest = Manifest {
+            v1: Some(ManifestV1 {
+                header_fprint: Some(header_fprint.into()),
+                version_id,
+                contents_fprint: Some(manifest_fprint.into()),
+                len,
+                ctime,
+                ctime_ns,
+                base_chunks_fprint: base_fprint.map(|fp| fp.into()),
+                chunks: compressible,
+            }),
+        };
+
+        self.buffer.publish_manifest(&self.path, &manifest)?;
+
+        // We published our new manifest, so we'll probably find a
+        // reference to `base_chunk` the next time we load the
+        // staged manifest.  Let's make sure it remains cached.
+        self.recent_base_chunk = base_chunk;
+
+        if let Some(base_fprint) = base_fprint {
+            copied += 1;
+            chunks.push(base_fprint);
+        }
+
+        Ok((copied, chunks, base_fprint))
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
     /// a sqlite read lock on the db file.
     #[instrument(skip(self), err)]
     fn snapshot_file_contents(&mut self) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
-
-        let buf = &self.buffer;
         let header_fprint = match self.generate_header_fprint()? {
             Some(fprint) => fprint,
             // If there's no header, we don't have a sqlite DB file to
@@ -847,72 +910,17 @@ impl Tracker {
         // We don't *have* to overwrite the .metadata file, but we
         // should create it if it's missing: without that file, the
         // copier can't make progress.
-        buf.ensure_staging_dir(&self.replication_targets, /*overwrite_meta=*/ false);
+        self.buffer
+            .ensure_staging_dir(&self.replication_targets, /*overwrite_meta=*/ false);
 
         // Publish an updated snapshot, and remember the chunks we
         // care about.
-
-        // Try to get an initial list of chunks to work off.
-        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
-
-        // `copied` and `chunks` always take the both
-        // newly-snapshotted chunks and the base chunk into account.
-        //
-        // The base chunk, if any, is also available on its own for
-        // full GCs after publishing: if we just published a new ready
-        // manifest, we can delete all chunks *except the current base
-        // chunk*.
-        let (copied, chunks, base_chunk) = {
-            let (len, mut chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
-
-            let (ctime, ctime_ns) = match self.file.metadata() {
-                Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
-                Err(e) => {
-                    let _ = chain_warn!(e, "failed to fetch file metadata", ?self.path);
-                    (0, 0)
-                }
-            };
-
-            let flattened = flatten_chunk_fprints(&chunks);
-            let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
-            let (compressible, base_chunk) = reencode_flattened_chunks(
-                &self.buffer,
-                current_manifest.map(|x| x.1).flatten(),
-                flattened,
-            )?;
-
-            let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
-
-            let manifest = Manifest {
-                v1: Some(ManifestV1 {
-                    header_fprint: Some(header_fprint.into()),
-                    version_id,
-                    contents_fprint: Some(manifest_fprint.into()),
-                    len,
-                    ctime,
-                    ctime_ns,
-                    base_chunks_fprint: base_fprint.map(|fp| fp.into()),
-                    chunks: compressible,
-                }),
-            };
-
-            buf.publish_manifest(&self.path, &manifest)?;
-
-            // We published our new manifest, so we'll probably find a
-            // reference to `base_chunk` the next time we load the
-            // staged manifest.  Let's make sure it remains cached.
-            self.recent_base_chunk = base_chunk;
-
-            if let Some(base_fprint) = base_fprint {
-                copied += 1;
-                chunks.push(base_fprint);
-            }
-
-            (copied, chunks, base_fprint)
-        };
+        let (copied, chunks, base_chunk) =
+            self.stage_new_snapshot(header_fprint, version_id, current_manifest)?;
 
         let mut published = false;
         // Unless there obviously is a ready manifest, try to publish our own.
+        let buf = &self.buffer;
         if !buf.has_ready_manifest(&self.path) {
             let ready = buf.prepare_ready_buffer(&chunks)?;
 
