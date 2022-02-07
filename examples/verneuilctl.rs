@@ -158,14 +158,13 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
     let manifest_contents = read_manifest()?;
     // Use the global default target lists for the manifest and when
     // fetching its chunks.
-    let manifest = verneuil::Manifest::decode_and_validate(
+    let (manifest, base) = verneuil::Manifest::decode_and_validate(
         &*manifest_contents,
         Default::default(),
         None,
         &cmd.manifest,
-    )?
-    .0;
-    let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest)?;
+    )?;
+    let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest, base)?;
     let reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
     output_reader(reader, &cmd.out)
 }
