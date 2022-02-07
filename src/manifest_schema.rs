@@ -659,10 +659,14 @@ pub(crate) fn extract_manifest_len(manifest: &Manifest) -> Result<u64> {
 /// Returns the list of chunks in the manifest proto at `Path`, along
 /// with the `base_chunks_fprint` if any, or an empty list if there is
 /// no such file.
+///
+/// All fingerprints in the list of chunks that may be satisfied by
+/// the bundled chunks are replaced with `substitute_bundled_fprints`.
 #[instrument]
 pub(crate) fn parse_manifest_chunks(
     path: &std::path::Path,
     replication_targets: &[ReplicationTarget],
+    substitute_for_bundled_fprints: Fingerprint,
 ) -> Result<(Vec<Fingerprint>, Option<Arc<Chunk>>)> {
     match std::fs::read(path) {
         Ok(contents) => {
@@ -672,7 +676,24 @@ pub(crate) fn parse_manifest_chunks(
                 Some(replication_targets),
                 path,
             )?;
-            Ok((extract_manifest_chunks(&manifest)?, base_or))
+            let mut chunks = extract_manifest_chunks(&manifest)?;
+
+            // Overwrite bundled chunks with the substitution fprint.
+            if let Some(v1) = manifest.v1.as_ref() {
+                for bundled in v1.bundled_chunks.iter() {
+                    if let Some(fprint) = bundled.chunk_fprint.as_ref() {
+                        if bundled.chunk_index < chunks.len() as u64 {
+                            let index = bundled.chunk_index as usize;
+
+                            if chunks[index] == fprint.into() {
+                                chunks[index] = substitute_for_bundled_fprints;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok((chunks, base_or))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), None)),
         Err(e) => Err(chain_error!(e, "failed to open manifest proto file", ?path)),

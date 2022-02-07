@@ -1841,7 +1841,15 @@ impl CopierWorker {
             / PATROL_TOUCH_PERIOD.as_secs_f64())
         .clamp(0.0, 1.0);
         let tap_file = replication_buffer::construct_tapped_manifest_path(spool_path, source)?;
-        let (mut chunks, base) = parse_manifest_chunks(&tap_file, &targets.replication_targets)?;
+
+        // Get the chunks, but replace everything that's bundled with
+        // the manifest with a zero fingerprint: we don't have to
+        // fetch bundled chunks, just like zero chunks.
+        let (mut chunks, base) = parse_manifest_chunks(
+            &tap_file,
+            &targets.replication_targets,
+            crate::loader::zero_fingerprint(),
+        )?;
         let mut rng = rand::thread_rng();
 
         if let Some(base) = base.as_ref() {
