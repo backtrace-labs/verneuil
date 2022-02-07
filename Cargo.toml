@@ -45,6 +45,7 @@ mix_ctime_in_version_id = []
 
 no_xattr = []  # Remove the xattr code to simulate feature-poor filesystems.
 
+test_random_chunk_action = []  # Randomly decide what to do with base chunks
 test_vfs = ["blake2b_simd", "tracing-subscriber"]  # Build an archive for sqlite3 tests.
 test_validate_writes = ["test_vfs"]  # Validate snapshots after writes
 test_validate_reads = ["test_vfs"]  # Validate snapshots after reads as well (extra slow)
