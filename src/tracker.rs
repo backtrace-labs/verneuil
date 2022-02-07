@@ -880,6 +880,27 @@ impl Tracker {
         Ok((copied, chunks, base_fprint))
     }
 
+    /// Attempt to publish a new ready manifest if possible.
+    ///
+    /// The current staged manifest must only refer to chunks in
+    /// `chunks`.
+    ///
+    /// Returns whether a new ready manifest was published.
+    fn maybe_update_ready_buffer(&self, chunks: &[Fingerprint]) -> Result<bool> {
+        let buf = &self.buffer;
+
+        // Can't publish a new ready manifest if one already exists.
+        if buf.has_ready_manifest(&self.path) {
+            return Ok(false);
+        }
+
+        let ready = buf.prepare_ready_buffer(chunks)?;
+        Ok(buf
+            .publish_ready_buffer(ready)
+            .map_err(|e| chain_info!(e, "failed to publish ready buffer", path=?self.path))
+            .is_ok())
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -918,23 +939,15 @@ impl Tracker {
         let (copied, chunks, base_chunk) =
             self.stage_new_snapshot(header_fprint, version_id, current_manifest)?;
 
-        let mut published = false;
-        // Unless there obviously is a ready manifest, try to publish our own.
-        let buf = &self.buffer;
-        if !buf.has_ready_manifest(&self.path) {
-            let ready = buf.prepare_ready_buffer(&chunks)?;
-
-            published = buf
-                .publish_ready_buffer(ready)
-                .map_err(|e| chain_info!(e, "failed to publish ready buffer", path=?self.path))
-                .is_ok();
-        }
+        let published = self.maybe_update_ready_buffer(&chunks)?;
 
         #[cfg(feature = "test_validate_reads")]
         self.validate_all_snapshots();
 
         // We did something.  Tell the copier.
         self.copier.signal_ready_buffer();
+
+        let buf = &self.buffer;
 
         // GC is opportunistic, failure is OK.  It's important to
         // the copier that we only remove chunks after attempting
