@@ -92,150 +92,6 @@ pub(crate) struct Tracker {
     recent_base_chunk: Option<Arc<crate::loader::Chunk>>,
 }
 
-fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
-    let mut ret = Vec::with_capacity(fprints.len() * 2);
-
-    for fprint in fprints {
-        ret.extend(&fprint.hash);
-    }
-
-    ret
-}
-
-/// What should we do with the current base chunk fingerprint list?
-enum BaseChunkAction {
-    /// Don't use a base chunk at all.
-    None,
-    /// Reuse the current base chunk.
-    Reuse,
-    /// Generate a new base chunk.
-    Refresh,
-}
-
-impl BaseChunkAction {
-    /// Determines what to do with a previous inherited base chunk
-    /// list.  The `matches` parameter counts the number of
-    /// fingerprints that match between the current chunk fingerprint
-    /// list and the inherited base chunk (i.e., the number of 0
-    /// fingerprints once the two are xor-ed together), and
-    /// `total_size` is the size of the current chunk fingerprint
-    /// list.
-    fn decide(matches: usize, total_size: usize) -> Self {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-
-        // With this feature, we always return a random action to
-        // exercise the rest of the snapshotting code.
-        #[cfg(feature = "test_random_chunk_action")]
-        return match rng.gen_range(0..3) {
-            0 => BaseChunkAction::None,
-            1 => BaseChunkAction::Reuse,
-            _ => BaseChunkAction::Refresh,
-        };
-
-        // If there are enough matches that the random uniform integer
-        // is less than the number of matches, keep the old base chunk.
-        //
-        // We sample from an inclusive range to guarantee there's a
-        // small chance of recreating the base chunk even when
-        // `matches == total_size`.
-        if rng.gen_range(0..=total_size) < matches {
-            BaseChunkAction::Reuse
-        } else if total_size < BASE_CHUNK_MIN_LENGTH {
-            // The list of chunk fingerprints is too short to warrant
-            // a base chunk.  Regenerate to nothing.
-            BaseChunkAction::None
-        } else {
-            BaseChunkAction::Refresh
-        }
-    }
-}
-
-/// Re-encodes `chunks` to expose a more compressible list of `u64`s
-/// in the manifest.
-///
-/// On entry, `chunks` contains the real chunk fingerprints (before
-/// any xor-ing).  The return value holds the chunk fingerprints,
-/// potentially xor-ed with a base chunk.  If a base chunk was xor-ed
-/// in, it's the second return value.
-fn reencode_flattened_chunks(
-    repl: &ReplicationBuffer,
-    prev_base: Option<Arc<Chunk>>,
-    mut chunks: Vec<u64>,
-) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
-    use std::convert::TryInto;
-
-    let apply_prev_base = |chunks: &mut Vec<u64>| {
-        let mut zero = 0;
-        // Apply `prev_base`, the previous base chunk, to see what's left.
-        if let Some(prev) = prev_base.as_ref() {
-            let base_words = prev
-                .payload()
-                .chunks_exact(std::mem::size_of::<u64>())
-                // Safe to unwrap: we get slices of exactly 8 bytes.
-                .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
-
-            for (word, base) in chunks.iter_mut().zip(base_words) {
-                let result = *word ^ base;
-                *word = result;
-
-                zero += (result == 0) as usize;
-            }
-        }
-
-        zero
-    };
-
-    let matches = apply_prev_base(&mut chunks);
-    match BaseChunkAction::decide(matches, chunks.len()) {
-        BaseChunkAction::None => {
-            // Apply `prev_base` again to undo the xors.
-            apply_prev_base(&mut chunks);
-            return Ok((chunks, None));
-        }
-        BaseChunkAction::Reuse => return Ok((chunks, prev_base)),
-        BaseChunkAction::Refresh => {}
-    }
-
-    // Copy the original value of `chunks` in `base`, as little-endian
-    // bytes.
-    let mut base: Vec<u8> = Vec::new();
-
-    base.reserve(chunks.len() * std::mem::size_of::<u64>());
-    for chunk in chunks.iter() {
-        base.extend(chunk.to_le_bytes());
-    }
-
-    // And now un-apply `prev_base`.
-    if let Some(prev) = prev_base {
-        for (base, prev) in base.iter_mut().zip(prev.payload()) {
-            *base ^= prev;
-        }
-    }
-
-    chunks.fill(0);
-
-    let base_chunk = Chunk::arc_from_bytes(&base);
-    std::mem::drop(base);
-
-    repl.stage_chunk(base_chunk.fprint(), base_chunk.payload())?;
-    Ok((chunks, Some(base_chunk)))
-}
-
-fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
-    if (flattened.len() % 2) != 0 {
-        return None;
-    }
-
-    let mut ret = Vec::with_capacity(flattened.len() / 2);
-
-    for i in 0..flattened.len() / 2 {
-        ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
-    }
-
-    Some(ret)
-}
-
 impl Tracker {
     /// Attempts to create a fresh tracker for `fd` at `c_path`.
     ///
@@ -426,6 +282,212 @@ impl Tracker {
         }
     }
 
+    /// Publishes a snapshot of `file` in the replication buffer, if
+    /// it exists.
+    ///
+    /// Must be called with a read lock held on the underlying file.
+    #[instrument(skip(self), err)]
+    pub fn snapshot(&mut self) -> Result<()> {
+        let ret = (|| {
+            #[cfg(feature = "test_validate_reads")]
+            self.validate_all_snapshots();
+            // Nothing to do if we know we're clean.
+            if self.backing_file_state == MutationState::Clean {
+                return Ok(());
+            }
+
+            // We also don't want to replicate if there's a hot
+            // journal: a hot journal can only be present when sqlite
+            // releases its lock if the lock protected a failed
+            // transaction that will be rolled back.
+            if self.has_hot_journal() {
+                // Return an error to make sure we force a full snapshot
+                // for the next transaction on the db file.
+                return Err(fresh_warn!(
+                    "found hot journal while releasing write lock",
+                    path=?self.path, ?self.backing_file_state));
+            }
+
+            let _span = tracing::info_span!(
+                "snapshot",
+                path=?self.path, ?self.backing_file_state);
+            self.snapshot_file_contents()
+        })();
+
+        // Always reset our state after a snapshot attempt.
+        self.cached_uuid.get_or_insert_with(Uuid::new_v4);
+        self.backing_file_state = MutationState::Clean;
+        self.previous_version_id.clear();
+        self.dirty_chunks.clear();
+
+        // If this attempt failed, force the next one to recompute the
+        // state from scratch: we *know* the current replication data
+        // is currently out of sync.
+        if ret.is_err() {
+            drop_result!(clear_version_id(&self.file),
+                         e => chain_error!(e, "failed to clear version xattr after failed snapshot",
+                                           snapshot_err=?ret));
+        }
+
+        ret
+    }
+
+    /// Performs test-only checks before a transaction's initial lock
+    /// acquisition.
+    #[inline]
+    #[instrument(skip(self))]
+    pub fn pre_lock_checks(&self) {
+        #[cfg(feature = "test_validate_reads")]
+        self.validate_all_snapshots();
+    }
+}
+
+fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
+    let mut ret = Vec::with_capacity(fprints.len() * 2);
+
+    for fprint in fprints {
+        ret.extend(&fprint.hash);
+    }
+
+    ret
+}
+
+/// What should we do with the current base chunk fingerprint list?
+enum BaseChunkAction {
+    /// Don't use a base chunk at all.
+    None,
+    /// Reuse the current base chunk.
+    Reuse,
+    /// Generate a new base chunk.
+    Refresh,
+}
+
+impl BaseChunkAction {
+    /// Determines what to do with a previous inherited base chunk
+    /// list.  The `matches` parameter counts the number of
+    /// fingerprints that match between the current chunk fingerprint
+    /// list and the inherited base chunk (i.e., the number of 0
+    /// fingerprints once the two are xor-ed together), and
+    /// `total_size` is the size of the current chunk fingerprint
+    /// list.
+    fn decide(matches: usize, total_size: usize) -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        // With this feature, we always return a random action to
+        // exercise the rest of the snapshotting code.
+        #[cfg(feature = "test_random_chunk_action")]
+        return match rng.gen_range(0..3) {
+            0 => BaseChunkAction::None,
+            1 => BaseChunkAction::Reuse,
+            _ => BaseChunkAction::Refresh,
+        };
+
+        // If there are enough matches that the random uniform integer
+        // is less than the number of matches, keep the old base chunk.
+        //
+        // We sample from an inclusive range to guarantee there's a
+        // small chance of recreating the base chunk even when
+        // `matches == total_size`.
+        if rng.gen_range(0..=total_size) < matches {
+            BaseChunkAction::Reuse
+        } else if total_size < BASE_CHUNK_MIN_LENGTH {
+            // The list of chunk fingerprints is too short to warrant
+            // a base chunk.  Regenerate to nothing.
+            BaseChunkAction::None
+        } else {
+            BaseChunkAction::Refresh
+        }
+    }
+}
+
+/// Re-encodes `chunks` to expose a more compressible list of `u64`s
+/// in the manifest.
+///
+/// On entry, `chunks` contains the real chunk fingerprints (before
+/// any xor-ing).  The return value holds the chunk fingerprints,
+/// potentially xor-ed with a base chunk.  If a base chunk was xor-ed
+/// in, it's the second return value.
+fn reencode_flattened_chunks(
+    repl: &ReplicationBuffer,
+    prev_base: Option<Arc<Chunk>>,
+    mut chunks: Vec<u64>,
+) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
+    use std::convert::TryInto;
+
+    let apply_prev_base = |chunks: &mut Vec<u64>| {
+        let mut zero = 0;
+        // Apply `prev_base`, the previous base chunk, to see what's left.
+        if let Some(prev) = prev_base.as_ref() {
+            let base_words = prev
+                .payload()
+                .chunks_exact(std::mem::size_of::<u64>())
+                // Safe to unwrap: we get slices of exactly 8 bytes.
+                .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+
+            for (word, base) in chunks.iter_mut().zip(base_words) {
+                let result = *word ^ base;
+                *word = result;
+
+                zero += (result == 0) as usize;
+            }
+        }
+
+        zero
+    };
+
+    let matches = apply_prev_base(&mut chunks);
+    match BaseChunkAction::decide(matches, chunks.len()) {
+        BaseChunkAction::None => {
+            // Apply `prev_base` again to undo the xors.
+            apply_prev_base(&mut chunks);
+            return Ok((chunks, None));
+        }
+        BaseChunkAction::Reuse => return Ok((chunks, prev_base)),
+        BaseChunkAction::Refresh => {}
+    }
+
+    // Copy the original value of `chunks` in `base`, as little-endian
+    // bytes.
+    let mut base: Vec<u8> = Vec::new();
+
+    base.reserve(chunks.len() * std::mem::size_of::<u64>());
+    for chunk in chunks.iter() {
+        base.extend(chunk.to_le_bytes());
+    }
+
+    // And now un-apply `prev_base`.
+    if let Some(prev) = prev_base {
+        for (base, prev) in base.iter_mut().zip(prev.payload()) {
+            *base ^= prev;
+        }
+    }
+
+    chunks.fill(0);
+
+    let base_chunk = Chunk::arc_from_bytes(&base);
+    std::mem::drop(base);
+
+    repl.stage_chunk(base_chunk.fprint(), base_chunk.payload())?;
+    Ok((chunks, Some(base_chunk)))
+}
+
+fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
+    if (flattened.len() % 2) != 0 {
+        return None;
+    }
+
+    let mut ret = Vec::with_capacity(flattened.len() / 2);
+
+    for i in 0..flattened.len() / 2 {
+        ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
+    }
+
+    Some(ret)
+}
+
+// This impl block has all the snapshot update logic.
+impl Tracker {
     /// Snapshots all the 64KB chunks in the tracked file, and returns
     /// the file's size as well, a list of chunk fingerprints, and the
     /// number of chunks that were actually snapshotted.
@@ -891,65 +953,6 @@ impl Tracker {
         #[cfg(feature = "test_validate_writes")]
         self.compare_snapshot().expect("snapshots must match");
         Ok(())
-    }
-
-    /// Publishes a snapshot of `file` in the replication buffer, if
-    /// it exists.
-    ///
-    /// Must be called with a read lock held on the underlying file.
-    #[instrument(skip(self), err)]
-    pub fn snapshot(&mut self) -> Result<()> {
-        let ret = (|| {
-            #[cfg(feature = "test_validate_reads")]
-            self.validate_all_snapshots();
-            // Nothing to do if we know we're clean.
-            if self.backing_file_state == MutationState::Clean {
-                return Ok(());
-            }
-
-            // We also don't want to replicate if there's a hot
-            // journal: a hot journal can only be present when sqlite
-            // releases its lock if the lock protected a failed
-            // transaction that will be rolled back.
-            if self.has_hot_journal() {
-                // Return an error to make sure we force a full snapshot
-                // for the next transaction on the db file.
-                return Err(fresh_warn!(
-                    "found hot journal while releasing write lock",
-                    path=?self.path, ?self.backing_file_state));
-            }
-
-            let _span = tracing::info_span!(
-                "snapshot",
-                path=?self.path, ?self.backing_file_state);
-            self.snapshot_file_contents()
-        })();
-
-        // Always reset our state after a snapshot attempt.
-        self.cached_uuid.get_or_insert_with(Uuid::new_v4);
-        self.backing_file_state = MutationState::Clean;
-        self.previous_version_id.clear();
-        self.dirty_chunks.clear();
-
-        // If this attempt failed, force the next one to recompute the
-        // state from scratch: we *know* the current replication data
-        // is currently out of sync.
-        if ret.is_err() {
-            drop_result!(clear_version_id(&self.file),
-                         e => chain_error!(e, "failed to clear version xattr after failed snapshot",
-                                           snapshot_err=?ret));
-        }
-
-        ret
-    }
-
-    /// Performs test-only checks before a transaction's initial lock
-    /// acquisition.
-    #[inline]
-    #[instrument(skip(self))]
-    pub fn pre_lock_checks(&self) {
-        #[cfg(feature = "test_validate_reads")]
-        self.validate_all_snapshots();
     }
 }
 
