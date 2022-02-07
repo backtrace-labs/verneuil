@@ -642,6 +642,10 @@ impl Tracker {
         }
     }
 
+    fn base_chunk_fprints(current: Option<&Manifest>) -> Option<Vec<Fingerprint>> {
+        rebuild_chunk_fprints(&current?.v1.as_ref()?.chunks)
+    }
+
     /// Snapshots all the 64KB chunks in the tracked file, and returns
     /// the file's size as well, a list of chunk fingerprints, and the
     /// number of chunks that were actually snapshotted.
@@ -849,12 +853,7 @@ impl Tracker {
         // care about.
 
         // Try to get an initial list of chunks to work off.
-        let mut base_fprints = None;
-        if let Some((manifest, _)) = current_manifest.as_ref() {
-            if let Some(v1) = &manifest.v1 {
-                base_fprints = rebuild_chunk_fprints(&v1.chunks);
-            }
-        }
+        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
 
         // `copied` and `chunks` always take the both
         // newly-snapshotted chunks and the base chunk into account.
