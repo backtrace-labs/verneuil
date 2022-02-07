@@ -62,3 +62,38 @@ scans for chunks that don't appear in the current manifest file, and
 delete them. The snapshot thus never grows more than approximately
 twice as large as the source database file, regardless of progress (or
 lack of) made by the copier worker threads.
+
+Compressible snapshots
+----------------------
+
+Our representation of a snapshot's contents as a list of fingerprints
+(128 bits for each 64 KB chunk) in manifest blobs works well for
+database files up to a few megabytes.  Things aren't as nice for
+larger databases.  For example, for a 1 GB database, each manifest
+must include 256 KB of incompressible fingerprints.  Not disastrous,
+but also not great.
+
+We expect most manifests to change slowly over time: fully overwriting
+a 1 GB database probably doesn't happen too often.  That's why we
+attempt to make manifests compressible by `xor`-ing the list of
+fingerprints with an optional "base chunk:" in the worst case, we
+haven't made things any less compressible, but, if the base chunk is
+similar to our manifest's list of fingerprints, the `xor` will create
+compressible runs of zero bytes.  When such a base chunk is present,
+we can undo the `xor` by applying it again.  If it's absent, there's
+nothing to do (we `xor` with an infinite stream of zeros).
+
+This `xor`-ing is simple, robust, and efficient.  There's only one
+operation (`xor` in a base chunk) that acts as its self-inverse, we
+can ignore any extra data in the base chunk, and conceptually pad the
+base chunk withs 0s if necessary, and the `xor` is trivially
+vectorisable.
+
+Once a database file grows large enough, the Verneuil change tracker
+will regularly generate a new base chunk, and try to reuse it while it
+seems to roughly match the current list of fingerprints.
+
+This approach scales fine for databases up to a few GBs, but probably
+wouldn't be great at 10+ GB, at which point the flat list of
+fingerprints becomes a liability.  However, sqlite itself probably
+isn't a great fit at that point either.
