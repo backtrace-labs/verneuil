@@ -901,6 +901,15 @@ impl Tracker {
             .is_ok())
     }
 
+    /// Performs a full chunk GC: we only want to keep the
+    /// `base_chunk` for the manifest we just published.
+    fn full_gc(&self, base_chunk: Option<Fingerprint>) {
+        let chunks = base_chunk.iter().copied().collect::<Vec<_>>();
+        drop_result!(self.buffer.gc_chunks(&chunks),
+                     e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
+        self.chunk_counter.store(0, Ordering::Relaxed);
+    }
+
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -949,17 +958,11 @@ impl Tracker {
 
         let buf = &self.buffer;
 
-        // GC is opportunistic, failure is OK.  It's important to
-        // the copier that we only remove chunks after attempting
+        // GC is opportunistic, failure is OK.  What's important to
+        // the copier is that we only remove chunks after attempting
         // to publish the ready buffer.
         if published {
-            // If we just published our snapshot to the ready buffer,
-            // we can delete all chunks... except the base chunk for
-            // the current manifest, which must remain readable.
-            let chunks = base_chunk.iter().copied().collect::<Vec<_>>();
-            drop_result!(buf.gc_chunks(&chunks),
-                         e => chain_info!(e, "failed to clear all staged chunks", path=?self.path));
-            self.chunk_counter.store(0, Ordering::Relaxed);
+            self.full_gc(base_chunk);
         } else {
             use rand::Rng;
 
