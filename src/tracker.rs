@@ -486,6 +486,17 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
     Some(ret)
 }
 
+/// How do we want to treat the current manifest (that we're about to
+/// replace)?
+enum CurrentManifest {
+    // Don't generate a new snapshot at all.
+    UpToDate,
+    // Snapshot from scratch.
+    Desync,
+    // Use the previous manifest as an initial snapshot.
+    Initial(Manifest, Option<Arc<Chunk>>),
+}
+
 // This impl block has all the snapshot update logic.
 impl Tracker {
     /// Computes the new fingerprint for the sqlite header.
@@ -510,6 +521,124 @@ impl Tracker {
 
                 Err(fresh_warn!("invalid db file", path=?self.path))
             }
+        }
+    }
+
+    /// Reads the current staged manifest, if any.
+    fn read_current_manifest(&self) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
+        let buf = &self.buffer;
+        let mut builder = kismet_cache::CacheBuilder::new();
+
+        // We assume any chunk needed to parse the manifest is always
+        // available in the staged chunk directory, and make sure to
+        // save such chunks during GC.
+        //
+        // We do that instead of using the test-only
+        // `cache_builder_for_source` because the latter does a lot
+        // more work in order to look into `ready` and `consuming`
+        // subdirectories for data chunk.  However, we (should) always
+        // keep the current base chunk in `staged`, so that extra work
+        // is useless and could hide logic bugs.
+        builder.plain_reader(buf.staged_chunk_directory());
+        buf.read_staged_manifest(
+            &self.path,
+            builder,
+            &self.replication_targets.replication_targets,
+        )
+    }
+
+    /// Loads the current manifest and figures out what to do with it.
+    fn judge_current_manifest(&self, version_id: &[u8]) -> CurrentManifest {
+        let mut current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
+            .read_current_manifest()
+            .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
+            .ok()
+            .flatten();
+
+        // If we're snapshotting after a write, we always want to go
+        // through the whole process.  We made some changes, let's
+        // guarantee we try and publish them.  That's important because,
+        // if xattrs are missing, we can sometimes observe an unchanged
+        // file header after physical writes to the db file that aren't
+        // yet relevant for readers (e.g., after a page cache flush).
+        //
+        // We must also figure out whether we trust `current_manifest`
+        // enough to build our snapshot as a diff on top of that file.
+        if self.backing_file_state == MutationState::Dirty {
+            let mut up_to_date = false;
+
+            if let Some((manifest, _)) = &current_manifest {
+                if let Some(v1) = &manifest.v1 {
+                    // The current snapshot seems to have everything
+                    // up to our last write transaction.  We can use that!
+                    //
+                    // Remember to special-case empty version strings: they
+                    // never match anything, much like NaNs.
+                    if !self.previous_version_id.is_empty()
+                        && v1.version_id == self.previous_version_id
+                    {
+                        up_to_date = true;
+                    }
+
+                    // The current snapshot seems to also include
+                    // write transaction.  Use it as a base, but
+                    // don't bail out, just in case this is a
+                    // spurious match.
+                    if !version_id.is_empty() && v1.version_id == version_id {
+                        up_to_date = true;
+                    }
+                }
+            }
+
+            // If the version ids are empty, something's wrong with
+            // xattrs.  If we know we wrote something, but the
+            // versions match, our id system must be wrong (probably
+            // because xattrs don't work).  Finally, if we know
+            // we wrote something but our list of dirty chunks is
+            // empty, we probably missed an update.
+            //
+            // In all cases, we want to force a full snapshot.
+            if self.previous_version_id.is_empty() || version_id.is_empty() {
+                // Empty version ids are expected: that's what happens
+                // when we create a new db, and when we force a full
+                // snapshot.
+                tracing::debug!(path=?self.path, ?self.previous_version_id,
+                               ?version_id, num_dirty=self.dirty_chunks.len(),
+                               "forcing a full snapshot due to empty version ids");
+                up_to_date = false;
+            } else if self.previous_version_id == version_id || self.dirty_chunks.is_empty() {
+                tracing::info!(path=?self.path, ?self.previous_version_id,
+                               ?version_id, num_dirty=self.dirty_chunks.len(),
+                               "forcing a full snapshot due to invalid version ids");
+                up_to_date = false;
+            }
+
+            // If the manifest isn't up to date, we can't use it.
+            if !up_to_date {
+                current_manifest = None;
+            }
+        } else {
+            // If we're doing this opportunistically (not after a write)
+            // and the staging manifest seems up to date, there's nothing
+            // to do.  We don't even have to update "ready": the `Copier`
+            // will read from the staging directory when we don't change it.
+            if !version_id.is_empty() {
+                if let Some((manifest, _)) = &current_manifest {
+                    if matches!(&manifest.v1, Some(v1) if v1.version_id == version_id) {
+                        return CurrentManifest::UpToDate;
+                    }
+                }
+            }
+
+            // If we think there's work to do after a read
+            // transaction, assume the worst, and rebuild
+            // the snapshot from scratch.
+            current_manifest = None;
+        }
+
+        match current_manifest {
+            None => CurrentManifest::Desync,
+            Some((manifest, base)) => CurrentManifest::Initial(manifest, base),
         }
     }
 
@@ -681,29 +810,6 @@ impl Tracker {
         Ok((len, chunk_fprints, num_snapshotted))
     }
 
-    /// Reads the current staged manifest, if any.
-    fn read_current_manifest(&self) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
-        let buf = &self.buffer;
-        let mut builder = kismet_cache::CacheBuilder::new();
-
-        // We assume any chunk needed to parse the manifest is always
-        // available in the staged chunk directory, and make sure to
-        // save such chunks during GC.
-        //
-        // We do that instead of using the test-only
-        // `cache_builder_for_source` because the latter does a lot
-        // more work in order to look into `ready` and `consuming`
-        // subdirectories for data chunk.  However, we (should) always
-        // keep the current base chunk in `staged`, so that extra work
-        // is useless and could hide logic bugs.
-        builder.plain_reader(buf.staged_chunk_directory());
-        buf.read_staged_manifest(
-            &self.path,
-            builder,
-            &self.replication_targets.replication_targets,
-        )
-    }
-
     /// Snapshots the contents of the tracked file to its replication
     /// buffer.  Concurrent threads or processes may be doing the same,
     /// but the contents of the file can't change, since we still hold
@@ -727,92 +833,12 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let mut current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
-            .read_current_manifest()
-            .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
-            .ok()
-            .flatten();
-
-        // If we're snapshotting after a write, we always want to go
-        // through the whole process.  We made some changes, let's
-        // guarantee we try and publish them.  That's important because,
-        // if xattrs are missing, we can sometimes observe an unchanged
-        // file header after physical writes to the db file that aren't
-        // yet relevant for readers (e.g., after a page cache flush).
-        //
-        // We must also figure out whether we trust `current_manifest`
-        // enough to build our snapshot as a diff on top of that file.
-        if self.backing_file_state == MutationState::Dirty {
-            let mut up_to_date = false;
-
-            if let Some((manifest, _)) = &current_manifest {
-                if let Some(v1) = &manifest.v1 {
-                    // The current snapshot seems to have everything
-                    // up to our last write transaction.  We can use that!
-                    //
-                    // Remember to special-case empty version strings: they
-                    // never match anything, much like NaNs.
-                    if !self.previous_version_id.is_empty()
-                        && v1.version_id == self.previous_version_id
-                    {
-                        up_to_date = true;
-                    }
-
-                    // The current snapshot seems to also include
-                    // write transaction.  Use it as a base, but
-                    // don't bail out, just in case this is a
-                    // spurious match.
-                    if !version_id.is_empty() && v1.version_id == version_id {
-                        up_to_date = true;
-                    }
-                }
-            }
-
-            // If the version ids are empty, something's wrong with
-            // xattrs.  If we know we wrote something, but the
-            // versions match, our id system must be wrong (probably
-            // because xattrs don't work).  Finally, if we know
-            // we wrote something but our list of dirty chunks is
-            // empty, we probably missed an update.
-            //
-            // In all cases, we want to force a full snapshot.
-            if self.previous_version_id.is_empty() || version_id.is_empty() {
-                // Empty version ids are expected: that's what happens
-                // when we create a new db, and when we force a full
-                // snapshot.
-                tracing::debug!(path=?self.path, ?self.previous_version_id,
-                               ?version_id, num_dirty=self.dirty_chunks.len(),
-                               "forcing a full snapshot due to empty version ids");
-                up_to_date = false;
-            } else if self.previous_version_id == version_id || self.dirty_chunks.is_empty() {
-                tracing::info!(path=?self.path, ?self.previous_version_id,
-                               ?version_id, num_dirty=self.dirty_chunks.len(),
-                               "forcing a full snapshot due to invalid version ids");
-                up_to_date = false;
-            }
-
-            // If the manifest isn't up to date, we can't use it.
-            if !up_to_date {
-                current_manifest = None;
-            }
-        } else {
-            // If we're doing this opportunistically (not after a write)
-            // and the staging manifest seems up to date, there's nothing
-            // to do.  We don't even have to update "ready": the `Copier`
-            // will read from the staging directory when we don't change it.
-            if !version_id.is_empty() {
-                if let Some((manifest, _)) = &current_manifest {
-                    if matches!(&manifest.v1, Some(v1) if v1.version_id == version_id) {
-                        return Ok(());
-                    }
-                }
-            }
-
-            // If we think there's work to do after a read
-            // transaction, assume the worst, and rebuild
-            // the snapshot from scratch.
-            current_manifest = None;
-        }
+        let current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> =
+            match self.judge_current_manifest(&version_id) {
+                CurrentManifest::UpToDate => return Ok(()),
+                CurrentManifest::Desync => None,
+                CurrentManifest::Initial(manifest, base) => Some((manifest, base)),
+            };
 
         // We don't *have* to overwrite the .metadata file, but we
         // should create it if it's missing: without that file, the
