@@ -1,3 +1,10 @@
+0.1.5 2022-02-06
+----------------
+* Be more resilient against S3 clones where blobs may flicker in
+  and out of existence shortly after PUTs (320390a4)
+* More efficient chunk loads and patrol refreshes, with a cached
+  executor instead of ephemeral ones (b7d4b610, ae8ff325)
+
 0.1.4 2022-01-31
 -----------------
 * Enable dynamic linking against older sqlites (b834c18d)
