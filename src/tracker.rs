@@ -342,16 +342,6 @@ impl Tracker {
     }
 }
 
-fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
-    let mut ret = Vec::with_capacity(fprints.len() * 2);
-
-    for fprint in fprints {
-        ret.extend(&fprint.hash);
-    }
-
-    ret
-}
-
 /// What should we do with the current base chunk fingerprint list?
 enum BaseChunkAction {
     /// Don't use a base chunk at all.
@@ -472,20 +462,6 @@ fn reencode_flattened_chunks(
     Ok((chunks, Some(base_chunk)))
 }
 
-fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
-    if (flattened.len() % 2) != 0 {
-        return None;
-    }
-
-    let mut ret = Vec::with_capacity(flattened.len() / 2);
-
-    for i in 0..flattened.len() / 2 {
-        ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
-    }
-
-    Some(ret)
-}
-
 // These methods are used by the snapshotting logic.
 impl Tracker {
     /// Computes the new fingerprint for the sqlite header.
@@ -537,7 +513,19 @@ impl Tracker {
     }
 
     fn base_chunk_fprints(current: Option<&Manifest>) -> Option<Vec<Fingerprint>> {
-        rebuild_chunk_fprints(&current?.v1.as_ref()?.chunks)
+        let flattened = &current?.v1.as_ref()?.chunks;
+
+        if (flattened.len() % 2) != 0 {
+            return None;
+        }
+
+        let mut ret = Vec::with_capacity(flattened.len() / 2);
+
+        for i in 0..flattened.len() / 2 {
+            ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
+        }
+
+        Some(ret)
     }
 }
 
@@ -837,6 +825,16 @@ impl Tracker {
         current_manifest: Option<(Manifest, Option<Arc<Chunk>>)>,
     ) -> Result<(usize, Vec<Fingerprint>, Option<Fingerprint>)> {
         use std::os::unix::fs::MetadataExt;
+
+        fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
+            let mut ret = Vec::with_capacity(fprints.len() * 2);
+
+            for fprint in fprints {
+                ret.extend(&fprint.hash);
+            }
+
+            ret
+        }
 
         // Try to get an initial list of chunks to work off.
         let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
