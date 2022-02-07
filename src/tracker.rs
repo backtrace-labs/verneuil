@@ -486,18 +486,7 @@ fn rebuild_chunk_fprints(flattened: &[u64]) -> Option<Vec<Fingerprint>> {
     Some(ret)
 }
 
-/// How do we want to treat the current manifest (that we're about to
-/// replace)?
-enum CurrentManifest {
-    // Don't generate a new snapshot at all.
-    UpToDate,
-    // Snapshot from scratch.
-    Desync,
-    // Use the previous manifest as an initial snapshot.
-    Initial(Manifest, Option<Arc<Chunk>>),
-}
-
-// This impl block has all the snapshot update logic.
+// These methods are used by the snapshotting logic.
 impl Tracker {
     /// Computes the new fingerprint for the sqlite header.
     ///
@@ -547,6 +536,30 @@ impl Tracker {
         )
     }
 
+    fn base_chunk_fprints(current: Option<&Manifest>) -> Option<Vec<Fingerprint>> {
+        rebuild_chunk_fprints(&current?.v1.as_ref()?.chunks)
+    }
+}
+
+/// How do we want to treat the current manifest (that we're about to
+/// replace)?
+enum CurrentManifest {
+    // Don't generate a new snapshot at all.
+    UpToDate,
+    // Snapshot from scratch.
+    Desync,
+    // Use the previous manifest as an initial snapshot.
+    Initial(Manifest, Option<Arc<Chunk>>),
+}
+
+// This impl block has all the snapshot update logic.
+//
+// While that logic is broken up in named methods, their correctness
+// relies on the state (in the `Tracker`, but also in the replication
+// buffer stored on the filesystem) set up by prior method calls in
+// `snapshot_file_contents`, and should not be invoked in any
+// different context.
+impl Tracker {
     /// Loads the current manifest and figures out what to do with it.
     fn judge_current_manifest(&self, version_id: &[u8]) -> CurrentManifest {
         let mut current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
@@ -640,10 +653,6 @@ impl Tracker {
             None => CurrentManifest::Desync,
             Some((manifest, base)) => CurrentManifest::Initial(manifest, base),
         }
-    }
-
-    fn base_chunk_fprints(current: Option<&Manifest>) -> Option<Vec<Fingerprint>> {
-        rebuild_chunk_fprints(&current?.v1.as_ref()?.chunks)
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
