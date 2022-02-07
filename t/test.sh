@@ -12,7 +12,7 @@ HERE=$(dirname $(readlink -f "$0"))
 # Default test features: validate after read and write transactions,
 # and publish data to a local minio server.  That gives us a lot of
 # coverage, but can be slow.
-FEATURES="test_validate_all"
+FEATURES="test_validate_all,test_random_chunk_action"
 
 # Other options:
 #
@@ -29,7 +29,7 @@ FEATURES="test_validate_all"
 # Run full assertions, without xattr support.
 # FEATURES="test_validate_all,no_xattr"
 #
-# Make sure that we behave usefully without replication targets.
+# Make sure that we behave usefully with the default chunk action.
 # FEATURES="test_validate_all"
 
 (cd "$HERE/..";

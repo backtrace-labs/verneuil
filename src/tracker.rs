@@ -38,6 +38,10 @@ use crate::result::Result;
 /// We snapshot db files in 64KB content-addressed chunks.
 pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
+/// Don't generate a base fingerprint chunk for a list of fingerprints
+/// shorter than `BASE_CHUNK_MIN_LENGTH`.
+const BASE_CHUNK_MIN_LENGTH: usize = 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
     Clean,   // No mutation since the last snapshot
@@ -98,8 +102,62 @@ fn flatten_chunk_fprints(fprints: &[Fingerprint]) -> Vec<u64> {
     ret
 }
 
+/// What should we do with the current base chunk fingerprint list?
+enum BaseChunkAction {
+    /// Don't use a base chunk at all.
+    None,
+    /// Reuse the current base chunk.
+    Reuse,
+    /// Generate a new base chunk.
+    Refresh,
+}
+
+impl BaseChunkAction {
+    /// Determines what to do with a previous inherited base chunk
+    /// list.  The `matches` parameter counts the number of
+    /// fingerprints that match between the current chunk fingerprint
+    /// list and the inherited base chunk (i.e., the number of 0
+    /// fingerprints once the two are xor-ed together), and
+    /// `total_size` is the size of the current chunk fingerprint
+    /// list.
+    fn decide(matches: usize, total_size: usize) -> Self {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        // With this feature, we always return a random action to
+        // exercise the rest of the snapshotting code.
+        #[cfg(feature = "test_random_chunk_action")]
+        return match rng.gen_range(0..3) {
+            0 => BaseChunkAction::None,
+            1 => BaseChunkAction::Reuse,
+            _ => BaseChunkAction::Refresh,
+        };
+
+        // If there are enough matches that the random uniform integer
+        // is less than the number of matches, keep the old base chunk.
+        //
+        // We sample from an inclusive range to guarantee there's a
+        // small chance of recreating the base chunk even when
+        // `matches == total_size`.
+        if rng.gen_range(0..=total_size) < matches {
+            BaseChunkAction::Reuse
+        } else if total_size < BASE_CHUNK_MIN_LENGTH {
+            // The list of chunk fingerprints is too short to warrant
+            // a base chunk.  Regenerate to nothing.
+            BaseChunkAction::None
+        } else {
+            BaseChunkAction::Refresh
+        }
+    }
+}
+
 /// Re-encodes `chunks` to expose a more compressible list of `u64`s
 /// in the manifest.
+///
+/// On entry, `chunks` contains the real chunk fingerprints (before
+/// any xor-ing).  The return value holds the chunk fingerprints,
+/// potentially xor-ed with a base chunk.  If a base chunk was xor-ed
+/// in, it's the second return value.
 fn reencode_flattened_chunks(
     repl: &ReplicationBuffer,
     prev_base: Option<Arc<Chunk>>,
@@ -107,26 +165,41 @@ fn reencode_flattened_chunks(
 ) -> Result<(Vec<u64>, Option<Arc<Chunk>>)> {
     use std::convert::TryInto;
 
-    let mut _non_zero = 0;
-    // Apply `prev_base`, the previous base chunk, to see what's left.
-    if let Some(prev) = prev_base.as_ref() {
-        let base_words = prev
-            .payload()
-            .chunks_exact(std::mem::size_of::<u64>())
-            // Safe to unwrap: we get slices of exactly 8 bytes.
-            .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+    let apply_prev_base = |chunks: &mut Vec<u64>| {
+        let mut zero = 0;
+        // Apply `prev_base`, the previous base chunk, to see what's left.
+        if let Some(prev) = prev_base.as_ref() {
+            let base_words = prev
+                .payload()
+                .chunks_exact(std::mem::size_of::<u64>())
+                // Safe to unwrap: we get slices of exactly 8 bytes.
+                .map(|s| u64::from_le_bytes(s.try_into().unwrap()));
 
-        for (word, base) in chunks.iter_mut().zip(base_words) {
-            let result = *word ^ base;
-            *word = result;
+            for (word, base) in chunks.iter_mut().zip(base_words) {
+                let result = *word ^ base;
+                *word = result;
 
-            _non_zero += (result != 0) as usize;
+                zero += (result == 0) as usize;
+            }
         }
+
+        zero
+    };
+
+    let matches = apply_prev_base(&mut chunks);
+    match BaseChunkAction::decide(matches, chunks.len()) {
+        BaseChunkAction::None => {
+            // Apply `prev_base` again to undo the xors.
+            apply_prev_base(&mut chunks);
+            return Ok((chunks, None));
+        }
+        BaseChunkAction::Reuse => return Ok((chunks, prev_base)),
+        BaseChunkAction::Refresh => {}
     }
 
-    // Dummy implementation: always publish a new reference chunk
-    // reference chunk.
-    let mut base = Vec::new();
+    // Copy the original value of `chunks` in `base`, as little-endian
+    // bytes.
+    let mut base: Vec<u8> = Vec::new();
 
     base.reserve(chunks.len() * std::mem::size_of::<u64>());
     for chunk in chunks.iter() {
@@ -725,9 +798,9 @@ impl Tracker {
 
             buf.publish_manifest(&self.path, &manifest)?;
 
-            // We published our new manifest, we should find a
+            // We published our new manifest, so we'll probably find a
             // reference to `base_chunk` the next time we load the
-            // staged manifest.
+            // staged manifest.  Let's make sure it remains cached.
             self.recent_base_chunk = base_chunk;
 
             if let Some(base_fprint) = base_fprint {
