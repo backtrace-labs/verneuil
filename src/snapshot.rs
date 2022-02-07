@@ -20,6 +20,13 @@ pub struct Snapshot {
     // For example, `4 => chunk` with a chunk of 2 byte means that the
     // chunk represents bytes `[2, 4)` of the snapshotted file.
     chunks: BTreeMap<u64, Arc<Chunk>>,
+    // Keep a reference to the base chunk for the Manifest used to
+    // create this `Snapshot`, if any: keeping it alive means we'll
+    // get it from cache when we refresh the snapshot and find a
+    // Manifest with the same base chunk.
+    //
+    // This field is only used to keep the `Chunk` alive.
+    _base_chunk: Option<Arc<Chunk>>,
 }
 
 /// A SnapshotReader implements `std::io::Read` for a parent `Snapshot`.
@@ -36,10 +43,18 @@ pub struct SnapshotReader<'parent> {
 impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from the global default replication targets.
-    pub fn new_with_default_targets(manifest: &Manifest) -> Result<Snapshot> {
+    pub fn new_with_default_targets(
+        manifest: &Manifest,
+        base_chunk: Option<Arc<Chunk>>,
+    ) -> Result<Snapshot> {
         let targets = crate::replication_target::get_default_replication_targets();
 
-        Snapshot::new(CacheBuilder::new(), &targets.replication_targets, manifest)
+        Snapshot::new(
+            CacheBuilder::new(),
+            &targets.replication_targets,
+            manifest,
+            base_chunk,
+        )
     }
 
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
@@ -48,6 +63,7 @@ impl Snapshot {
         cache_builder: CacheBuilder,
         remote_sources: &[ReplicationTarget],
         manifest: &Manifest,
+        base_chunk: Option<Arc<Chunk>>,
     ) -> Result<Snapshot> {
         let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
 
@@ -113,7 +129,11 @@ impl Snapshot {
             ));
         }
 
-        Ok(Snapshot { len, chunks })
+        Ok(Snapshot {
+            len,
+            chunks,
+            _base_chunk: base_chunk,
+        })
     }
 
     /// Returns whether the snapshot represents a zero-byte file.
@@ -252,6 +272,7 @@ fn test_empty_reader_boundaries() {
     let snapshot = Snapshot {
         len: 10u64,
         chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
+        _base_chunk: None,
     };
 
     let mut dst = Vec::new();
@@ -336,6 +357,7 @@ fn test_reader_simple() {
             .iter()
             .cloned()
             .collect(),
+        _base_chunk: None,
     };
 
     let mut read = snapshot.as_read(0, u64::MAX);
@@ -360,6 +382,7 @@ fn test_reader_short_sequence() {
     let snapshot = Snapshot {
         len: 10u64,
         chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
+        _base_chunk: None,
     };
 
     let mut read = snapshot.as_read(0, u64::MAX);
@@ -391,6 +414,7 @@ fn test_reader_subseq() {
                 (end, create_chunk(((begin as u8)..(end as u8)).collect()))
             })
             .collect(),
+        _base_chunk: None,
     };
 
     for begin in 0..=flattened.len() {

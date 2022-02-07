@@ -149,9 +149,9 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
 
     // Use the global list of replication targets, same as the
     // `Snapshot` below.
-    let manifest = crate::Manifest::decode_and_validate(&*bytes, Default::default(), None, &path)
-        .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?
-        .0;
+    let (manifest, base) =
+        crate::Manifest::decode_and_validate(&*bytes, Default::default(), None, &path)
+            .map_err(|e| chain_error!(e, "failed to parse manifest file", %path))?;
 
     let (ctime, ctime_ns) = match &manifest.v1 {
         Some(v1) => (
@@ -167,7 +167,7 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
         ctime,
         ctime_ns,
         reload_queued: AtomicBool::new(false),
-        data: Snapshot::new_with_default_targets(&manifest)?,
+        data: Snapshot::new_with_default_targets(&manifest, base)?,
     });
 
     LIVE_DATA

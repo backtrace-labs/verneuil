@@ -893,6 +893,7 @@ impl Tracker {
             self.cache_builder_for_source(source),
             &self.replication_targets.replication_targets,
             manifest,
+            None,
         )
         .expect("failed to instantiate snapshot")
     }
