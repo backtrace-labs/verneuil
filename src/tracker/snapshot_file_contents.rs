@@ -203,7 +203,8 @@ impl Tracker {
     }
 
     fn base_chunk_fprints(current: Option<&Manifest>) -> Option<Vec<Fingerprint>> {
-        let flattened = &current?.v1.as_ref()?.chunks;
+        let v1 = current?.v1.as_ref()?;
+        let flattened = &v1.chunks;
 
         if (flattened.len() % 2) != 0 {
             return None;
@@ -213,6 +214,27 @@ impl Tracker {
 
         for i in 0..flattened.len() / 2 {
             ret.push(Fingerprint::new(flattened[2 * i], flattened[2 * i + 1]));
+        }
+
+        // If a chunk is bundled with the current manifest, we can't
+        // assume it's available in the content-addressed store for us
+        // to reuse.  Overwrite it with the zero fingerprint: the
+        // loader special-cases that fingerprint and always knows what
+        // it corresponds to, even when it's not in the
+        // content-addressed store.  If we happen to find that the new
+        // chunk at that location matches the zero fingerprint, we
+        // don't have to upload anything.
+        //
+        // The caller (`stage_new_snapshot`) also knows to consider
+        // the data at the corresponding file offset dirty and
+        // probably stage fresh data for upload.
+        let zero_fp = crate::loader::zero_fingerprint();
+        for bundled in &v1.bundled_chunks {
+            let index = bundled.chunk_index;
+
+            if index < ret.len() as u64 {
+                ret[index as usize] = zero_fp;
+            }
         }
 
         Some(ret)
@@ -527,6 +549,16 @@ impl Tracker {
             }
 
             ret
+        }
+
+        // If the current manifest has any bundled chunks, we must
+        // mark them as dirty: it doesn't matter that we didn't change
+        // them, we can't refer to them without making sure they're
+        // available for readers.
+        if let Some(v1) = current_manifest.as_ref().map(|x| x.0.v1.as_ref()).flatten() {
+            for bundled in &v1.bundled_chunks {
+                self.dirty_chunks.insert(bundled.chunk_offset, None);
+            }
         }
 
         // Try to get an initial list of chunks to work off.
