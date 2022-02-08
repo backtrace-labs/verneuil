@@ -38,9 +38,16 @@ int verneuil_configure_impl(const struct verneuil_options *options);
 /**
  * Implements the registration hook for Sqlite's extension loading
  * mechanism.
+ *
+ * If `tempdir` is non-NULL, it overrides the temporary directory for
+ * the Verneuil VFS.
+ *
+ * If `make_default` is true, the `Verneuil` read-write VFS (that
+ * publishes snapshots) is registered as the new default VFS.
  */
 int verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
-    const sqlite3_api_routines *pApi);
+    const sqlite3_api_routines *pApi, const char *tempdir,
+    bool make_default);
 
 /**
  * Test-only: registers the Verneuil VFS as the new default, and

@@ -2,6 +2,7 @@
 //! enable the Verneuil replicating VFS.  The VFS looks for its
 //! configuration JSON in the `VERNEUIL_CONFIG` environment variable.
 use std::ffi::c_void;
+use std::ffi::CString;
 use std::os::raw::c_char;
 
 use verneuil::chain_error;
@@ -11,7 +12,13 @@ use verneuil::VERNEUIL_CONFIG_ENV_VAR;
 
 // See `c/vfs.h`.
 extern "C" {
-    fn verneuil_init_impl(db: *mut c_void, errmsg: *mut *mut c_char, api: *const c_void) -> i32;
+    fn verneuil_init_impl(
+        db: *mut c_void,
+        errmsg: *mut *mut c_char,
+        api: *const c_void,
+        tempdir: *const c_char,
+        make_default: bool,
+    ) -> i32;
 }
 
 /// Sqlite3 will invoke this function if Verneuil is loaded as a
@@ -41,13 +48,35 @@ pub unsafe extern "C" fn sqlite3_verneuilvfs_init(
         .map(|e| format!("{:?}", e));
 
     tracing::info!("tracing initialized");
+
+    let mut make_default = false;
+    let mut tempdir = None;
     match verneuil::load_configuration_from_env(None) {
-        Some(options) => drop_result!(verneuil::configure_replication(options),
-                                      e => chain_error!(e, "failed to configure verneuil")),
+        Some(options) => {
+            make_default = options.make_default;
+            tempdir = options.tempdir.clone();
+            drop_result!(verneuil::configure_replication(options),
+                         e => chain_error!(e, "failed to configure verneuil"));
+        }
         None => {
             let _ = fresh_warn!("no verneuil configuration found", %VERNEUIL_CONFIG_ENV_VAR);
         }
     }
 
-    verneuil_init_impl(db, err_msg, api)
+    let c_path;
+    let mut c_path_ptr = std::ptr::null();
+
+    if let Some(tempdir) = tempdir {
+        match CString::new(tempdir.clone()) {
+            Ok(c_str) => {
+                c_path = c_str;
+                c_path_ptr = c_path.as_ptr();
+            }
+            Err(e) => {
+                let _ = fresh_warn!("invalid `tempdir` string", ?tempdir, ?e);
+            }
+        }
+    }
+
+    verneuil_init_impl(db, err_msg, api, c_path_ptr, make_default)
 }

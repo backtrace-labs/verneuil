@@ -2394,13 +2394,9 @@ verneuil_configure_impl(const struct verneuil_options *options)
 
 int
 verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
-    const sqlite3_api_routines *pApi)
+    const sqlite3_api_routines *pApi, const char *tempdir,
+    bool make_default)
 {
-#ifdef TEST_VFS
-        int make_default = 1;
-#else
-        int make_default = 0;
-#endif
         int rc;
 
         (void)db;
@@ -2435,6 +2431,12 @@ verneuil_init_impl(sqlite3 *db, char **pzErrMsg,
         if (rc != SQLITE_OK)
                 return rc;
 
+        if (tempdir != NULL) {
+                rc = verneuil_set_tempdir(tempdir);
+                if (rc != SQLITE_OK)
+                        return rc;
+        }
+
         return SQLITE_OK_LOAD_PERMANENTLY;
 }
 
@@ -2445,7 +2447,7 @@ verneuil_test_only_register(void)
         char *error = NULL;
         int rc;
 
-        rc = verneuil_init_impl(NULL, &error, NULL);
+        rc = verneuil_init_impl(NULL, &error, NULL, NULL, true);
         sqlite3_free(error);
 
         if (rc == SQLITE_OK_LOAD_PERMANENTLY)
