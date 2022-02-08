@@ -119,6 +119,19 @@ impl Tracker {
         )
         .expect("ready snapshot must be valid");
 
+        // Check the `consuming` snapshot again: it might have been
+        // upgraded from `ready` to `consuming` while we were trying
+        // to validate them.
+        self.validate_snapshot(
+            buf.read_consuming_manifest(
+                &self.path,
+                self.cache_builder_for_source(ChunkSource::Consuming),
+                targets,
+            ),
+            ChunkSource::Consuming,
+        )
+        .expect("consuming snapshot must be valid");
+
         self.validate_snapshot(self.read_current_manifest(), ChunkSource::Staged)
             .expect("staged snapshot must be valid");
     }
