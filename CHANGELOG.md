@@ -1,3 +1,8 @@
+0.2.0 2022-02-08
+----------------
+* New, better compressible, manifest format, to reduce the manifest
+  overhead for large (1+ GB) sqlite files (internal docs in edacfeb6)
+
 0.1.5 2022-02-06
 ----------------
 * Be more resilient against S3 clones where blobs may flicker in
