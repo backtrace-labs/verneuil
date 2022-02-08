@@ -873,15 +873,44 @@ fn read_manifest_at_path(
     cache_builder: kismet_cache::CacheBuilder,
     targets: &[ReplicationTarget],
 ) -> Result<Option<Manifest>> {
-    let contents = match std::fs::read(file_path) {
-        Ok(contents) => contents,
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(file_path) {
+        Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(chain_error!(e, "failed to read manifest", ?file_path)),
+        Err(e) => return Err(chain_error!(e, "failed to open manifest", ?file_path)),
     };
 
-    Ok(Some(
-        Manifest::decode_and_validate(&*contents, cache_builder, Some(targets), file_path)?.0,
-    ))
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|e| chain_error!(e, "failed to read manifest", ?file_path))?;
+
+    match Manifest::decode_and_validate(&*contents, cache_builder, Some(targets), file_path) {
+        Ok((manifest, _base)) => Ok(Some(manifest)),
+        Err(e) => {
+            use std::os::unix::fs::MetadataExt;
+
+            // If we failed to parse the manifest, but the manifest
+            // file doesn't exist anymore or was overwritten, bubble
+            // that up as a missing manifest file.
+            let initial_meta = file
+                .metadata()
+                .map_err(|e| chain_error!(e, "failed to stat open manifest file", ?file_path))?;
+
+            let current_meta = match std::fs::metadata(file_path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(chain_error!(e, "failed to stat manifest file", ?file_path)),
+            };
+
+            if (initial_meta.dev(), initial_meta.ino()) == (current_meta.dev(), current_meta.ino())
+            {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Returns the path to the staging directory under `parent`; it may
