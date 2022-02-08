@@ -93,6 +93,7 @@ EOF
 export AWS_ACCESS_KEY_ID=VERNEUIL_TEST_ACCOUNT
 export AWS_SECRET_ACCESS_KEY=VERNEUIL_TEST_KEY
 export RUST_LOG=off  # Disable logging by default: some sqlite tests take over stdin/stdout.
+export RUST_BACKTRACE=full # Dump a full backtrace on panic
 
 export VERNEUIL_CONFIG="@${HERE}/test_with_minio.json"
 # export VERNEUIL_CONFIG="$OFFLINE_CONFIG"  # Disable the replication target here.
