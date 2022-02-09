@@ -33,7 +33,7 @@ FEATURES="test_validate_all,test_random_chunk_action"
 # FEATURES="test_validate_all"
 
 (cd "$HERE/..";
- cargo build  --release --target-dir "$CURRENT" --no-default-features --features "$FEATURES")
+ RUSTFLAGS=-g cargo build  --release --target-dir "$CURRENT" --no-default-features --features "$FEATURES")
 
 # We want sqlite to call our test-only registration function, which
 # will mark the verneuil VFS as the one, and pretend it's the Unix
