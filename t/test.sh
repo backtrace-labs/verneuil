@@ -67,7 +67,15 @@ mkdir -p minio
 rm -rf minio
 mkdir -p minio
 
-docker run --net=host \
+EXTRA_DOCKER_ARGS=
+# If there are at least 4 CPUs on this machine, restrict minio to 2
+# cores: goodput scales negatively at some point around 256 cores.
+if grep -q '^processor\s*:\s*3$' /proc/cpuinfo ;
+then
+    EXTRA_DOCKER_ARGS="$EXTRA_DOCKER_ARGS --cpuset-cpus=1-2"
+fi
+
+docker run --net=host $EXTRA_DOCKER_ARGS \
   --user $(id -u):$(id -g) \
   --name verneuil_test_minio \
   -v $CURRENT/minio:/data \
