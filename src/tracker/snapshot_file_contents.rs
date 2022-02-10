@@ -11,6 +11,7 @@ use crate::chain_info;
 use crate::chain_warn;
 use crate::drop_result;
 use crate::fresh_warn;
+use crate::loader::is_well_known_fingerprint;
 use crate::loader::Chunk;
 use crate::manifest_schema::clear_version_id;
 use crate::manifest_schema::extract_version_id;
@@ -144,7 +145,10 @@ fn reencode_flattened_chunks(
     let base_chunk = Chunk::arc_from_bytes(&base);
     std::mem::drop(base);
 
-    repl.stage_chunk(base_chunk.fprint(), base_chunk.payload())?;
+    if !is_well_known_fingerprint(base_chunk.fprint()) {
+        repl.stage_chunk(base_chunk.fprint(), base_chunk.payload())?;
+    }
+
     Ok((chunks, Some(base_chunk)))
 }
 
@@ -430,10 +434,13 @@ impl Tracker {
                 // Nothing to do, it's all clean
                 Ok(false)
             } else {
-                // Only stage the chunk if it has changed: we don't
-                // want our background scans to create useless copy
-                // work.
-                repl.stage_chunk(fprint, slice)?;
+                // Only stage the chunk if it has changed and isn't
+                // statically known to the loader: we don't want our
+                // background scans to create useless copy work.
+                if !is_well_known_fingerprint(fprint) {
+                    repl.stage_chunk(fprint, slice)?;
+                }
+
                 chunk_fprints[chunk_index as usize] = fprint;
                 Ok(true)
             }
