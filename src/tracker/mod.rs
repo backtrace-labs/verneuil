@@ -37,6 +37,14 @@ pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
 const BASE_CHUNK_MIN_LENGTH: usize = 1024;
 
+/// Always bundle chunks at these offsets with the manifest.
+///
+/// Offset 0 is special because it contains sqlite's 0 page, and that
+/// page contains a small header that's modified after every write
+/// transaction.  There's no point trying to deduplicate it, it's
+/// essentially never the same.
+const BUNDLED_CHUNK_OFFSETS: [u64; 1] = [0];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
     Clean,   // No mutation since the last snapshot
@@ -230,6 +238,19 @@ impl Tracker {
         }
     }
 
+    /// Determines whether the chunk data at `offset` byte in the file
+    /// should be bundled with the manifest, rather than published as
+    /// a standalone content-addressed chunk.
+    fn should_bundle_chunk_at_offset(&self, offset: u64) -> bool {
+        BUNDLED_CHUNK_OFFSETS.contains(&offset)
+    }
+
+    /// Returns a vector of offsets for chunks we wish to bundle with
+    /// the manifest.
+    fn bundled_chunks_offset_list(&self) -> Vec<u64> {
+        BUNDLED_CHUNK_OFFSETS.to_vec()
+    }
+
     /// Notes that we are about to update the tracked file, and
     /// that bytes in [offset, offset + count) are about to change.
     #[instrument(level = "trace", skip(self))]
@@ -245,7 +266,11 @@ impl Tracker {
 
         self.backing_file_state = MutationState::Dirty;
 
-        if !buf.is_null() && count == SNAPSHOT_GRANULARITY && (offset % SNAPSHOT_GRANULARITY) == 0 {
+        if !buf.is_null()
+            && count == SNAPSHOT_GRANULARITY
+            && (offset % SNAPSHOT_GRANULARITY) == 0
+            && !self.should_bundle_chunk_at_offset(offset)
+        {
             // When sqlite fires off a writes that's exactly
             // chunk-aligned, stage it directly for replication.  We
             // expect this to happen most of the time, when the DB is
