@@ -560,6 +560,17 @@ fn file_is_stale(path: &Path, max_age: Duration) -> Result<bool> {
     Ok(elapsed >= max_age)
 }
 
+/// Attempts to atomically rename a path and then removes it.
+fn remove_dir(path: &Path) -> std::io::Result<()> {
+    let mut new_path = path.to_path_buf();
+    new_path.set_extension(".del");
+
+    match std::fs::rename(path, &new_path) {
+        Ok(()) => std::fs::remove_dir_all(&new_path),
+        Err(_) => std::fs::remove_dir_all(path)
+    }
+}
+
 /// Attempts to delete all directories in the parent of `goal_path`
 /// except `goal_path`.
 #[instrument(err)]
@@ -581,7 +592,7 @@ fn delete_stale_directories(goal_path: &Path) -> Result<()> {
     for subdir in it.flatten() {
         if Some(subdir.file_name().as_os_str()) != goal_filename {
             parent.push(subdir.file_name());
-            if let Err(error) = std::fs::remove_dir_all(&parent) {
+            if let Err(error) = remove_dir(&parent) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::info!(?parent, %error, "failed to remove sibling");
                 }
@@ -636,7 +647,7 @@ fn delete_dangling_replication_directories(mut parent: PathBuf) -> Result<()> {
             parent.push(subdir.file_name());
             tracing::info!(%base_file, victim=?parent,
                            "deleting dangling replication directory");
-            drop_result!(std::fs::remove_dir_all(&parent),
+            drop_result!(remove_dir(&parent),
                          e => chain_info!(e, "failed to delete replication directory for missing db",
                                           %base_file, victim=?parent));
             parent.pop();
