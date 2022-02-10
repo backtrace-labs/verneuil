@@ -567,7 +567,7 @@ fn remove_dir(path: &Path) -> std::io::Result<()> {
 
     match std::fs::rename(path, &new_path) {
         Ok(()) => std::fs::remove_dir_all(&new_path),
-        Err(_) => std::fs::remove_dir_all(path)
+        Err(_) => std::fs::remove_dir_all(path),
     }
 }
 
