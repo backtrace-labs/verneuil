@@ -19,6 +19,7 @@ use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::fingerprint_sqlite_header;
 use crate::manifest_schema::fingerprint_v1_chunk_list;
 use crate::manifest_schema::update_version_id;
+use crate::manifest_schema::BundledChunk;
 use crate::manifest_schema::Manifest;
 use crate::manifest_schema::ManifestV1;
 use crate::replication_buffer::ReplicationBuffer;
@@ -356,13 +357,14 @@ impl Tracker {
     }
 
     /// Snapshots all the 64KB chunks in the tracked file, and returns
-    /// the file's size as well, a list of chunk fingerprints, and the
-    /// number of chunks that were actually snapshotted.
+    /// the file's size as well, a list of chunk fingerprints, a list
+    /// of bundled chunks for the manifest, and the number of chunks
+    /// that were actually snapshotted.
     #[instrument(skip(self, base), err)]
     fn snapshot_chunks(
         &self,
         base: Option<Vec<Fingerprint>>,
-    ) -> Result<(u64, Vec<Fingerprint>, usize)> {
+    ) -> Result<(u64, Vec<Fingerprint>, Vec<BundledChunk>, usize)> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
@@ -420,6 +422,7 @@ impl Tracker {
         let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);
 
         let mut num_snapshotted: usize = 0;
+        let mut bundled_chunks = Vec::new();
 
         // Updates the snapshot to take into account the data in chunk
         // `chunk_index`.
@@ -452,7 +455,16 @@ impl Tracker {
                 chunk_fprints[chunk_index as usize] = expected;
             }
 
-            if fprint == chunk_fprints[chunk_index as usize] {
+            // When a chunk is bundled, we must always send it in.
+            let ret = if self.should_bundle_chunk_at_offset(begin) {
+                bundled_chunks.push(BundledChunk {
+                    chunk_index,
+                    chunk_offset: begin,
+                    chunk_fprint: Some(fprint.into()),
+                    chunk_data: slice.to_vec(),
+                });
+                Ok(true)
+            } else if fprint == chunk_fprints[chunk_index as usize] {
                 // Nothing to do, it's all clean
                 Ok(false)
             } else {
@@ -463,9 +475,11 @@ impl Tracker {
                     repl.stage_chunk(fprint, slice)?;
                 }
 
-                chunk_fprints[chunk_index as usize] = fprint;
                 Ok(true)
-            }
+            };
+
+            chunk_fprints[chunk_index as usize] = fprint;
+            ret
         };
 
         for (base, expected_fprint) in &self.dirty_chunks {
@@ -523,7 +537,7 @@ impl Tracker {
             update(chunk_index, None)?;
         }
 
-        Ok((len, chunk_fprints, num_snapshotted))
+        Ok((len, chunk_fprints, bundled_chunks, num_snapshotted))
     }
 
     /// Stages a new snapshot for the db file's current contents,
@@ -561,10 +575,18 @@ impl Tracker {
             }
         }
 
+        // If we want to bundle something, we should always bundle it.
+        // That's the expected steady state, and avoids potential
+        // state transition bugs when the previous manifest did not
+        // bundle the same set of chunks we want to.
+        for offset in self.bundled_chunks_offset_list() {
+            self.dirty_chunks.insert(offset, None);
+        }
+
         // Try to get an initial list of chunks to work off.
         let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
 
-        let (len, mut chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
+        let (len, mut chunks, bundled_chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
 
         let (ctime, ctime_ns) = match self.file.metadata() {
             Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
@@ -594,7 +616,7 @@ impl Tracker {
                 ctime_ns,
                 base_chunks_fprint: base_fprint.map(|fp| fp.into()),
                 chunks: compressible,
-                bundled_chunks: Vec::new(),
+                bundled_chunks,
             }),
         };
 
