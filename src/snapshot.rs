@@ -66,8 +66,22 @@ impl Snapshot {
         base_chunk: Option<Arc<Chunk>>,
     ) -> Result<Snapshot> {
         let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
+        let mut loader = Loader::new(cache_builder, remote_sources)?;
 
-        let loader = Loader::new(cache_builder, remote_sources)?;
+        // Go through all `BundledChunk`s in the manifest, and register
+        // them in `loader`.
+        if let Some(v1) = manifest.v1.as_ref() {
+            v1.bundled_chunks
+                .iter()
+                .filter_map(|bundled| {
+                    let fprint: umash::Fingerprint = bundled.chunk_fprint.as_ref()?.into();
+
+                    Chunk::arc_from_cache(fprint)
+                        .or_else(|| Some(Chunk::arc_from_bytes(&bundled.chunk_data)))
+                })
+                .for_each(|chunk| loader.adjoin_known_chunk(chunk));
+        }
+
         let fetched = loader.fetch_all_chunks(&fprints)?;
 
         let mut len: u64 = 0;
