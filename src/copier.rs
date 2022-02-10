@@ -1852,6 +1852,10 @@ impl CopierWorker {
         // found (or `None`).
         *recent_base_chunk.lock().unwrap() = base;
 
+        // Don't bother keeping alive data for fingerprints we don't
+        // need to fetch.
+        chunks.retain(|fp| !crate::loader::is_well_known_fingerprint(*fp));
+
         // Touch that fraction of the chunks list, with randomised
         // rounding for any fractional number of chunks: rounding
         // down might consistently round to 0, and rounding up
