@@ -60,6 +60,38 @@ impl From<&Fprint> for Fingerprint {
     }
 }
 
+/// A `BundledChunk` is sent with a manifest, instead of indirecting
+/// through a content-addressed chunk store.
+///
+/// Readers may assume bundled data matches the list of chunk
+/// fingerprints in the `Manifest`.  They do not have to handle
+/// internally inconsistent `BundledChunk`s nor disagreements
+/// between `BundledChunk`s and the rest of the manifest.
+///
+/// In other words, bundling chunks with a manifest isn't merely a
+/// best-effort optimisation: incorrect metadata (`chunk_index` and
+/// `chunk_offset` in particular) can lead to an invalid snapshot.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct BundledChunk {
+    // The bundled chunk is expected to match this index in the
+    // manifest's list of chunk fingerprints.
+    #[prost(uint64, tag = "1")]
+    pub chunk_index: u64,
+
+    // The bundled chunk should be at that byte offset in the
+    // manifest's snapshot.
+    #[prost(uint64, tag = "2")]
+    pub chunk_offset: u64,
+
+    // The chunk's data has this fingerprint.
+    #[prost(message, tag = "3")]
+    pub chunk_fprint: Option<Fprint>,
+
+    // And the chunk consists of these bytes.
+    #[prost(bytes, tag = "4")]
+    pub chunk_data: Vec<u8>,
+}
+
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct ManifestV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There
@@ -130,6 +162,13 @@ pub struct ManifestV1 {
     // do so just before serialising the manifest.
     #[prost(fixed64, repeated, tag = "15")]
     pub chunks: Vec<u64>,
+
+    // The list of chunks bundled with this manifest.  When we have
+    // such a chunk, we don't look for it in the content-addressed
+    // store, and we can't assume the corresponding chunk exists in
+    // the content-addressed store.
+    #[prost(message, repeated, tag = "16")]
+    pub bundled_chunks: Vec<BundledChunk>,
 }
 
 /// When deserialising a `Manifest`, it usually makes sense to use
