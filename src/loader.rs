@@ -173,6 +173,11 @@ impl Chunk {
         Ok(Chunk { fprint, payload })
     }
 
+    /// Returns a cached chunk for `fprint`, if we have one.
+    pub(crate) fn arc_from_cache(fprint: Fingerprint) -> Option<Arc<Chunk>> {
+        fetch_from_cache(fprint)
+    }
+
     /// Returns a chunk (potentially cached) from `payload`.
     pub(crate) fn arc_from_bytes(payload: &[u8]) -> Arc<Chunk> {
         let fprint = fingerprint_file_chunk(payload);
@@ -333,6 +338,14 @@ impl Loader {
                 .map(|chunk| (chunk.fprint(), chunk))
                 .collect(),
         })
+    }
+
+    /// Registers a new chunk as "known" to the `Loader`, unless there
+    /// already was a known chunk with that fingerprint.
+    ///
+    /// Known chunks are returned directly and bypass any I/O.
+    pub(crate) fn adjoin_known_chunk(&mut self, chunk: Arc<Chunk>) {
+        self.known_chunks.entry(chunk.fprint()).or_insert(chunk);
     }
 
     /// Attempts to fetch the chunk for each fingerprint in `fprints`.
