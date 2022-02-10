@@ -87,6 +87,9 @@ impl Chunk {
 pub(crate) struct Loader {
     cache: kismet_cache::Cache,
     remote_sources: Vec<Bucket>,
+    // These chunks will be returned without involving any cache nor
+    // `remote_sources`.
+    known_chunks: HashMap<Fingerprint, Arc<Chunk>>,
 }
 
 lazy_static::lazy_static! {
@@ -123,6 +126,28 @@ lazy_static::lazy_static! {
         let fprint = fingerprint_file_chunk(&payload);
         (fprint, Arc::new(Chunk::new(fprint, payload).expect("fprint must match")))
     };
+}
+
+/// Returns the fingerprint for the zero-filled chunk.  We have
+/// special knowledge of this chunk and know its contents without
+/// fetching it from remote storage.
+#[inline]
+pub(crate) fn zero_fingerprint() -> Fingerprint {
+    ZERO_FILLED_CHUNK.0
+}
+
+/// Returns whether `fp` is "known" to the chunk loader: we don't need
+/// to hit remote storage to figure out what data they refer to.
+/// Changing the set of well-known fingerprints may affect
+/// compatibility.
+#[inline]
+pub(crate) fn is_well_known_fingerprint(fp: Fingerprint) -> bool {
+    fp == zero_fingerprint()
+}
+
+/// Returns a vector of all well-known chunks.
+fn well_known_chunks() -> Vec<Arc<Chunk>> {
+    vec![ZERO_FILLED_CHUNK.1.clone()]
 }
 
 impl Chunk {
@@ -303,6 +328,10 @@ impl Loader {
         Ok(Loader {
             cache: cache_builder.build(),
             remote_sources,
+            known_chunks: well_known_chunks()
+                .into_iter()
+                .map(|chunk| (chunk.fprint(), chunk))
+                .collect(),
         })
     }
 
@@ -346,8 +375,8 @@ impl Loader {
     pub(crate) fn fetch_chunk(&self, fprint: Fingerprint) -> Result<Option<Arc<Chunk>>> {
         use std::io::Write;
 
-        if fprint == ZERO_FILLED_CHUNK.0 {
-            return Ok(Some(ZERO_FILLED_CHUNK.1.clone()));
+        if let Some(chunk) = self.known_chunks.get(&fprint) {
+            return Ok(Some(chunk.clone()));
         }
 
         let contents = fetch_from_cache(fprint);
