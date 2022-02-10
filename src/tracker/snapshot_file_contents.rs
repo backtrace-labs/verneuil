@@ -562,6 +562,7 @@ impl Tracker {
                 ctime_ns,
                 base_chunks_fprint: base_fprint.map(|fp| fp.into()),
                 chunks: compressible,
+                bundled_chunks: Vec::new(),
             }),
         };
 
