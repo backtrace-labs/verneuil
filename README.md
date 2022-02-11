@@ -1,18 +1,23 @@
-Verneuil: streaming replication for sqlite
+Verneuil: streaming replication for SQLite
 ==========================================
 
 [![asciicast](doc/demo.gif)](https://asciinema.org/a/457886)
 
 Verneuil[^verneuil-process] [[vɛʁnœj]](https://en.wikipedia.org/wiki/Auguste_Victor_Louis_Verneuil)
 is a [VFS (OS abstraction layer)](https://www.sqlite.org/vfs.html) for
-[sqlite](https://www.sqlite.org/index.html) that accesses local
+[SQLite](https://www.sqlite.org/index.html) that accesses local
 database files like the default unix VFS while asynchronously
 replicating snapshots to [S3](https://aws.amazon.com/s3/)-compatible
 blob stores.  We wrote it to improve the scalability and availability
-of pre-existing services for which sqlite is a good fit, at least for
+of pre-existing services for which SQLite is a good fit, at least for
 single-node deployments.
 
-[^verneuil-process]:  The [Verneuil process](https://en.wikipedia.org/wiki/Verneuil_method) was the first commercial method of manufacturing synthetic gemstones... and DRH insists on pronouncing sqlite like a mineral, surely a precious one (:
+Backtrace relies on Verneuil to backup and replicate thousands of
+SQLite databases that range in size from 100KB to a few gigabytes,
+some of which see updates every second... for less than $40/day in S3
+costs.
+
+[^verneuil-process]:  The [Verneuil process](https://en.wikipedia.org/wiki/Verneuil_method) was the first commercial method of manufacturing synthetic gemstones... and DRH insists on pronouncing SQLite like a mineral, surely a precious one (:
 
 The primary design goal of Verneuil is to add asynchronous read
 replication to working single-node systems without introducing new
@@ -24,25 +29,25 @@ data is acceptable.
 
 In keeping with this conservative approach to replication, the local
 database file on disk remains the source of truth, and the VFS is
-fully compatible with sqlite's default `unix` VFS, even for concurrent
+fully compatible with SQLite's default `unix` VFS, even for concurrent
 (with file locking) accesses.  Verneuil stores all state that must
-persist across sqlite transactions on disk, so multiple processes can
+persist across SQLite transactions on disk, so multiple processes can
 still access and replicate the same database with Verneuil.
 
 Verneuil also paces all API calls (with a [currently hardcoded] limit
 of 30 call/second/process) to avoid "surprising" cloud bills, and
-decouples the sqlite VFS from the replication worker threads that
+decouples the SQLite VFS from the replication worker threads that
 upload data to a remote blob store with a crash-safe buffer directory
 that bounds its worst-case disk footprint to roughly four times the
 size of the source database file.  It's thus always safe to disable
 access to the blob store: buffered replication data may grow over
 time, but always within bounds.
 
-Replacing the default unix VFS with Verneuil impacts local sqlite
+Replacing the default unix VFS with Verneuil impacts local SQLite
 operations, of course: writes must be slower, in order to queue
 updates for replication.  However, this slowdown is usually
 proportional to the time it took to perform the write itself, and
-often dominated by the *two* `fsync`s incurred by sqlite transaction
+often dominated by the *two* `fsync`s incurred by SQLite transaction
 commits in rollback mode.  In addition, the additional replication
 logic runs with the write lock downgraded to a read lock, so
 subsequent transactions only block on the new replication step once
@@ -53,17 +58,17 @@ Verneuil is meant for asynchronous read replication, with streaming
 backups as a nice side effect.  The
 [replication approach](https://docs.google.com/document/d/173cfdvnVB_68No9vqmgKHc_SSd0Cy3-YmPaXZsVvXIg)
 is thus completely different.  In particular, while litestream only
-works with sqlite databases in WAL mode, Verneuil only supports
+works with SQLite databases in WAL mode, Verneuil only supports
 rollback journaling.  See `doc/DESIGN.md` for details.
 
 What's in this repo
 -------------------
 
 1. A "Linux" VFS (`c/linuxvfs.c`) that implements everything that
-   sqlite needs for a non-WAL DB, without all the backward
-   compatibility cruft in sqlite's Unix VFS.  The new VFS's behaviour
+   SQLite needs for a non-WAL DB, without all the backward
+   compatibility cruft in SQLite's Unix VFS.  The new VFS's behaviour
    is fully compatible with upstream's Unix VFS!  It's a simpler
-   starting point for new (Linux-only) sqlite VFSes.
+   starting point for new (Linux-only) SQLite VFSes.
 
 2. A Rust crate with a C interface (see `include/verneuil.h`) to
    configure and register:
@@ -71,14 +76,14 @@ What's in this repo
    - The `verneuil` VFS, which hooks into the Linux VFS to track changes,
      generate snapshots in spooling directories, and asynchronously
      upload spooled data to a remote blob store like S3.  This VFS is
-     only compatible with sqlite's rollback journal mode.  It can be
+     only compatible with SQLite's rollback journal mode.  It can be
      called directly as a Rust program, or via its C interface.
 
-   - The `verneuil_snapshot` VFS that lets sqlite access snapshots stored
+   - The `verneuil_snapshot` VFS that lets SQLite access snapshots stored
      in S3-compatible blob stores.
 
-3. A runtime-loadable sqlite extension, `libverneuil_vfs`, that lets
-   sqlite open databases with the `verneuil` VFS (to replicate the
+3. A runtime-loadable SQLite extension, `libverneuil_vfs`, that lets
+   SQLite open databases with the `verneuil` VFS (to replicate the
    database to remote storage), or with the `verneuil_snapshot` VFS
    (to access a replicated snapshot).
 
@@ -90,12 +95,12 @@ Quick start
 -----------
 
 There is more detailed setup information, including how to directly
-link against the verneuil crate instead of loading it as a sqlite
+link against the verneuil crate instead of loading it as a SQLite
 extension, in `doc/VFS.md` and `doc/SNAPSHOT_VFS.md`.  The
 `rusqlite_integration` example shows how that works for a Rust crate.
 
 For quick hacks and test drives, the easiest way to use Verneuil is to
-build it as a runtime loadable extension for sqlite
+build it as a runtime loadable extension for SQLite
 (`libverneuil_vfs`).
 
 `cargo build --release --examples --features='dynamic_vfs'`
@@ -144,7 +149,7 @@ credentials daemon, or by reading the `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` environment variables.
 
 Now that the environment is set up, we can load the extension in
-sqlite, and start replicating our writes to
+SQLite, and start replicating our writes to
 [S3](https://aws.amazon.com/s3/), or any other compatible blob server
 (we use [minio](https://min.io/) for testing).
 
@@ -163,7 +168,7 @@ sqlite> .open file:verneuil://source.host.name/path/to/replicated.db?vfs=verneui
 -- for the database at `/path/to/replicated.db`.
 ```
 
-Outside the sqlite shell, [extensions loading must be enabled](https://www.sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfigenableloadextension)
+Outside the SQLite shell, [extensions loading must be enabled](https://www.sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfigenableloadextension)
 in order to allow access to the [`load_extension` SQL function](https://www.sqlite.org/lang_corefunc.html#load_extension).
 
 [URI filenames](https://www.sqlite.org/uri.html) must also be enabled
@@ -171,7 +176,7 @@ in order to specify the VFS in the connection string; it's also possible
 to [pass a VFS argument to `sqlite3_open_v2`](https://www.sqlite.org/c3ref/open.html).
 
 Replication data is buffered to the `replication_spooling_dir`
-synchronously, before the end of each sqlite transaction.  Actually
+synchronously, before the end of each SQLite transaction.  Actually
 uploading the data to remote storage happens asynchronously: we
 wouldn't want to block transaction commit on network calls.
 
@@ -273,8 +278,8 @@ OPTIONS:
 But why?
 --------
 
-Backtraces shards most of its backend metadata in a few thousand small
-(1-2 MB) to medium size (up to 1-2 GB) sqlite databases, with an
+Backtraces shards most of its backend metadata in thousands of small
+(1-2 MB) to medium size (up to 1-2 GB) SQLite databases, with an
 average aggregate write rate of a few dozen write transactions per
 second (with a few hot databases and many cold ones).  Before
 Verneuil, this approach offered adequate performance and availability.
@@ -296,12 +301,12 @@ hundred databases in rapid succession.
 Data freshness is not a goal because Verneuil prioritises disaster
 avoidance over everything else.  That's why we interpose a wait-free
 crash-safe replication buffer (implemented as files on disk) between
-the snapshot update logic, which must run synchronously with sqlite
+the snapshot update logic, which must run synchronously with SQLite
 transaction commits, and the copier worker threads that upload
 snapshot data to remote blob stores.  We trust this buffer to act as a
 "data diode" that architecturally shuts off feedback loops from the
-copier workers back to the sqlite VFS (i.e., back to the application).
-Crucially, the amount of buffered data for a given sqlite data base is
+copier workers back to the SQLite VFS (i.e., back to the application).
+Crucially, the amount of buffered data for a given SQLite data base is
 bounded to a multiple of that database file's size, even when copiers
 are completely stuck.  Even when the blob store is inaccessible or a
 target bucket misconfigured, local operations will not be interrupted
@@ -336,7 +341,7 @@ incompressible data, less if zstd is useful), or a manifest (16 bytes
 per 64 KB chunk in the source database file, so 512 KB for a 2 GB
 file).
 
-[^size-limit]: This hardcoded limit, coupled with the patrol logic that "touches" every extant chunk once a day, limits the total size of replicated databases for a single process: the replication logic may break down around 20-30 GB, but local operations should not be affected, except for the bounded growth in buffered replication data.  That's not an issue for us because we only store metadata in sqlite, metadata that tends to be orders of magnitude smaller than the data.
+[^size-limit]: This hardcoded limit, coupled with the patrol logic that "touches" every extant chunk once a day, limits the total size of replicated databases for a single process: the replication logic may break down around 20-30 GB, but local operations should not be affected, except for the bounded growth in buffered replication data.  That's not an issue for us because we only store metadata in SQLite, metadata that tends to be orders of magnitude smaller than the data.
 
 Chunks can be reaped by a retention rule that deletes them after a
 week of inactivity (Verneuil attempts to "touch" useful chunks once a
@@ -370,14 +375,14 @@ How is it tested?
 
 In addition to simply running this in production to confirm that
 regular single-node operations still work and that the code correctly
-paces its API calls, we use sqlite's open source regression test
+paces its API calls, we use SQLite's open source regression test
 suite, after replacing the default Unix VFS with Verneuil.
 Unfortunately, some tests assume WAL DBs are supported, so we have to
-disable them; some others inject failures to exercise sqlite's failure
+disable them; some others inject failures to exercise SQLite's failure
 handling logic, those too must be disabled.  The resulting test suite
 lives at https://github.com/pkhuong/sqlite/tree/pkhuong/no-wal-baseline
 
-Configure a sqlite `build` directory from the mutilated test suite,
+Configure a SQLite `build` directory from the mutilated test suite,
 then run `verneuil/t/test.sh` to build test executables that load
 the Verneuil VFS and make it the new default.  The test script also
 spins up a local minio container for the Verneuil VFS.
@@ -385,7 +390,7 @@ spins up a local minio container for the Verneuil VFS.
 In test mode, the VFS executes internal consistency checking code, and
 panics whenever it notices a spooling or replication failure.
 
-The logic for read replicas can't piggyback on top of the sqlite test
+The logic for read replicas can't piggyback on top of the SQLite test
 suite as easily. It is instead subjected to classic unit testing and
 manual smoke testing.
 
@@ -393,30 +398,27 @@ What's missing for 1.0
 ----------------------
 
 - Configurability: most of the plumbing is there to configure
-  individual sqlite connections, but the current implementation is
+  individual SQLite connections, but the current implementation is
   geared towards a program linking directly against libverneuil and
   configuring it with C calls.  We can already load Verneuil in
-  sqlite by configuring it with an environment variable (which matches
+  SQLite by configuring it with an environment variable (which matches
   the current global configuration structure), but we should add
   support for reading configuration data from the connection string
-  (sqlite query string parameters).
+  (SQLite query string parameters).
 
 Things we should do after 1.0
 -----------------------------
 
 1. We currently always create the journal file in `0644`.  Umask applies,
-   but it would make sense to implement the same logic as sqlite's Unix
+   but it would make sense to implement the same logic as SQLite's Unix
    VFS and inherit the main db file's permissions.
 
-2. The first page in a sqlite DB almost always changes after a write
-   transaction.  Should we bundle it with the directory proto?
-
-3. Many filesystems now support copy-on-write; we should think about
+2. Many filesystems now support copy-on-write; we should think about
    using that for the commit step, instead of a journal file!
 
-4. The S3 client library is really naive.  We should reuse HTTPS
+3. The S3 client library is really naive.  We should reuse HTTPS
    connections.
 
-5. Consider some way to get chunks without indirecting through S3.
+4. Consider some way to get chunks without indirecting through S3.
    Could gossip promising chunks ahead of time, or simply serve them
    on demand over request-response like HTTP.
