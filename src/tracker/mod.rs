@@ -35,7 +35,14 @@ pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
 /// Don't generate a base fingerprint chunk for a list of fingerprints
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
-const BASE_CHUNK_MIN_LENGTH: usize = 1024;
+///
+/// Production experience shows the base chunk system is effective in
+/// practice.  Enabling that system for db files than span 600 chunks
+/// means that, in the worst case (a series of write transactions that
+/// each change one chunk, without repetition), we can expect to
+/// generate 5.5% more chunks (for base fingerprint lists) than the
+/// changed chunks themselves.  That seems acceptable.
+const BASE_CHUNK_MIN_LENGTH: usize = 600;
 
 /// Always bundle chunks at these offsets with the manifest.
 ///
