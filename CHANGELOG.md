@@ -1,6 +1,13 @@
-0.3.0 2022-02-11
+0.4.0 2022-02-11
 ----------------
-* New manifests format now includes the first chunk (which changes
+* Backward-incompatible tweak to the new manifest format,
+  before the old protobuf spec sees too much use (9e1183c3)
+* Use a base chunk for the fingerprint list more aggressively
+  (24746b30)
+
+0.3.0 2022-02-11 (YANKED for proto spec tweak)
+----------------
+* New manifest format now includes the first chunk (which changes
   after every successful sqlite write transaction) in order to save
   API calls for reads and writes (8e7fa62b) [#7]
 * More tentative support for long paths (> `MAX_MAX`) (76519c99)
