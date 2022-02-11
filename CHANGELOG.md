@@ -1,3 +1,8 @@
+0.4.1 2022-01-22
+----------------
+* Add a field in manifests to describe the program/library version
+  that generated each manifest (f855c656)
+
 0.4.0 2022-02-11
 ----------------
 * Backward-incompatible tweak to the new manifest format,
