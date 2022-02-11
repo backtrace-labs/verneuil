@@ -476,13 +476,14 @@ pub(crate) fn restore_slashes(input: &str) -> Result<Option<String>> {
     }
 }
 
-fn mangle_string(string: &str) -> String {
-    let unslashified = replace_slashes(string);
-
+/// If `input` is at least as long as `MAX_MANGLED_NAME_LENGTH`,
+/// shorten it to slightly more than `MAX_MANGLED_NAME_LENGTH`
+/// in order to guarantee the name fits in `NAME_MAX`.
+fn pseudo_uniquely_fit_string_in_filename(input: String) -> String {
     // Avoid fencepost bugs and never generate a mangled string
     // that's exactly MAX_MANGLED_NAME_LENGTH long.
-    if unslashified.as_bytes().len() < MAX_MANGLED_NAME_LENGTH {
-        return unslashified;
+    if input.as_bytes().len() < MAX_MANGLED_NAME_LENGTH {
+        return input;
     }
 
     lazy_static::lazy_static! {
@@ -492,7 +493,7 @@ fn mangle_string(string: &str) -> String {
     // This fingerprint will be printed as 2x 16 hex char strings.
     let fprint = MANGLE_PARAMS
         .fingerprinter(0)
-        .write(unslashified.as_bytes())
+        .write(input.as_bytes())
         .digest();
 
     // MAX_MANGLED_NAME_LENGTH is a bit short of the expected
@@ -506,13 +507,16 @@ fn mangle_string(string: &str) -> String {
     // MAX_MANGLED_NAME_LENGTH is comfortable less than 255, so the
     // final mangled name is both definitely longer than
     // MAX_MANGLED_NAME_LENGTH and shorter than 255.
-    let left = String::from_utf8_lossy(&unslashified.as_bytes()[..fragment_len]);
-    let right =
-        String::from_utf8_lossy(&unslashified.as_bytes()[unslashified.len() - fragment_len..]);
+    let left = String::from_utf8_lossy(&input.as_bytes()[..fragment_len]);
+    let right = String::from_utf8_lossy(&input.as_bytes()[input.len() - fragment_len..]);
     format!(
         "{}{:016x}{:016x}{}",
         left, fprint.hash[0], fprint.hash[1], right
     )
+}
+
+fn mangle_string(string: &str) -> String {
+    pseudo_uniquely_fit_string_in_filename(replace_slashes(string))
 }
 
 /// Mangles a path to an extent database into a directory name:
