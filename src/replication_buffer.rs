@@ -837,7 +837,10 @@ pub fn manifest_name_for_hostname_path(hostname_or: Option<&str>, path: &Path) -
         path_hash % (1 << (4 * 4)),
         string
     );
-    Ok(percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string())
+
+    Ok(pseudo_uniquely_fit_string_in_filename(
+        percent_encoding::utf8_percent_encode(&name, &ESCAPED).to_string(),
+    ))
 }
 
 /// Returns a conservatively percent-encoded URI for `path`.
