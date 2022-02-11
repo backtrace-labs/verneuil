@@ -150,6 +150,10 @@ pub struct ManifestV1 {
     #[prost(message, tag = "8")]
     pub base_chunks_fprint: Option<Fprint>,
 
+    // Program and version that generated this manifest.
+    #[prost(string, optional, tag = "9")]
+    pub generated_by: Option<String>,
+
     // The fingerprints for each chunk as pairs of u64.  The first
     // chunk has fingerprint `chunks[0], chunks[1]`, the second
     // `chunks[2], chunks[3]`, etc.
@@ -184,6 +188,15 @@ pub struct Manifest {
     //
     // In fact, we might want to consider marking 5 as reserved, or
     // guarantee we'll always zstd-compress manifest blob contents.
+}
+
+/// Returns the `generator_version` string for this build.
+pub(crate) fn generator_version_string() -> String {
+    format!(
+        "{}-v{}",
+        option_env!("CARGO_CRATE_NAME").unwrap_or("Verneuil?"),
+        option_env!("CARGO_PKG_VERSION").unwrap_or("UnknownVersion")
+    )
 }
 
 impl Manifest {
