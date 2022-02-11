@@ -1,7 +1,14 @@
+0.3.0 2022-02-11
+----------------
+* New manifests format now includes the first chunk (which changes
+  after every successful sqlite write transaction) in order to save
+  API calls for reads and writes (8e7fa62b) [#7]
+* More tentative support for long paths (> `MAX_MAX`) (76519c99)
+
 0.2.0 2022-02-08
 ----------------
 * New, better compressible, manifest format, to reduce the manifest
-  overhead for large (1+ GB) sqlite files (internal docs in edacfeb6)
+  overhead for large (1+ GB) sqlite files (internal docs in edacfeb6) [#3]
 
 0.1.5 2022-02-06
 ----------------
@@ -14,7 +21,7 @@
 -----------------
 * Enable dynamic linking against older sqlites (b834c18d)
 * Simplify the logic to avoid low fd numbers (2be8aeac)
-* Support long paths (> NAME_MAX) (5689ff3d) [#1]
+* Support long paths (> `NAME_MAX`) (5689ff3d) [#1]
 * Upgrade to governor 0.4 to drop one dependency on hash brown.
 
 0.1.3 2021-12-07
