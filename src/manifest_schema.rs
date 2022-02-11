@@ -88,7 +88,7 @@ pub struct BundledChunk {
     pub chunk_fprint: Option<Fprint>,
 
     // And the chunk consists of these bytes.
-    #[prost(bytes, tag = "4")]
+    #[prost(bytes, tag = "15")]
     pub chunk_data: Vec<u8>,
 }
 
