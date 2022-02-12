@@ -735,3 +735,95 @@ fn check_chunk_fingerprint() {
 
     assert_eq!(hash_file_chunk(&zeros), 8155395758008617606);
 }
+
+/// Make sure prost can serialise and deserialise empty `Fprint`
+/// protos.
+#[test]
+fn test_fprint_default() {
+    use prost::Message;
+
+    let defaults = Fprint { major: 0, minor: 0 };
+
+    let empty: &[u8] = b"";
+    let decoded = Fprint::decode(empty).expect("empty Fprint should parse");
+    assert_eq!(decoded, defaults);
+
+    let mut encoded = Vec::new();
+    defaults
+        .encode(&mut encoded)
+        .expect("default Fprint should serialise");
+    assert_eq!(encoded, b"");
+}
+
+/// Make sure prost can serialise and deserialise empty `BundledChunk`
+/// protos.
+#[test]
+fn test_bundled_chunk_default() {
+    use prost::Message;
+
+    let defaults = BundledChunk {
+        chunk_index: 0,
+        chunk_offset: 0,
+        chunk_fprint: None,
+        chunk_data: vec![],
+    };
+
+    let empty: &[u8] = b"";
+    let decoded = BundledChunk::decode(empty).expect("empty BundledChunk should parse");
+    assert_eq!(decoded, defaults);
+
+    let mut encoded = Vec::new();
+    defaults
+        .encode(&mut encoded)
+        .expect("default BundledChunk should serialise");
+    assert_eq!(encoded, b"");
+}
+
+/// Make sure prost can serialise and deserialise empty `ManifestV1`
+/// protos.
+#[test]
+fn test_manifest_v1_default() {
+    use prost::Message;
+
+    let defaults = ManifestV1 {
+        header_fprint: None,
+        version_id: vec![],
+        contents_fprint: None,
+        len: 0,
+        ctime: 0,
+        ctime_ns: 0,
+        base_chunks_fprint: None,
+        generated_by: None,
+        chunks: vec![],
+        bundled_chunks: vec![],
+    };
+
+    let empty: &[u8] = b"";
+    let decoded = ManifestV1::decode(empty).expect("empty ManifestV1 should parse");
+    assert_eq!(decoded, defaults);
+
+    let mut encoded = Vec::new();
+    defaults
+        .encode(&mut encoded)
+        .expect("default ManifestV1 should serialise");
+    assert_eq!(encoded, b"");
+}
+
+/// Make sure prost can serialise and deserialise empty `Manifest`
+/// protos.
+#[test]
+fn test_manifest_default() {
+    use prost::Message;
+
+    let defaults = Manifest { v1: None };
+
+    let empty: &[u8] = b"";
+    let decoded = Manifest::decode(empty).expect("empty Manifest should parse");
+    assert_eq!(decoded, defaults);
+
+    let mut encoded = Vec::new();
+    defaults
+        .encode(&mut encoded)
+        .expect("default Manifest should serialise");
+    assert_eq!(encoded, b"");
+}
