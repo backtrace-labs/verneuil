@@ -615,7 +615,7 @@ impl Tracker {
                 ctime,
                 ctime_ns,
                 base_chunks_fprint: base_fprint.map(|fp| fp.into()),
-                generated_by: Some(crate::manifest_schema::generator_version_string()),
+                generated_by: crate::manifest_schema::generator_version_bytes(),
                 chunks: compressible,
                 bundled_chunks,
             }),

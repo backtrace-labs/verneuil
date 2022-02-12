@@ -151,8 +151,8 @@ pub struct ManifestV1 {
     pub base_chunks_fprint: Option<Fprint>,
 
     // Program and version that generated this manifest.
-    #[prost(string, optional, tag = "9")]
-    pub generated_by: Option<String>,
+    #[prost(bytes, tag = "9")]
+    pub generated_by: Vec<u8>,
 
     // The fingerprints for each chunk as pairs of u64.  The first
     // chunk has fingerprint `chunks[0], chunks[1]`, the second
@@ -190,13 +190,14 @@ pub struct Manifest {
     // guarantee we'll always zstd-compress manifest blob contents.
 }
 
-/// Returns the `generator_version` string for this build.
-pub(crate) fn generator_version_string() -> String {
+/// Returns the `generator_version` byte string for this build.
+pub(crate) fn generator_version_bytes() -> Vec<u8> {
     format!(
         "{}-v{}",
         option_env!("CARGO_CRATE_NAME").unwrap_or("Verneuil?"),
         option_env!("CARGO_PKG_VERSION").unwrap_or("UnknownVersion")
     )
+    .into_bytes()
 }
 
 impl Manifest {
@@ -793,7 +794,7 @@ fn test_manifest_v1_default() {
         ctime: 0,
         ctime_ns: 0,
         base_chunks_fprint: None,
-        generated_by: None,
+        generated_by: vec![],
         chunks: vec![],
         bundled_chunks: vec![],
     };
