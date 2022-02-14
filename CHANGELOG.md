@@ -1,4 +1,9 @@
-0.4.1 2022-01-22
+0.4.2 2022-02-14
+----------------
+* Try to detect when the boot time changes and still reuse the old
+  spooling directory path for the current boot.
+
+0.4.1 2022-02-12
 ----------------
 * Add a field in manifests to describe the program/library version
   that generated each manifest (f855c656)
