@@ -180,6 +180,16 @@ lazy_static::lazy_static! {
     static ref DEFAULT_SPOOLING_DIRECTORY: RwLock<Option<PathBuf>> = Default::default();
 }
 
+/// Account for clock drift by up to this many seconds when probe for
+/// per-boot directories: the directories' names contain the boot
+/// time, and that value is subject to time adjustment.
+///
+/// We have observed 1 second adjustments (maybe a much smaller change
+/// rounded to second precision) on EC2.  2 seconds should hopefully
+/// be enough, except when opening a db with Verneuil immediately
+/// after booting up a machine that had been off for hours.
+const INSTANCE_ID_PROBE_RANGE: u64 = 2;
+
 /// We tag the per-boot directory with a version string: if we upgrade
 /// or downgrade to a different directory tree format, Verneuil will
 /// treat that as no or stale data (a well tested path), rather than
@@ -1046,13 +1056,31 @@ pub(crate) fn directory_meta(parent: PathBuf) -> PathBuf {
 /// Appends the current instance id to the replication spooling
 /// `prefix`.
 pub(crate) fn current_spooling_dir(mut prefix: PathBuf) -> PathBuf {
-    // Add an instance id.
-    prefix.push(format!(
-        "verneuil-{}-{}",
-        replace_slashes(instance_id::instance_id()),
-        ON_DISK_FORMAT_VERSION_SUFFIX,
-    ));
+    /// Constructs a subdirectory name that includes the instance id
+    /// and the on-disk version suffix.
+    fn dir_name(instance_id: &str) -> String {
+        format!(
+            "verneuil-{}-{}",
+            replace_slashes(instance_id),
+            ON_DISK_FORMAT_VERSION_SUFFIX,
+        )
+    }
 
+    // Check for pre-existing subdirectories with slightly different
+    // instance ids.
+    for probe in instance_id::likely_instance_ids(INSTANCE_ID_PROBE_RANGE) {
+        prefix.push(dir_name(&probe));
+
+        if prefix.is_dir() {
+            return prefix;
+        }
+
+        prefix.pop();
+    }
+
+    // Otherwise, create a new one from what we believe is the
+    // actual instance id.
+    prefix.push(dir_name(instance_id::instance_id()));
     prefix
 }
 

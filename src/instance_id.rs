@@ -98,6 +98,36 @@ pub(crate) fn instance_id() -> &'static str {
     &INSTANCE
 }
 
+/// Returns a list of instance ids within `range` seconds of our
+/// `boot_timestamp()`, from most to least similar to `instance_id()`.
+/// The `boot_id()` suffices for correctness, while the
+/// `boot_timestamp()` mostly exists to help operators, so it can make
+/// sense to probe for `boot_timestamp()`.
+///
+/// The `boot_timestamp()` is subject to time adjustments, so we may
+/// want to probe for instance ids similar to the one we think we
+/// have.  If we ever allow configuration without `boot_id()`, this
+/// function should probably detect that situation and inconditionally
+/// return an empty list.
+pub(crate) fn likely_instance_ids(range: u64) -> Vec<String> {
+    let base_ts = boot_timestamp();
+    let boot_id = boot_id();
+
+    let mut ret = vec![instance_id().to_string()];
+
+    for delta in 1..=range {
+        if let Some(ts) = base_ts.checked_sub(delta) {
+            ret.push(format!("{}.{}", ts, boot_id));
+        }
+
+        if let Some(ts) = base_ts.checked_add(delta) {
+            ret.push(format!("{}.{}", ts, boot_id));
+        }
+    }
+
+    ret
+}
+
 #[test]
 fn print_boot_time() {
     assert_ne!(boot_timestamp(), 0);
