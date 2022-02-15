@@ -1,6 +1,6 @@
 [package]
 name = "verneuil"
-version = "0.4.2"
+version = "0.5.0"
 description = "A sqlite VFS for asynchronous replication to S3-compatible blob stores"
 license = "MIT"
 repository = "https://github.com/backtrace-labs/verneuil"

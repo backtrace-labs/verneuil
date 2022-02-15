@@ -1,3 +1,10 @@
+0.5.0 2022-02-15
+----------------
+* Build with clap v3, which needs Rust >= 1.54 (c979b425), and forced
+  us to only use long options for `--hostname` in `verneuilctl` (b6a8dfcd)
+* New `verneuilctl shell` subcommand to open a replica in the sqlite3
+  shell (452e3006)
+
 0.4.2 2022-02-14
 ----------------
 * Try to detect when the boot time changes and still reuse the old
