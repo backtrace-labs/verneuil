@@ -49,6 +49,7 @@ enum Command {
     Manifest(Manifest),
     Flush(Flush),
     Sync(Sync),
+    Shell(Shell),
 }
 
 // Writes the contents of `reader` to `out`, or stdout if `None`.
@@ -308,6 +309,156 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Parser)]
+#[clap(setting = clap::AppSettings::TrailingVarArg)]
+/// The verneuilctl shell utility accepts the path to a verneuil
+/// manifest file, and opens the snapshot it describes in the sqlite
+/// shell.
+struct Shell {
+    /// The manifest file that describes the snapshot to restore.
+    ///
+    /// These are typically stored as objects in versioned buckets;
+    /// it is up to the invoker to fish out the relevant version.
+    ///
+    /// If missing, verneuilctl restore will attempt to download it
+    /// from remote storage, based on `--hostname` and `--source_path`.
+    ///
+    /// As special cases, an `http://` or `https://` prefix will be
+    /// downloaded over HTTP(S), an
+    /// `s3://bucket.region[.endpoint]/path/to/blob` URI will be
+    /// loaded via HTTPS domain-addressed S3,
+    /// `verneuil://machine-host-name/path/to/sqlite.db` will be
+    /// loaded based on that hostname (or the current machine's
+    /// hostname if empty) and source path, and a `file://` prefix
+    /// will always be read as a local path.
+    #[clap(short, long)]
+    manifest: Option<String>,
+
+    /// The hostname of the machine that generated the snapshot.
+    ///
+    /// Defaults to the current machine's hostname.
+    #[clap(long)]
+    hostname: Option<String>,
+
+    /// The path to the source file that was replicated by Verneuil,
+    /// when it ran on `--hostname`.
+    #[clap(short, long, parse(from_os_str))]
+    source_path: Option<PathBuf>,
+
+    /// The path to the sqlite3 shell executable; defaults to
+    /// searching PATH for `sqlite3`.
+    #[clap(short, long)]
+    executable: Option<std::ffi::OsString>,
+
+    /// The path to the libverneuil_vfs shared object; defaults to
+    /// searching the `lib` directory in the executable's parent
+    /// directory, then the executable's parent directory, and finally
+    /// sqlite3's default search logic.
+    #[clap(short, long)]
+    vfs: Option<String>,
+
+    /// Additional arguments for sqlite3.
+    sqlite3_arguments: Vec<String>,
+}
+
+fn shell(cmd: Shell, config: Options) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    const VFS_NAME: &str = "libverneuil_vfs";
+
+    // We have to URL encode the path we pass to sqlite3.
+    const ESCAPED: percent_encoding::AsciiSet =
+        percent_encoding::CONTROLS.add(b'%').add(b'?').add(b'&');
+
+    // Looks for `libverneuil_vfs.so` in a sibling `lib` directory
+    // (e.g., if we're at `.../bin/verneuilctl` and the vfs is at
+    // `.../lib/libverneuil_vfs.so`), then in the same directory
+    // as this executable.
+    //
+    // If that fails, let sqlite perform its own lookup.
+    fn find_verneuil_vfs_path() -> Result<String> {
+        let self_path = std::env::current_exe()
+            .map_err(|e| chain_error!(e, "failed to get the path to verneuilctl"))?;
+        let self_path = std::fs::canonicalize(&self_path)
+            .map_err(|e| chain_error!(e, "failed to canonicalise self path", ?self_path))?;
+
+        if let Some(parent) = self_path.parent().map(std::path::Path::parent).flatten() {
+            let probe = parent.join("lib").join(format!("{}.so", VFS_NAME));
+
+            if probe.exists() {
+                return probe
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|e| chain_error!(e, "failed to stringify path"));
+            }
+        }
+
+        if let Some(parent) = self_path.parent() {
+            let probe = parent.join(format!("{}.so", VFS_NAME));
+
+            if probe.exists() {
+                return probe
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|e| chain_error!(e, "failed to stringify path"));
+            }
+        }
+
+        Ok(VFS_NAME.to_string())
+    }
+
+    let source = if let Some(source) = cmd.manifest {
+        source
+    } else if let Some(path) = cmd.source_path {
+        let canonical;
+
+        format!(
+            "verneuil://{}{}",
+            cmd.hostname.as_deref().unwrap_or(""),
+            if path.is_absolute() {
+                path.to_string_lossy()
+            } else {
+                canonical = std::fs::canonicalize(&path)
+                    .map_err(|e| chain_error!(e, "failed to canonicalize relative path", ?path))?;
+
+                canonical.to_string_lossy()
+            }
+        )
+    } else {
+        return Err(fresh_error!(
+            "One of `--manifest` or `--source_path` must be provided to `verneuilctl shell`",
+            ?cmd
+        ));
+    };
+
+    let vfs_path = if let Some(vfs) = cmd.vfs {
+        vfs
+    } else {
+        find_verneuil_vfs_path()?
+    };
+
+    let target = cmd
+        .executable
+        .as_deref()
+        .unwrap_or_else(|| std::ffi::OsStr::new("sqlite3"));
+
+    let mut exec = std::process::Command::new(target);
+    exec.env(
+        verneuil::VERNEUIL_CONFIG_ENV_VAR,
+        serde_json::to_string(&config).map_err(|e| chain_error!(e, "failed to unparse config"))?,
+    )
+    .arg("-cmd")
+    .arg(format!(".load {}", vfs_path))
+    .arg("-cmd")
+    .arg(format!(
+        ".open file:{}?vfs=verneuil_snapshot",
+        percent_encoding::utf8_percent_encode(&source, &ESCAPED)
+    ))
+    .args(cmd.sqlite3_arguments);
+
+    Err(exec.exec()).map_err(|e| chain_error!(e, "failed to spawn sqlite3 shell", ?target))
+}
+
 pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -367,5 +518,6 @@ pub fn main() -> Result<()> {
         Command::Manifest(cmd) => manifest(cmd, replication_config(ApplyConfig::No)?),
         Command::Flush(cmd) => flush(cmd),
         Command::Sync(cmd) => sync(cmd, replication_config(ApplyConfig::All)?),
+        Command::Shell(cmd) => shell(cmd, replication_config(ApplyConfig::No)?),
     }
 }
