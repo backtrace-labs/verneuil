@@ -117,7 +117,7 @@ struct Restore {
     /// The hostname of the machine that generated the snapshot.
     ///
     /// Defaults to the current machine's hostname.
-    #[clap(short, long)]
+    #[clap(long)]
     hostname: Option<String>,
 
     /// The path to the source file that was replicated by Verneuil,
@@ -181,7 +181,7 @@ struct ManifestName {
 
     /// The hostname (/etc/hostname) of the machine that replicated
     /// that source file.  Defaults to the current hostname.
-    #[clap(short, long)]
+    #[clap(long)]
     hostname: Option<String>,
 }
 
@@ -205,7 +205,7 @@ struct Manifest {
 
     /// The hostname (/etc/hostname) of the machine that replicated
     /// that source file.  Defaults to the current hostname.
-    #[clap(short, long)]
+    #[clap(long)]
     hostname: Option<String>,
 
     /// The path to the output manifest file.
