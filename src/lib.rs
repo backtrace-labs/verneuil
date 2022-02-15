@@ -34,7 +34,7 @@ pub use snapshot::Snapshot;
 pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";
 
 /// Initialization options for the Verneuil VFS.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Options {
     /// If true, the Verneuil VFS overrides the default sqlite VFS.
