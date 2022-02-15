@@ -1,12 +1,13 @@
 use std::path::PathBuf;
-use structopt::StructOpt;
+
+use clap::Parser;
 use verneuil::chain_error;
 use verneuil::fresh_error;
 use verneuil::Options;
 use verneuil::Result;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     name = "verneuilctl",
     about = "utilities to interact with Verneuil snapshots"
 )]
@@ -26,7 +27,7 @@ struct Opt {
     ///
     /// This parameter is optional, and defaults to the value of the
     /// `VERNEUIL_CONFIG` environment variable.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     config: Option<String>,
 
     /// Log level, in the same format as `RUST_LOG`.  Defaults to
@@ -34,14 +35,14 @@ struct Opt {
     /// verbosity to also log info and warning to stderr.
     ///
     /// To fully disable logging, pass `--log=off`.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     log: Option<String>,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     cmd: Command,
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 enum Command {
     Restore(Restore),
     ManifestName(ManifestName),
@@ -89,7 +90,7 @@ fn output_reader(mut reader: impl std::io::Read, out: &Option<PathBuf>) -> Resul
     Ok(())
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 /// The verneuilctl restore utility accepts the path to a verneuil
 /// manifest file, and reconstructs its contents to the `--out`
 /// argument (or stdout by default).
@@ -110,24 +111,24 @@ struct Restore {
     /// loaded based on that hostname (or the current machine's
     /// hostname if empty) and source path, and a `file://` prefix
     /// will always be read as a local path.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     manifest: Option<String>,
 
     /// The hostname of the machine that generated the snapshot.
     ///
     /// Defaults to the current machine's hostname.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     hostname: Option<String>,
 
     /// The path to the source file that was replicated by Verneuil,
     /// when it ran on `--hostname`.
-    #[structopt(short, long, parse(from_os_str))]
+    #[clap(short, long, parse(from_os_str))]
     source_path: Option<PathBuf>,
 
     /// The path to the reconstructed output file.
     ///
     /// Defaults to stdout.
-    #[structopt(short, long, parse(from_os_str))]
+    #[clap(short, long, parse(from_os_str))]
     out: Option<PathBuf>,
 }
 
@@ -169,18 +170,18 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
     output_reader(reader, &cmd.out)
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 /// The verneuilctl manifest-name utility accepts the path to a source
 /// replicated file and an optional hostname, and prints the name of
 /// the corresponding manifest file to stdout.
 struct ManifestName {
     /// The path to the source file that was replicated by Verneuil.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// The hostname (/etc/hostname) of the machine that replicated
     /// that source file.  Defaults to the current hostname.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     hostname: Option<String>,
 }
 
@@ -193,24 +194,24 @@ fn manifest_name(cmd: ManifestName) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 /// The verneuilctl manifest utility accepts the path to a source
 /// replicated file and an optional hostname, and outputs the contents
 /// of the corresponding manifest file to `--out`, or stdout by default.
 struct Manifest {
     /// The path to the source file that was replicated by Verneuil.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// The hostname (/etc/hostname) of the machine that replicated
     /// that source file.  Defaults to the current hostname.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     hostname: Option<String>,
 
     /// The path to the output manifest file.
     ///
     /// Defaults to stdout.
-    #[structopt(short, long, parse(from_os_str))]
+    #[clap(short, long, parse(from_os_str))]
     out: Option<PathBuf>,
 }
 
@@ -227,13 +228,13 @@ fn manifest(cmd: Manifest, config: Options) -> Result<()> {
     output_reader(&*bytes, &cmd.out)
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 /// The verneuilctl flush utility accepts the path to a spooling directory,
 /// (i.e., a value for `verneuil::Options::replication_spooling_dir`), and
 /// attempts to upload all the files pending replication in that directory.
 struct Flush {
     /// The replication spooling directory prefix.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str))]
     spooling: PathBuf,
 }
 
@@ -241,14 +242,14 @@ fn flush(cmd: Flush) -> Result<()> {
     verneuil::copy_all_spool_paths(cmd.spooling, /*best_effort*/ false)
 }
 
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 /// The verneuilctl sync utility accepts the path to a sqlite db, and
 /// uploads a fresh snapshot to the configured replication targets.
 ///
 /// On success, prints the manifest name to stdout.
 struct Sync {
     /// The source sqlite database file.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// Whether to optimize the database before uploading it.
@@ -257,7 +258,7 @@ struct Sync {
     /// size to 64 KB (ideal for Verneuil), and vacuuming the
     /// database.  Vacuuming makes the updated page size actually take
     /// effect, and garbage collects the database's contents.
-    #[structopt(short, long)]
+    #[clap(short, long)]
     optimize: bool,
 }
 
@@ -310,7 +311,7 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
 pub fn main() -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
 
     // Send tracing calls to stderr, and convert any log! call to
     // traces.

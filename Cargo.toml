@@ -58,6 +58,9 @@ backtrace = "0.3"
 # but only during tests.
 blake2b_simd = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
+# Having dev dependencies as optional makes it possible to
+# build verneuil's examples out of tree.
+clap = { version = "3", optional = true }
 crossbeam-channel = "0.5"
 governor = { version = "0.4", default-features = false, features = ["std", "jitter"] }  # 0.4 doesn't build without "jitter"
 itertools = "0.10"
@@ -74,9 +77,6 @@ regex = "1"
 rust-s3 = { version = "0.28", default-features = false, features = ["tokio-rustls-tls", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Having dev dependencies as optional makes it possible to
-# build verneuil's examples out of tree.
-structopt = { version = "0.3", optional = true }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "time"], default-features = false }
 tracing = "0.1"
@@ -89,7 +89,7 @@ zstd = "0.10"
 [dev-dependencies]
 rusqlite = { version = "0.26" }  # For the sample rusqlite_integration.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }  # Examples set up tracing.
-structopt = "0.3"
+clap = { version = "3", features = ["derive"] }
 
 [build-dependencies]
 cc = "1"
