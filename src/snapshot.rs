@@ -16,6 +16,20 @@ use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
 use crate::tracker::SNAPSHOT_GRANULARITY;
 
+/// When loading partially, always load at least this many chunks at
+/// the beginning of the file.
+///
+/// With our 64 KB chunk size, 16 chunks means ~1 MB of data (and
+/// sqlite pages compress well, often to 20% of the original size).
+/// It's also in the same order of magnitude as the size of the loader
+/// thread pool, so we don't waste too much time waiting to execute.
+#[cfg(not(feature = "test_vfs"))]
+const PARTIAL_LOAD_MIN_CHUNK_COUNT: usize = 16;
+
+// Exercise demand loading more heavily in tests.
+#[cfg(feature = "test_vfs")]
+const PARTIAL_LOAD_MIN_CHUNK_COUNT: usize = 2;
+
 #[derive(Clone, Debug)]
 struct LazyChunk {
     fprint: Fingerprint,
@@ -138,6 +152,51 @@ impl From<Arc<Chunk>> for LazyChunk {
     }
 }
 
+fn decide_fprints_to_fetch(
+    policy: SnapshotLoadingPolicy,
+    fprints: &[Fingerprint],
+) -> Vec<Fingerprint> {
+    let mut ret = Vec::new();
+
+    if fprints.is_empty() {
+        return ret;
+    }
+
+    match policy {
+        // Map `Default` to `Eager` for now, in the interest of the
+        // impact of lazy loading.
+        SnapshotLoadingPolicy::Default | SnapshotLoadingPolicy::Eager => {
+            // If we have to load everything, do so.
+            ret.extend_from_slice(fprints);
+        }
+        SnapshotLoadingPolicy::Partial { min, max } => {
+            // We know there's at least one chunk, and we always want
+            // the first one (sqlite always reads it).
+            let min = min.unwrap_or(0).clamp(1, fprints.len() as u64) as usize;
+            let max = max
+                .unwrap_or(PARTIAL_LOAD_MIN_CHUNK_COUNT as u64)
+                .clamp(min as u64, usize::MAX as u64) as usize;
+
+            // Aim to load ~sqrt(# chunks).
+            let prefix_size = ((fprints.len() as f64).sqrt().ceil() as usize).clamp(min, max);
+
+            ret.extend_from_slice(&fprints[0..prefix_size.clamp(0, fprints.len())]);
+
+            // We always want the last chunk: it (and no other chunk)
+            // could be shorter than a full SNAPSHOT_GRANULARITY, and
+            // we assume lazily loaded chunks are exactly that size.
+            //
+            // However, we only want to add it when it's missing: the
+            // caller assumes only the last fprint is the final one.
+            if ret.len() < fprints.len() {
+                ret.extend(fprints.last());
+            }
+        }
+    }
+
+    ret
+}
+
 impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from the global default replication targets.
@@ -160,7 +219,7 @@ impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from `local_caches` directories and from `remote_sources`.
     pub fn new(
-        _load_policy: SnapshotLoadingPolicy,
+        load_policy: SnapshotLoadingPolicy,
         cache_builder: CacheBuilder,
         remote_sources: &[ReplicationTarget],
         manifest: &Manifest,
@@ -169,10 +228,10 @@ impl Snapshot {
         // The load policy shouldn't affect correctness.  Apply an
         // arbitrary one in tests.
         #[cfg(feature = "test_vfs")]
-        let _load_policy = {
+        let load_policy = {
             use rand::Rng;
 
-            let _ = _load_policy;
+            let _ = load_policy;
             match rand::thread_rng().gen_range(0..3usize) {
                 0 => SnapshotLoadingPolicy::Default,
                 1 => SnapshotLoadingPolicy::Eager,
@@ -200,7 +259,7 @@ impl Snapshot {
                 .for_each(|chunk| loader.adjoin_known_chunk(chunk));
         }
 
-        let to_fetch = fprints.clone();
+        let to_fetch = decide_fprints_to_fetch(load_policy, &fprints);
         let fetched = loader.fetch_all_chunks(&to_fetch)?;
 
         // Check that we fetched all the chunks we were looking for.
