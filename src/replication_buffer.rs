@@ -576,6 +576,11 @@ fn file_is_stale(path: &Path, max_age: Duration) -> Result<bool> {
 
 /// Attempts to atomically rename a path and then removes it.
 fn remove_dir(path: &Path) -> std::io::Result<()> {
+    // Avoid false positive in the validation logic when we delete
+    // spooled data because sqlite deleted a test db.
+    #[cfg(feature = "test_validate_reads")]
+    return Ok(());
+
     let mut new_path = path.to_path_buf();
     new_path.set_extension(".del");
 
