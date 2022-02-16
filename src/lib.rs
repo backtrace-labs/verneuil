@@ -29,6 +29,7 @@ pub use manifest_schema::Manifest;
 pub use replication_buffer::manifest_name_for_hostname_path;
 pub use result::Result;
 pub use snapshot::Snapshot;
+pub use snapshot::SnapshotLoadingPolicy;
 
 /// Read the verneuil configuration from this variable by default.
 pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";

@@ -59,12 +59,9 @@ impl Tracker {
         cache_builder
     }
 
-    fn fetch_snapshot_or_die(
-        &self,
-        manifest: &Manifest,
-        source: ChunkSource,
-    ) -> crate::snapshot::Snapshot {
-        crate::snapshot::Snapshot::new(
+    fn fetch_snapshot_or_die(&self, manifest: &Manifest, source: ChunkSource) -> crate::Snapshot {
+        crate::Snapshot::new(
+            crate::SnapshotLoadingPolicy::Default,
             self.cache_builder_for_source(source),
             &self.replication_targets.replication_targets,
             manifest,

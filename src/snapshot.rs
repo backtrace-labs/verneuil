@@ -22,6 +22,28 @@ struct LazyChunk {
     bytes: MonoArc<Chunk>,
 }
 
+/// How do we want to populate a snapshot's data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotLoadingPolicy {
+    // Let the implementation decide.
+    Default,
+    // Always fully load everything when creating the `Snapshot`.
+    Eager,
+    // Let the implementation load some things on demand, while
+    // loading a chunk count in `[min, max]` (defaults to 0 and
+    // an internal default never less than `min`).
+    //
+    // We always load the first and last chunk.
+    Partial { min: Option<u64>, max: Option<u64> },
+}
+
+impl Default for SnapshotLoadingPolicy {
+    fn default() -> Self {
+        SnapshotLoadingPolicy::Default
+    }
+}
+
 pub struct Snapshot {
     len: u64,
 
@@ -120,12 +142,14 @@ impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from the global default replication targets.
     pub fn new_with_default_targets(
+        load_policy: SnapshotLoadingPolicy,
         manifest: &Manifest,
         base_chunk: Option<Arc<Chunk>>,
     ) -> Result<Snapshot> {
         let targets = crate::replication_target::get_default_replication_targets();
 
         Snapshot::new(
+            load_policy,
             CacheBuilder::new(),
             &targets.replication_targets,
             manifest,
@@ -136,11 +160,29 @@ impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from `local_caches` directories and from `remote_sources`.
     pub fn new(
+        _load_policy: SnapshotLoadingPolicy,
         cache_builder: CacheBuilder,
         remote_sources: &[ReplicationTarget],
         manifest: &Manifest,
         base_chunk: Option<Arc<Chunk>>,
     ) -> Result<Snapshot> {
+        // The load policy shouldn't affect correctness.  Apply an
+        // arbitrary one in tests.
+        #[cfg(feature = "test_vfs")]
+        let _load_policy = {
+            use rand::Rng;
+
+            let _ = _load_policy;
+            match rand::thread_rng().gen_range(0..3usize) {
+                0 => SnapshotLoadingPolicy::Default,
+                1 => SnapshotLoadingPolicy::Eager,
+                _ => SnapshotLoadingPolicy::Partial {
+                    min: None,
+                    max: None,
+                },
+            }
+        };
+
         let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
         let mut loader = Loader::new(cache_builder, remote_sources)?;
 
@@ -576,4 +618,63 @@ fn test_reader_subseq() {
             assert_eq!(&dst, &(&flattened)[begin..end.clamp(0, flattened.len())]);
         }
     }
+}
+
+#[test]
+fn test_snapshot_loading_policy_json_default() {
+    let json = r#""default""#;
+
+    assert_eq!(
+        serde_json::from_str::<SnapshotLoadingPolicy>(json).unwrap(),
+        SnapshotLoadingPolicy::Default
+    );
+}
+
+#[test]
+fn test_snapshot_loading_policy_json_eager() {
+    let json = r#"{"eager": null}"#;
+
+    assert_eq!(
+        serde_json::from_str::<SnapshotLoadingPolicy>(json).unwrap(),
+        SnapshotLoadingPolicy::Eager
+    );
+}
+
+#[test]
+fn test_snapshot_loading_policy_json_partial_default() {
+    let json = r#"{"partial": {}}"#;
+
+    assert_eq!(
+        serde_json::from_str::<SnapshotLoadingPolicy>(json).unwrap(),
+        SnapshotLoadingPolicy::Partial {
+            min: None,
+            max: None
+        }
+    );
+}
+
+#[test]
+fn test_snapshot_loading_policy_json_partial() {
+    let json = r#"{"partial": { "max": 10}}"#;
+
+    assert_eq!(
+        serde_json::from_str::<SnapshotLoadingPolicy>(json).unwrap(),
+        SnapshotLoadingPolicy::Partial {
+            min: None,
+            max: Some(10)
+        }
+    );
+}
+
+#[test]
+fn test_snapshot_loading_policy_json_partial_full() {
+    let json = r#"{"partial": { "min": 1, "max": 10}}"#;
+
+    assert_eq!(
+        serde_json::from_str::<SnapshotLoadingPolicy>(json).unwrap(),
+        SnapshotLoadingPolicy::Partial {
+            min: Some(1),
+            max: Some(10)
+        }
+    );
 }
