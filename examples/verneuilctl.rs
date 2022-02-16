@@ -167,7 +167,7 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
         &cmd.manifest,
     )?;
     let snapshot = verneuil::Snapshot::new_with_default_targets(&manifest, base)?;
-    let reader = snapshot.as_read(0, u64::MAX); // Read the whole thing.
+    let reader = snapshot.as_read(0, u64::MAX)?; // Read the whole thing.
     output_reader(reader, &cmd.out)
 }
 

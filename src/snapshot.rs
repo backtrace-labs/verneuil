@@ -166,15 +166,15 @@ impl Snapshot {
     /// `std::io::Read` for the snapshot's contents at bytes
     /// `[initial_offset, min(initial_offset + len, self.len()))`.
     #[inline]
-    pub fn as_read(&self, initial_offset: u64, len: u64) -> SnapshotReader {
+    pub fn as_read(&self, initial_offset: u64, len: u64) -> Result<SnapshotReader> {
         // Fast path empty ranges.
         if initial_offset >= self.len() || len == 0 {
-            return SnapshotReader {
+            return Ok(SnapshotReader {
                 current_chunk: None,
                 end_byte_offset: 0,
                 exhausted: true,
                 chunks: self.chunks.range(0..0),
-            };
+            });
         }
 
         let end_byte_offset = initial_offset.saturating_add(len).clamp(0, self.len());
@@ -204,12 +204,12 @@ impl Snapshot {
         // max key in `self.chunks`.
         debug_assert!(current_chunk.is_some());
 
-        SnapshotReader {
+        Ok(SnapshotReader {
             current_chunk,
             end_byte_offset,
             exhausted: false,
             chunks,
-        }
+        })
     }
 }
 
@@ -294,6 +294,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(0, 0)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -301,6 +302,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(10, 0)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -308,6 +310,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(11, 0)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -317,6 +320,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(10, 1)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -324,6 +328,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(11, 1)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -333,6 +338,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(10, u64::MAX)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -340,6 +346,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(u64::MAX, 1)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -347,6 +354,7 @@ fn test_empty_reader_boundaries() {
     assert_eq!(
         snapshot
             .as_read(u64::MAX, u64::MAX)
+            .expect("as_read should not fail")
             .read_to_end(&mut dst)
             .expect("read should never fail"),
         0
@@ -374,7 +382,9 @@ fn test_reader_simple() {
         _base_chunk: None,
     };
 
-    let mut read = snapshot.as_read(0, u64::MAX);
+    let mut read = snapshot
+        .as_read(0, u64::MAX)
+        .expect("as_read should not fail");
     let mut dst = Vec::new();
     assert_eq!(
         std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
@@ -399,7 +409,9 @@ fn test_reader_short_sequence() {
         _base_chunk: None,
     };
 
-    let mut read = snapshot.as_read(0, u64::MAX);
+    let mut read = snapshot
+        .as_read(0, u64::MAX)
+        .expect("as_read should not fail");
     let mut dst = Vec::new();
     assert_eq!(
         std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
@@ -440,6 +452,7 @@ fn test_reader_subseq() {
             assert_eq!(
                 snapshot
                     .as_read(begin as u64, (end - begin) as u64)
+                    .expect("as_read should not fail")
                     .read_to_end(&mut dst)
                     .expect("read never fails"),
                 flattened.len().min(end) - begin,
