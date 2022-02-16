@@ -397,8 +397,7 @@ impl Loader {
         let key = kismet_cache::Key::new(&name, fprint.hash(), fprint.secondary());
 
         // Don't fast path in tests.
-        #[cfg(not(feature = "test_vfs"))]
-        if contents.is_some() {
+        if contents.is_some() && !cfg!(feature = "test_vfs") {
             // Signal that we're still interested in this file.
             drop_result!(self.cache.touch(key),
                          e => chain_info!(e, "failed to touch cached chunk", ?fprint));
