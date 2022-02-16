@@ -55,8 +55,10 @@ pub struct Options {
     pub replication_spooling_dir_permissions: Option<u32>,
 
     /// List of default replication targets.
-    #[serde(default)]
     pub replication_targets: Vec<replication_target::ReplicationTarget>,
+
+    /// Global policy when loading snapshot data.
+    pub snapshot_loading_policy: SnapshotLoadingPolicy,
 }
 
 #[repr(C)]
@@ -150,6 +152,7 @@ pub fn configure_replication(options: Options) -> Result<()> {
     }
 
     replication_target::set_default_replication_targets(options.replication_targets);
+    snapshot::set_default_snapshot_loading_policy(options.snapshot_loading_policy);
 
     Ok(())
 }
