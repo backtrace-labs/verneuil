@@ -197,6 +197,16 @@ fn decide_fprints_to_fetch(
     ret
 }
 
+lazy_static::lazy_static! {
+    static ref DEFAULT_SNAPSHOT_LOADING_POLICY: std::sync::RwLock<SnapshotLoadingPolicy> =
+        Default::default();
+}
+
+/// Sets the global default snapshot loading policy.
+pub(crate) fn set_default_snapshot_loading_policy(policy: SnapshotLoadingPolicy) {
+    *DEFAULT_SNAPSHOT_LOADING_POLICY.write().unwrap() = policy;
+}
+
 impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from the global default replication targets.
@@ -219,12 +229,16 @@ impl Snapshot {
     /// Constructs a `Snapshot` for `manifest` by fetching chunks
     /// from `local_caches` directories and from `remote_sources`.
     pub fn new(
-        load_policy: SnapshotLoadingPolicy,
+        mut load_policy: SnapshotLoadingPolicy,
         cache_builder: CacheBuilder,
         remote_sources: &[ReplicationTarget],
         manifest: &Manifest,
         base_chunk: Option<Arc<Chunk>>,
     ) -> Result<Snapshot> {
+        if load_policy == SnapshotLoadingPolicy::Default {
+            load_policy = *DEFAULT_SNAPSHOT_LOADING_POLICY.read().unwrap();
+        }
+
         // The load policy shouldn't affect correctness.  Apply an
         // arbitrary one in tests.
         #[cfg(feature = "test_vfs")]
