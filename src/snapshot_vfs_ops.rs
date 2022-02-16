@@ -17,6 +17,7 @@ use crate::sqlite_code::SqliteCode;
 use crate::sqlite_lock_level::LockLevel;
 use crate::Result;
 use crate::Snapshot;
+use crate::SnapshotLoadingPolicy;
 
 /// Number of background refresh workers.
 const REFRESH_POOL_SIZE: usize = 4;
@@ -167,7 +168,7 @@ fn fetch_new_data(path: String) -> Result<Arc<Data>> {
         ctime,
         ctime_ns,
         reload_queued: AtomicBool::new(false),
-        data: Snapshot::new_with_default_targets(&manifest, base)?,
+        data: Snapshot::new_with_default_targets(SnapshotLoadingPolicy::Default, &manifest, base)?,
     });
 
     LIVE_DATA
