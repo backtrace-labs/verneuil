@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kismet_cache::CacheBuilder;
+use quinine::MonoArc;
+use umash::Fingerprint;
 
+use crate::chain_error;
 use crate::fresh_error;
 use crate::loader::Chunk;
 use crate::loader::Loader;
@@ -12,14 +15,26 @@ use crate::manifest_schema::Manifest;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
 
+#[derive(Clone, Debug)]
+struct LazyChunk {
+    fprint: Fingerprint,
+    bytes: MonoArc<Chunk>,
+}
+
 pub struct Snapshot {
     len: u64,
+
     // The chunks map is a sorted map from the exclusive end of the
     // byte range covered by each chunk to the chunk of data.
     //
     // For example, `4 => chunk` with a chunk of 2 byte means that the
     // chunk represents bytes `[2, 4)` of the snapshotted file.
-    chunks: BTreeMap<u64, Arc<Chunk>>,
+    chunks: BTreeMap<u64, LazyChunk>,
+
+    // The chunk loader, if any.  This is `None` when we do not expect
+    // to load chunks lazily.
+    loader: Option<Box<Loader>>,
+
     // Keep a reference to the base chunk for the Manifest used to
     // create this `Snapshot`, if any: keeping it alive means we'll
     // get it from cache when we refresh the snapshot and find a
@@ -37,7 +52,69 @@ pub struct SnapshotReader<'parent> {
     end_byte_offset: u64,
     // Set to true once we have read up to `last_byte`.
     exhausted: bool,
-    chunks: std::collections::btree_map::Range<'parent, u64, Arc<Chunk>>,
+    chunks: std::collections::btree_map::Range<'parent, u64, LazyChunk>,
+}
+
+impl LazyChunk {
+    fn from_chunk(chunk: Arc<Chunk>) -> Self {
+        Self {
+            fprint: chunk.fprint(),
+            bytes: chunk.into(),
+        }
+    }
+
+    /// Ensures we have a value in `bytes`, or errors out.
+    ///
+    /// Once this function returns successfully, `payload()` will
+    /// never panic.
+    fn ensure_loaded(&self, loader: Option<&Loader>) -> Result<()> {
+        if self.bytes.is_some() {
+            return Ok(());
+        }
+
+        // If we get here and `loader` is `None`, that's a programmer
+        // error.
+        let loader =
+            loader.expect("loader should always be available when loading chunks on demand");
+        let fprint = self.fprint;
+        match loader
+            .fetch_chunk(self.fprint)
+            .map_err(|e| chain_error!(e, "failed to fetch chunk data on demand", ?fprint))?
+        {
+            // We assume lazily loaded chunks are all exactly
+            // `SNAPSHOT_GRANULARITY` long when constructing the snapshot.
+            Some(chunk)
+                if chunk.payload().len() == crate::tracker::SNAPSHOT_GRANULARITY as usize =>
+            {
+                // If `store` fails, that's because the `MonoArc`
+                // already holds a value; either way, our job's done.
+                let _ = self.bytes.store(chunk);
+                Ok(())
+            }
+            Some(chunk) => Err(
+                fresh_error!("invalid chunk size found during on-demand loading",
+                             fprint=?self.fprint,
+                             actual=chunk.payload().len(),
+                             expected=crate::tracker::SNAPSHOT_GRANULARITY),
+            ),
+            None => {
+                Err(fresh_error!("chunk not found during on-demand loading", fprint=?self.fprint))
+            }
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.bytes
+            .as_ref()
+            .expect("`ensure_loaded()` should be called before `payload()`")
+            .payload()
+    }
+}
+
+impl From<Arc<Chunk>> for LazyChunk {
+    fn from(chunk: Arc<Chunk>) -> LazyChunk {
+        LazyChunk::from_chunk(chunk)
+    }
 }
 
 impl Snapshot {
@@ -104,7 +181,7 @@ impl Snapshot {
                         payload_len = payload.len()
                     )
                 })?;
-                chunks.insert(len, chunk);
+                chunks.insert(len, LazyChunk::from_chunk(chunk));
             }
 
             Ok(())
@@ -146,6 +223,7 @@ impl Snapshot {
         Ok(Snapshot {
             len,
             chunks,
+            loader: None,
             _base_chunk: base_chunk,
         })
     }
@@ -178,6 +256,17 @@ impl Snapshot {
         }
 
         let end_byte_offset = initial_offset.saturating_add(len).clamp(0, self.len());
+
+        // Iterate over all chunks that end after `initial_offset`,
+        // and make sure any that overlaps with
+        // `[initial_offset, end_byte_offset)` is loaded.
+        let loader = self.loader.as_ref().map(AsRef::as_ref);
+        for (end, lazy_chunk) in self.chunks.range((initial_offset + 1)..=u64::MAX) {
+            lazy_chunk.ensure_loaded(loader)?;
+            if *end >= end_byte_offset {
+                break;
+            }
+        }
 
         // Find the first chunk that ends after `initial_offset`.
         let mut chunks = self.chunks.range((initial_offset + 1)..=u64::MAX);
@@ -285,7 +374,11 @@ fn test_empty_reader_boundaries() {
     let second = create_chunk((4..10).collect());
     let snapshot = Snapshot {
         len: 10u64,
-        chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
+        chunks: [(4u64, first.into()), (10u64, second.into())]
+            .iter()
+            .cloned()
+            .collect(),
+        loader: None,
         _base_chunk: None,
     };
 
@@ -375,10 +468,11 @@ fn test_reader_simple() {
     let chunk = create_chunk(base.clone());
     let snapshot = Snapshot {
         len: chunk.payload().len() as u64,
-        chunks: [(chunk.payload().len() as u64, chunk)]
+        chunks: [(chunk.payload().len() as u64, chunk.into())]
             .iter()
             .cloned()
             .collect(),
+        loader: None,
         _base_chunk: None,
     };
 
@@ -405,7 +499,11 @@ fn test_reader_short_sequence() {
 
     let snapshot = Snapshot {
         len: 10u64,
-        chunks: [(4u64, first), (10u64, second)].iter().cloned().collect(),
+        chunks: [(4u64, first.into()), (10u64, second.into())]
+            .iter()
+            .cloned()
+            .collect(),
+        loader: None,
         _base_chunk: None,
     };
 
@@ -437,9 +535,13 @@ fn test_reader_subseq() {
             .map(|i| {
                 let begin = (i * FRAGMENT_SIZE) as u64;
                 let end = begin + FRAGMENT_SIZE as u64;
-                (end, create_chunk(((begin as u8)..(end as u8)).collect()))
+                (
+                    end,
+                    create_chunk(((begin as u8)..(end as u8)).collect()).into(),
+                )
             })
             .collect(),
+        loader: None,
         _base_chunk: None,
     };
 
