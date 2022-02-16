@@ -199,7 +199,13 @@ impl Tracker {
         );
 
         let snapshot = self.fetch_snapshot_or_die(&manifest, ChunkSource::Staged);
-        std::io::copy(&mut snapshot.as_read(0, u64::MAX), &mut hasher).expect("should hash");
+        std::io::copy(
+            &mut snapshot
+                .as_read(0, u64::MAX)
+                .expect("as_read should succeed"),
+            &mut hasher,
+        )
+        .expect("should hash");
         assert_eq!(expected, hasher.finalize());
         Ok(())
     }

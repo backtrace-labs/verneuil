@@ -458,7 +458,7 @@ impl SnapshotFile {
             .ok_or_else(|| fresh_error!("attempted to read uninitialised SnapshotFile"))?
             .data;
 
-        let copied = std::io::copy(&mut snapshot.as_read(offset, dst.len() as u64), &mut dst)
+        let copied = std::io::copy(&mut snapshot.as_read(offset, dst.len() as u64)?, &mut dst)
             .map_err(|e| chain_error!(e, "failed to read from snapshot"))?;
         dst.fill(0);
         Ok(copied)
