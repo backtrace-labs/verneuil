@@ -71,6 +71,7 @@ lru = { version = "0.7", default-features = false }  # Disable hashbrown
 memmap2 = "0.5"
 percent-encoding = "2"
 prost = "0.9"
+quinine = "0.2"
 rand = "0.8"
 rayon = "1.5"
 regex = "1"
