@@ -14,6 +14,7 @@ use crate::loader::Loader;
 use crate::manifest_schema::Manifest;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
+use crate::tracker::SNAPSHOT_GRANULARITY;
 
 #[derive(Clone, Debug)]
 struct LazyChunk {
@@ -83,9 +84,7 @@ impl LazyChunk {
         {
             // We assume lazily loaded chunks are all exactly
             // `SNAPSHOT_GRANULARITY` long when constructing the snapshot.
-            Some(chunk)
-                if chunk.payload().len() == crate::tracker::SNAPSHOT_GRANULARITY as usize =>
-            {
+            Some(chunk) if chunk.payload().len() == SNAPSHOT_GRANULARITY as usize => {
                 // If `store` fails, that's because the `MonoArc`
                 // already holds a value; either way, our job's done.
                 let _ = self.bytes.store(chunk);
@@ -95,7 +94,7 @@ impl LazyChunk {
                 fresh_error!("invalid chunk size found during on-demand loading",
                              fprint=?self.fprint,
                              actual=chunk.payload().len(),
-                             expected=crate::tracker::SNAPSHOT_GRANULARITY),
+                             expected=SNAPSHOT_GRANULARITY),
             ),
             None => {
                 Err(fresh_error!("chunk not found during on-demand loading", fprint=?self.fprint))
@@ -159,55 +158,64 @@ impl Snapshot {
                 .for_each(|chunk| loader.adjoin_known_chunk(chunk));
         }
 
-        let fetched = loader.fetch_all_chunks(&fprints)?;
+        let to_fetch = fprints.clone();
+        let fetched = loader.fetch_all_chunks(&to_fetch)?;
+
+        // Check that we fetched all the chunks we were looking for.
+        // We assume the last value in `to_fetch` is always the last
+        // chunk in the manifest in test-only assertions.
+        if let Some((last, prefix)) = to_fetch.split_last() {
+            let find_chunk = |fprint| {
+                fetched
+                    .get(fprint)
+                    .cloned()
+                    .ok_or_else(|| fresh_error!("unable to find chunk data", ?fprint, ?loader))
+            };
+
+            for fprint in prefix {
+                let _chunk = find_chunk(fprint)?;
+                // All but the last chunk must be exactly snapshot-sized.
+                #[cfg(feature = "test_vfs")]
+                assert_eq!(_chunk.payload().len(), SNAPSHOT_GRANULARITY as usize);
+            }
+
+            let _chunk = find_chunk(last)?;
+            // The last chunk may be short.
+            #[cfg(feature = "test_vfs")]
+            assert!(_chunk.payload().len() <= SNAPSHOT_GRANULARITY as usize);
+        }
 
         let mut len: u64 = 0;
         let mut chunks = BTreeMap::new();
+        let mut any_missing_chunk = false;
 
-        let find_chunk = |fprint| {
-            fetched
-                .get(fprint)
-                .cloned()
-                .ok_or_else(|| fresh_error!("unable to find chunk data", ?fprint, ?loader))
-        };
+        for fprint in fprints {
+            let chunk_or = fetched.get(&fprint).cloned();
+            let payload_len = chunk_or
+                .as_deref()
+                .map(|chunk| chunk.payload().len() as u64)
+                .unwrap_or(SNAPSHOT_GRANULARITY);
 
-        let mut insert_chunk = |chunk: Arc<Chunk>| {
-            let payload = chunk.payload();
-            if !payload.is_empty() {
-                len = len.checked_add(payload.len() as u64).ok_or_else(|| {
-                    fresh_error!(
-                        "total snapshot length overflowed",
-                        len,
-                        payload_len = payload.len()
-                    )
-                })?;
-                chunks.insert(len, LazyChunk::from_chunk(chunk));
+            if chunk_or.is_none() {
+                any_missing_chunk = true;
             }
 
-            Ok(())
-        };
-
-        if let Some((last, prefix)) = (&fprints).split_last() {
-            for fprint in prefix {
-                let chunk = find_chunk(fprint)?;
-
-                // All but the last chunk must be exactly snapshot-sized.
-                #[cfg(feature = "test_vfs")]
-                assert_eq!(
-                    chunk.payload().len(),
-                    crate::tracker::SNAPSHOT_GRANULARITY as usize
-                );
-
-                insert_chunk(chunk)?;
+            // If we definitely have an empty chunk, we can ignore it.
+            if payload_len == 0 {
+                continue;
             }
 
-            let chunk = find_chunk(last)?;
+            len = len.checked_add(payload_len).ok_or_else(|| {
+                fresh_error!("total snapshot length overflowed", len, payload_len)
+            })?;
 
-            // The last chunk may be short.
-            #[cfg(feature = "test_vfs")]
-            assert!(chunk.payload().len() <= crate::tracker::SNAPSHOT_GRANULARITY as usize);
-
-            insert_chunk(chunk)?;
+            chunks.insert(
+                len,
+                LazyChunk {
+                    fprint,
+                    bytes: chunk_or.into(),
+                },
+            );
         }
 
         let expected_len = crate::manifest_schema::extract_manifest_len(manifest)?;
@@ -223,7 +231,13 @@ impl Snapshot {
         Ok(Snapshot {
             len,
             chunks,
-            loader: None,
+            // If we found any chunk that hasn't been loaded yet, save
+            // the loader for any on-demand loading.
+            loader: if any_missing_chunk {
+                Some(Box::new(loader))
+            } else {
+                None
+            },
             _base_chunk: base_chunk,
         })
     }
