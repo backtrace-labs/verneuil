@@ -1,8 +1,13 @@
+0.6.1 2022-02-17
+----------------
+* Fix a panic in the `verneuil_snapshot` VFS when reading in the
+  middle of a partially loaded snapshot (3df96ba0)
+
 0.6.0 2022-02-17
 ----------------
 * Snapshots may now be populated partially on creation, with the rest
   fetched on demand.  Set a `snapshot_loading_policy` in the global
-  config JSON to enable that feature (d384b464).
+  config JSON to enable that feature. (d384b464)
 
 0.5.0 2022-02-15
 ----------------
