@@ -85,10 +85,10 @@ pub struct Snapshot {
 pub struct SnapshotReader<'parent> {
     // The current slice is either None, or non-empty.
     current_chunk: Option<&'parent [u8]>,
-    // Byte offset where we want to stop reading (exclusive)
+    // Byte offset where we want to stop reading (exclusive).
     end_byte_offset: u64,
-    // Set to true once we have read up to `last_byte`.
-    exhausted: bool,
+    // Number of bytes left in this reader.
+    left_to_read: u64,
     chunks: std::collections::btree_map::Range<'parent, u64, LazyChunk>,
 }
 
@@ -379,7 +379,7 @@ impl Snapshot {
             return Ok(SnapshotReader {
                 current_chunk: None,
                 end_byte_offset: 0,
-                exhausted: true,
+                left_to_read: 0,
                 chunks: self.chunks.range(0..0),
             });
         }
@@ -425,7 +425,7 @@ impl Snapshot {
         Ok(SnapshotReader {
             current_chunk,
             end_byte_offset,
-            exhausted: false,
+            left_to_read: end_byte_offset - initial_offset,
             chunks,
         })
     }
@@ -447,16 +447,16 @@ impl SnapshotReader<'_> {
 }
 
 impl<'a> std::io::Read for SnapshotReader<'a> {
-    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, mut dst: &mut [u8]) -> std::io::Result<usize> {
+        if dst.len() as u64 > self.left_to_read {
+            dst = &mut dst[0..self.left_to_read as usize];
+        }
+
         if dst.is_empty() {
             return Ok(0);
         }
 
         if self.current_chunk.is_none() {
-            if self.exhausted {
-                return Ok(0);
-            }
-
             self.current_chunk = self.chunks.next().and_then(|(end, chunk)| {
                 let bytes = SnapshotReader::drop_trailing_bytes(
                     chunk.payload(),
@@ -469,13 +469,14 @@ impl<'a> std::io::Read for SnapshotReader<'a> {
                     Some(bytes)
                 }
             });
-            self.exhausted = self.current_chunk.is_none()
         }
 
         match self.current_chunk.as_mut() {
             Some(current) => {
                 let ret = (*current).read(dst)?;
 
+                assert!(ret as u64 <= self.left_to_read);
+                self.left_to_read -= ret as u64;
                 if (*current).is_empty() {
                     self.current_chunk = None;
                 }
@@ -615,6 +616,46 @@ fn test_reader_simple() {
     );
     assert_eq!(base.len(), dst.len());
     assert_eq!(base, dst);
+}
+
+/// Create a snapshot that consists of one populated chunk and one
+/// unpopulated one.  Make sure that we
+/// read it correctly when we stop *exactly* at the populated chunk.
+#[test]
+fn test_reader_one_chunk() {
+    let mut base = Vec::new();
+
+    for i in 0..1000 {
+        base.push(((i * 2) % 256) as u8)
+    }
+
+    let chunk = create_chunk(base.clone());
+    let snapshot = Snapshot {
+        len: 2000,
+        chunks: [
+            (1000, chunk.into()),
+            (
+                2000,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect(),
+        loader: None,
+        _base_chunk: None,
+    };
+
+    let mut read = snapshot.as_read(200, 800).expect("as_read should not fail");
+    let mut dst = Vec::new();
+    assert_eq!(
+        std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
+        800
+    );
+    assert_eq!(&dst, &base[200..]);
 }
 
 /// Create a snapshot that merely consists of two short chunks.
