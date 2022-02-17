@@ -1,3 +1,9 @@
+0.6.0 2022-02-17
+----------------
+* Snapshots may now be populated partially on creation, with the rest
+  fetched on demand.  Set a `snapshot_loading_policy` in the global
+  config JSON to enable that feature (d384b464).
+
 0.5.0 2022-02-15
 ----------------
 * Build with clap v3, which needs Rust >= 1.54 (c979b425), and forced
