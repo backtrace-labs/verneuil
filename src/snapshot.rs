@@ -618,9 +618,9 @@ fn test_reader_simple() {
     assert_eq!(base, dst);
 }
 
-/// Create a snapshot that consists of one populated chunk and one
-/// unpopulated one.  Make sure that we
-/// read it correctly when we stop *exactly* at the populated chunk.
+/// Create a snapshot that consists of one populated chunk surrounded
+/// by two unpopulated ones.  Make sure that we read it correctly when
+/// we stop *exactly* at the populated chunk.
 #[test]
 fn test_reader_one_chunk() {
     let mut base = Vec::new();
@@ -631,11 +631,18 @@ fn test_reader_one_chunk() {
 
     let chunk = create_chunk(base.clone());
     let snapshot = Snapshot {
-        len: 2000,
+        len: 2500,
         chunks: [
-            (1000, chunk.into()),
             (
-                2000,
+                500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+            (1500, chunk.into()),
+            (
+                2500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
                     bytes: MonoArc::empty(),
@@ -649,13 +656,157 @@ fn test_reader_one_chunk() {
         _base_chunk: None,
     };
 
-    let mut read = snapshot.as_read(200, 800).expect("as_read should not fail");
+    // Read from the middle of the populated chunk
+    let mut read = snapshot.as_read(700, 800).expect("as_read should not fail");
     let mut dst = Vec::new();
     assert_eq!(
         std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
         800
     );
     assert_eq!(&dst, &base[200..]);
+}
+
+/// Create a snapshot that consists of one populated chunk surrounded
+/// by two unpopulated ones.  Make sure that we read it correctly when
+/// we stop just before then end of the populated chunk.
+#[test]
+fn test_reader_one_chunk_short() {
+    let mut base = Vec::new();
+
+    for i in 0..1000 {
+        base.push(((i * 2) % 256) as u8)
+    }
+
+    let chunk = create_chunk(base.clone());
+    let snapshot = Snapshot {
+        len: 2500,
+        chunks: [
+            (
+                500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+            (1500, chunk.into()),
+            (
+                2500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect(),
+        loader: None,
+        _base_chunk: None,
+    };
+
+    let mut read = snapshot.as_read(501, 998).expect("as_read should not fail");
+    let mut dst = Vec::new();
+    assert_eq!(
+        std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
+        998
+    );
+    assert_eq!(&dst, &base[1..999]);
+}
+
+/// Create a snapshot that consists of one populated chunk surrounded
+/// by two unpopulated ones.  Make sure that we read it correctly when
+/// we start exactly at the populated chunk.
+#[test]
+fn test_reader_one_chunk_short_from_start() {
+    let mut base = Vec::new();
+
+    for i in 0..1000 {
+        base.push(((i * 2) % 256) as u8)
+    }
+
+    let chunk = create_chunk(base.clone());
+    let snapshot = Snapshot {
+        len: 2500,
+        chunks: [
+            (
+                500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+            (1500, chunk.into()),
+            (
+                2500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect(),
+        loader: None,
+        _base_chunk: None,
+    };
+
+    let mut read = snapshot.as_read(500, 999).expect("as_read should not fail");
+    let mut dst = Vec::new();
+    assert_eq!(
+        std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
+        999
+    );
+    assert_eq!(&dst, &base[0..999]);
+}
+
+/// Create a snapshot that consists of one populated chunk surrounded
+/// by two unpopulated ones.  Make sure that we read it correctly when
+/// we read exactly the populated chunk.
+#[test]
+fn test_reader_one_chunk_exact() {
+    let mut base = Vec::new();
+
+    for i in 0..1000 {
+        base.push(((i * 2) % 256) as u8)
+    }
+
+    let chunk = create_chunk(base.clone());
+    let snapshot = Snapshot {
+        len: 2500,
+        chunks: [
+            (
+                500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+            (1500, chunk.into()),
+            (
+                2500,
+                LazyChunk {
+                    fprint: Fingerprint { hash: [0, 0] },
+                    bytes: MonoArc::empty(),
+                },
+            ),
+        ]
+        .iter()
+        .cloned()
+        .collect(),
+        loader: None,
+        _base_chunk: None,
+    };
+
+    let mut read = snapshot
+        .as_read(500, 1000)
+        .expect("as_read should not fail");
+    let mut dst = Vec::new();
+    assert_eq!(
+        std::io::copy(&mut read, &mut dst).expect("copy should succeed"),
+        1000
+    );
+    assert_eq!(&dst, &base);
 }
 
 /// Create a snapshot that merely consists of two short chunks.
