@@ -367,4 +367,11 @@ impl Tracker {
         #[cfg(feature = "test_validate_reads")]
         self.validate_all_snapshots();
     }
+
+    /// Attempts to synchronously flush all spooled data for the
+    /// tracked database.
+    #[instrument(skip(self))]
+    pub fn flush_spooled_data(&self) -> Result<()> {
+        crate::copier::copy_spool_path(self.buffer.spooling_directory())
+    }
 }
