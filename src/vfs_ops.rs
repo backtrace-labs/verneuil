@@ -23,6 +23,7 @@ struct LinuxFile {
     lock_timeout_ms: u32,
     dirsync_pending: bool,
     first_write_in_transaction: bool,
+    flush_on_close: bool,
 }
 
 impl LinuxFile {
@@ -78,7 +79,16 @@ extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> SqliteCode {
 
 #[no_mangle]
 extern "C" fn verneuil__file_close(file: &mut LinuxFile) -> i32 {
-    std::mem::drop(file.consume_tracker());
+    let tracker = file.consume_tracker();
+
+    if file.flush_on_close {
+        if let Some(tracker) = tracker.as_ref() {
+            drop_result!(tracker.flush_spooled_data(),
+                         e => chain_warn!(e, "failed to flush replication data on close"));
+        }
+    }
+
+    std::mem::drop(tracker);
     unsafe { verneuil__file_close_impl(file) }
 }
 

@@ -144,6 +144,13 @@ struct linux_file {
          * remember to update the file's xattr before the first write.
          */
         bool first_write_in_transaction;
+
+        /*
+         * When this flag is true, the VFS should attempt to
+         * synchronously flush all spooled replication data when
+         * closing the file.
+         */
+        bool flush_on_close;
 };
 
 static_assert(sizeof(struct sqlite3_file) == sizeof(void *),
