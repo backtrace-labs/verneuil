@@ -372,6 +372,19 @@ impl Tracker {
     /// tracked database.
     #[instrument(skip(self))]
     pub fn flush_spooled_data(&self) -> Result<()> {
-        crate::copier::copy_spool_path(self.buffer.spooling_directory())
+        let to_flush = self.buffer.spooling_directory();
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // We use our own Tokio runtime in `copy_spool_path`.
+            // Avoid panics due to nested runtimes by flushing in a
+            // temporary thread.  Flushes have to upload data over the
+            // network, so they're not exactly fast anyway.
+            let to_flush = to_flush.to_owned();
+            std::thread::spawn(move || crate::copier::copy_spool_path(&to_flush))
+                .join()
+                .map_err(|e| chain_error!(e, "copy_spool_path thread failed"))?
+        } else {
+            crate::copier::copy_spool_path(to_flush)
+        }
     }
 }

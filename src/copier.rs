@@ -485,6 +485,10 @@ impl Copier {
 }
 
 /// Synchronously copies any pending replication data in `path`.
+///
+/// This function blocks on Verneuil's internal tokio `current_thread`
+/// runtime and should not be invoked in an async context.  If
+/// necessary, spawn a thread and join on that.
 #[instrument]
 pub fn copy_spool_path(path: &Path) -> Result<()> {
     lazy_static::lazy_static! {
