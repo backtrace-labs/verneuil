@@ -78,6 +78,23 @@ extern "C" fn verneuil__file_post_open(file: &mut LinuxFile) -> SqliteCode {
 }
 
 #[no_mangle]
+extern "C" fn verneuil__file_flush_replication_data(file: &mut LinuxFile) -> i32 {
+    let tracker = if let Some(tracker) = file.tracker() {
+        tracker
+    } else {
+        return 0;
+    };
+
+    match tracker
+        .flush_spooled_data()
+        .map_err(|e| chain_warn!(e, "failed to force flush replication data"))
+    {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
 extern "C" fn verneuil__file_close(file: &mut LinuxFile) -> i32 {
     let tracker = file.consume_tracker();
 

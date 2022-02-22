@@ -96,6 +96,13 @@ int verneuil__snapshot_open(struct snapshot_file *, const char *path);
 int verneuil__file_close_impl(struct sqlite3_file *);
 
 /**
+ * Flushes spooled replication data for a replicated db.
+ *
+ * Returns 0 on success and non-zero on failure.
+ */
+int verneuil__file_flush_replication_data(struct linux_file *);
+
+/**
  * Rust implementation for xClose.  Cleans up any state initialised by
  * `verneuil__file_post_open` before calling `verneuil__file_close_impl`.
  */

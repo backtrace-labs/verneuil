@@ -2068,6 +2068,41 @@ linux_tempfilename(char **dst)
         return SQLITE_OK;
 }
 
+/**
+ * Converts a string parameter to a truth value:
+ *
+ * If the string is empty, returns the default value.
+ * Otherwise, returns false iff the string's first character
+ *  is '0', 'f'(alse), or 'n'(o).
+ */
+static bool
+parse_bool_param(const char *param, bool default_value)
+{
+
+        if (param == NULL)
+                return default_value;
+
+        /*
+         * https://www.sqlite.org/pragma.html says boolean parameters
+         * map "0", "no", "false", and "off" to false.  Extend the
+         * classic switch on the first character to also handle "off".
+         */
+        switch (param[0]) {
+        case '0':
+        case 'f':
+        case 'F':
+        case 'n':
+        case 'N':
+                return false;
+
+        default:
+                if (strcasecmp(param, "off") == 0)
+                        return false;
+
+                return true;
+        }
+}
+
 static int
 linux_file_control(sqlite3_file *vfile, int op, void *arg)
 {
@@ -2098,6 +2133,35 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
 
         case SQLITE_FCNTL_TEMPFILENAME:
                 return linux_tempfilename(arg);
+
+        case SQLITE_FCNTL_PRAGMA: {
+             char **argv = arg;
+             char **dst = &argv[0];
+             const char *pragma = argv[1];
+             const char *param = argv[2];
+
+             if (strcmp(pragma, "verneuil_flush_replication_data") == 0) {
+                     bool ret;
+
+                     if (param == NULL ||
+                         strcmp(param, "now") == 0 ||
+                         strcmp(param, "force") == 0 ||
+                         strcmp(param, "2") == 0) {
+                             ret = verneuil__file_flush_replication_data(file) == 0;
+                     } else {
+                             bool value;
+
+                             value = parse_bool_param(param, true);
+                             ret = file->flush_on_close;
+                             file->flush_on_close = value;
+                     }
+
+                     *dst = sqlite3_mprintf("%s", ret ? "1" : "0");
+                     return SQLITE_OK;
+             }
+
+             return SQLITE_NOTFOUND;
+        }
 
         /* These are used in tests, and should be implemented. */
         case SQLITE_FCNTL_LOCKSTATE:
@@ -2141,41 +2205,6 @@ snapshot_refresh(sqlite3_file *vfile, char **dst, uint32_t force_level)
         *dst = sqlite3_mprintf("failed to %srefresh verneuil snapshot: %*s",
             (force_level > 1 ? "force " : ""), (int)len, result);
         return SQLITE_ERROR;
-}
-
-/**
- * Converts a string parameter to a truth value:
- *
- * If the string is empty, returns the default value.
- * Otherwise, returns false iff the string's first character
- *  is '0', 'f'(alse), or 'n'(o).
- */
-static bool
-parse_bool_param(const char *param, bool default_value)
-{
-
-        if (param == NULL)
-                return default_value;
-
-        /*
-         * https://www.sqlite.org/pragma.html says boolean parameters
-         * map "0", "no", "false", and "off" to false.  Extend the
-         * classic switch on the first character to also handle "off".
-         */
-        switch (param[0]) {
-        case '0':
-        case 'f':
-        case 'F':
-        case 'n':
-        case 'N':
-                return false;
-
-        default:
-                if (strcasecmp(param, "off") == 0)
-                        return false;
-
-                return true;
-        }
 }
 
 static int

@@ -4,7 +4,7 @@ The Verneuil (replicating) VFS
 The `verneuil` VFS opens local sqlite database files like the sqlite's
 default `unix` VFS, and replicates them to a remote blob store when so
 configured.  It is otherwise (nearly) identical[^no-dirsync] to the
-unix VFS, and does not currently expose any additional `pragma`.
+unix VFS.
 
 [^no-dirsync]: The Verneuil VFS never opens parent directories to fsync them.  It is thus safer to use it with the journaling mode set to `TRUNCATE` or `PERSIST`.
 
@@ -79,6 +79,26 @@ targets succeed.
 However, if there is no S3 replication target, replication always
 fails (i.e., replication data remains in the buffer directory, within
 size bounds).
+
+Buffer flushing pragmas
+-----------------------
+
+By default, the Verneuil VFS synchronously pushes replication data to
+a spooling directory, but does not wait for that data to make it to
+remote storage.
+
+Executing `pragma verneuil_flush_replication_data` with no argument,
+or with "now", "force", or `2` will synchronously send any spooled
+replication data for the connection's current (main) database.  The
+pragma returns 1 on success and 0 on failure.
+
+Verneuil can also flush when the connection is closed (disabled by
+default).  Executing `pragma verneuil_flush_replication_data` with a
+boolean argument (e.g., 1 for true, 0 for false) will set the flag
+that determines whether to flush on close.  A true value will execute
+a synchronous flush before closing the connection, and a false value
+(default) will disable that behaviour.  The pragma returns 1 if the
+behaviour was previously enabled, and 0 otherwise.
 
 Deeper integration, with static linking
 ---------------------------------------

@@ -99,14 +99,13 @@ fn main() {
     )
     .unwrap();
 
-    // We can flush synchronously.
-    if let Some(path) = options.replication_spooling_dir.as_deref() {
-        verneuil::copy_all_spool_paths(
-            std::path::Path::new(path).to_owned(),
-            /*best_effort=*/ false,
-        )
+    // Flush on drop.
+    conn.pragma(None, "verneuil_flush_replication_data", 1, |_| Ok(()))
         .unwrap();
-    }
+
+    // Flush now.
+    conn.pragma(None, "verneuil_flush_replication_data", 2, |_| Ok(()))
+        .unwrap();
 
     // And now that there is some replicated state, we can open a
     // replica.
@@ -150,6 +149,10 @@ fn main() {
     {
         println!("{} => {}", id, value);
     }
+
+    // Dropping the connection will trigger a synchronous flush of any
+    // spooled replication data for that database.
+    std::mem::drop(conn);
 
     // There might be a delay (the copier attempts to only
     // copy updated data slighly less than once a second),
