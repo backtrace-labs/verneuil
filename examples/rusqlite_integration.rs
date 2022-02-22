@@ -154,11 +154,6 @@ fn main() {
     // spooled replication data for that database.
     std::mem::drop(conn);
 
-    // There might be a delay (the copier attempts to only
-    // copy updated data slighly less than once a second),
-    // but the replication data should be updated eventually.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
     // And now dump the contents of the replica.
     println!("From replica");
     // Force a synchronous refresh.  See `doc/SNAPSHOT_VFS.md` for
