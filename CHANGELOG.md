@@ -1,3 +1,8 @@
+0.6.2 2022-02-22
+----------------
+* Add new pragma (`verneuil_flush_replication_data`) to the replicating
+  Verneuil VFS.  See doc/VFS.md for details (2ba6b199)
+
 0.6.1 2022-02-17
 ----------------
 * Fix a panic in the `verneuil_snapshot` VFS when reading in the
