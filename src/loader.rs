@@ -600,6 +600,19 @@ fn call_with_slow_logging<T>(
 
 /// Attempts to load the blob `name` from `source`.
 pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
+    // Run `load_from_source_impl` in our private (rayon) thread pool
+    // to avoid clashes between `impl`'s use of our internal runtime
+    // and any tokio runtime in the caller's context...
+    //
+    // unless we're already running on that thread pool.
+    if LOADER_POOL.current_thread_index().is_some() {
+        load_from_source_impl(source, name)
+    } else {
+        LOADER_POOL.install(|| load_from_source_impl(source, name))
+    }
+}
+
+fn load_from_source_impl(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>> {
     use rand::Rng;
 
     let mut rng = rand::thread_rng();
@@ -611,7 +624,7 @@ pub(crate) fn load_from_source(source: &Bucket, name: &str) -> Result<Option<Vec
         ) {
             Ok((payload, 200)) => return Ok(Some(payload)),
             // All callers propagate 404s as hard failures.  We might
-            // as try a little bit harder if we get a 404.
+            // as well try a little bit harder if we get a 404.
             Ok((_, 404)) if i > 0 => return Ok(None),
             Ok((body, code)) if code < 500 && ![404, 429].contains(&code) => {
                 return Err(
