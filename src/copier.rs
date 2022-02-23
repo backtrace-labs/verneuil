@@ -487,8 +487,9 @@ impl Copier {
 /// Synchronously copies any pending replication data in `path`.
 ///
 /// This function blocks on Verneuil's internal tokio `current_thread`
-/// runtime and should not be invoked in an async context.  If
-/// necessary, spawn a thread and join on that.
+/// runtime and must not be invoked in an async context.  If necessary
+/// (i.e., when this function may be called from an arbitrary
+/// context), dispatch to a worker thread and join on the result.
 #[instrument]
 pub fn copy_spool_path(path: &Path) -> Result<()> {
     lazy_static::lazy_static! {
@@ -1107,6 +1108,15 @@ impl FileIdentifier {
     }
 }
 
+/// `CopierWorker`s handle the actual upload of chunks and manifests
+/// to remote blob stores, and deletion of files once their contents
+/// hit remote storage.
+///
+/// That copying logic uses our internal current-thread tokio runtime,
+/// so must not be invoked from an async context.  Methods on
+/// `CopierWorker` must not be invoked from arbitrary contexts.  If
+/// it's impossible to guarantee the caller is not in a tokio context,
+/// the code must run in a worker thread.
 #[derive(Debug)]
 struct CopierWorker {
     // Edge-triggered work units, enqueued at the end of a sqlite

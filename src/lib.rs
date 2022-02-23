@@ -567,6 +567,8 @@ pub fn copy_all_spool_paths(
         }
     }
 
+    // We make sure to run in the Rayon pool for parallelism, and,
+    // more importantly, to avoid any async context in the caller.
     to_copy.shuffle(&mut rand::thread_rng());
     to_copy
         .into_par_iter()
