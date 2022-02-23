@@ -1,3 +1,8 @@
+0.6.3 2022-02-23
+----------------
+* Make synchronous flushes (`pragma verneuil_flush_replication_data`)
+  play nice with async contexts (6a032652)
+
 0.6.2 2022-02-22
 ----------------
 * Add new pragma (`verneuil_flush_replication_data`) to the replicating
