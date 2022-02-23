@@ -1,3 +1,7 @@
+0.6.4 2022-02-23
+----------------
+* Make the snapshot VFS work in async contexts as well (44c29d84)
+
 0.6.3 2022-02-23
 ----------------
 * Make synchronous flushes (`pragma verneuil_flush_replication_data`)
