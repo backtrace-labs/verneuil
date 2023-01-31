@@ -165,7 +165,15 @@ fn decide_fprints_to_fetch(
     match policy {
         // Map `Default` to `Eager` for now, in the interest of the
         // impact of lazy loading.
-        SnapshotLoadingPolicy::Default | SnapshotLoadingPolicy::Eager => {
+        SnapshotLoadingPolicy::Default => {
+            if fprints.len() >= 1 {
+                ret.extend(fprints.first());
+            }
+            if fprints.len() >= 2 {
+                ret.extend(fprints.last());
+            }
+        }
+        SnapshotLoadingPolicy::Eager => {
             // If we have to load everything, do so.
             ret.extend_from_slice(fprints);
         }

@@ -30,8 +30,8 @@ use crate::result::Result;
 mod invariants;
 mod snapshot_file_contents;
 
-/// We snapshot db files in 64KB content-addressed chunks.
-pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
+/// We snapshot db files in 512KB content-addressed chunks.
+pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 19;
 
 /// Don't generate a base fingerprint chunk for a list of fingerprints
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
