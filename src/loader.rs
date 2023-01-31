@@ -622,13 +622,13 @@ fn load_from_source_impl(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>>
             || block_on_with_executor(|| source.get_object(name)),
             |duration| tracing::info!(?duration, ?name, "slow S3 GET"),
         ) {
-            Ok((payload, 200)) => return Ok(Some(payload)),
+            Ok(response_data) if response_data.status_code() == 200 => return Ok(Some(response_data.bytes().to_vec())),
             // All callers propagate 404s as hard failures.  We might
             // as well try a little bit harder if we get a 404.
-            Ok((_, 404)) if i > 0 => return Ok(None),
-            Ok((body, code)) if code < 500 && ![404, 429].contains(&code) => {
+            Ok(response_data) if i > 0 && response_data.status_code() == 404 => return Ok(None),
+            Ok(response_data) if response_data.status_code() < 500 && ![404, 429].contains(&response_data.status_code()) => {
                 return Err(
-                    chain_error!((body, code), "failed to fetch chunk", %source.name, %name),
+                    chain_error!((response_data.bytes().to_vec(), response_data.status_code()), "failed to fetch chunk", %source.name, %name),
                 )
             }
             err => {

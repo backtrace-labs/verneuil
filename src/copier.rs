@@ -704,14 +704,14 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
             rt.block_on(Bucket::create(
                 &bucket.name(),
                 bucket.region(),
-                bucket.credentials().clone(),
+                bucket.credentials().read().unwrap().clone(),
                 s3::bucket_ops::BucketConfiguration::private(),
             ))
         } else {
             rt.block_on(Bucket::create_with_path_style(
                 &bucket.name(),
                 bucket.region(),
-                bucket.credentials().clone(),
+                bucket.credentials().read().unwrap().clone(),
                 s3::bucket_ops::BucketConfiguration::private(),
             ))
         }
@@ -861,10 +861,10 @@ async fn copy_file(
             )
             .await
             {
-                Ok((_, code)) if (200..300).contains(&code) => {
+                Ok(response_data) if (200..300).contains(&response_data.status_code()) => {
                     break;
                 }
-                Ok((body, code)) if code < 500 && code != 408 && code != 429 => {
+                Ok(response_data) if response_data.status_code() < 500 && response_data.status_code() != 408 && response_data.status_code() != 429 => {
                     // If something went wrong, clear the recent
                     // wrong: maybe the remote is in a bad state.
                     RECENT_WORK.lock().unwrap().clear();
@@ -873,7 +873,7 @@ async fn copy_file(
                     // retry on 400: RequestTimeout, but we'll catch
                     // it in the next background scan.
                     return Err(chain_error!(
-                        (body, code),
+                        (response_data.bytes().to_vec(), response_data.status_code()),
                         "failed to post chunk",
                         %target.name,
                         ?blob_name,
@@ -955,10 +955,10 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                 },
                 |duration| tracing::info!(?duration, ?blob_name, "slow S3 COPY"),
             ) {
-                Ok((_, code)) if (200..300).contains(&code) => {
+                Ok(response_data) if (200..300).contains(&response_data.status_code()) => {
                     break;
                 }
-                Ok((body, 404)) => {
+                Ok(response_data) if response_data.status_code() == 404 => {
                     // If something went wrong, clear the recent
                     // wrong: maybe the remote is in a bad state.
                     RECENT_WORK.lock().unwrap().clear();
@@ -966,17 +966,17 @@ fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
                     // Something's definitely wrong with our
                     // replication data if we can't find the blob.
                     return Err(chain_error!(
-                        (body, 404),
+                        (response_data.to_vec(), 404),
                         "chunk not found",
                         %target.name,
                         ?blob_name
                     ));
                 }
                 // If it's a non-404 error, don't retry.
-                Ok((body, code)) if (400..500).contains(&code) && code != 408 && code != 429 => {
+                Ok(response_data) if (400..500).contains(&response_data.status_code()) && response_data.status_code() != 408 && response_data.status_code() != 429 => {
                     RECENT_WORK.lock().unwrap().clear();
 
-                    let _ = chain_warn!((body, code), "failed to touch chunk", %target.name, ?blob_name);
+                    let _ = chain_warn!((response_data.bytes().to_vec(), response_data.status_code()), "failed to touch chunk", %target.name, ?blob_name);
                     break;
                 }
                 err => {
