@@ -1019,16 +1019,27 @@ linux_dlclose(sqlite3_vfs *vfs, void *handle)
         return;
 }
 
+#ifdef __APPLE__
+static ssize_t
+getrandom_compat(void *buf, size_t buflen)
+{
+        /* arc4random doesn't fail. */
+        arc4random_buf(buf, buflen);
+        return buflen;
+}
+#else
 /*
  * Linux added the getrandom syscall in 3.17, but glibc only recently
  * added a wrapper.  Define our own getrandom.
  */
 static ssize_t
-getrandom_compat(void *buf, size_t buflen, unsigned int flags)
+getrandom_compat(void *buf, size_t buflen)
 {
+        unsigned int flags = 0;
 
         return syscall(SYS_getrandom, buf, buflen, flags);
 }
+#endif
 
 static int
 linux_randomness(sqlite3_vfs *vfs, int n, char *dst)
@@ -1046,7 +1057,7 @@ linux_randomness(sqlite3_vfs *vfs, int n, char *dst)
                  * (256-byte) seed, so we don't have to worry
                  * about short reads.
                  */
-                r = getrandom_compat(dst, n, /*flags=*/0);
+                r = getrandom_compat(dst, n);
         } while (r < 0 && errno == EINTR);
         /*
          * It's ok to fail silently: we zero-filled, so no UB,
@@ -1836,7 +1847,7 @@ linux_tempfilename(char **dst)
 
         clock_gettime(CLOCK_REALTIME, &now);
         do {
-                r = getrandom_compat(noise, sizeof(noise), 0);
+                r = getrandom_compat(noise, sizeof(noise));
         } while (r <= 0 && errno == EINTR);
 
         unique = atomic_fetch_add(&counter, 1);
