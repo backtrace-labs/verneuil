@@ -70,6 +70,13 @@ SQLITE_EXTENSION_INIT1
 # define SQLITE_TEMP_FILE_PREFIX "etilqs_"
 #endif
 
+#ifndef O_LARGEFILE
+/*
+ * This is a no-op flag on 64-bit builds; we keep it to match sqlite.
+ */
+# define O_LARGEFILE 0
+#endif
+
 /**
  * Some older distributions fail to expose these constants.  Hardcode
  * them if necessary: open file description locks have been around
