@@ -121,8 +121,14 @@ struct linux_file {
         /*
          * This metadata identifies the inode that `fd` refers to.
          */
-        dev_t device;
-        ino_t inode;
+        union {
+                dev_t device;
+                uint64_t rust_padding_for_device;
+        };
+        union {
+                ino_t inode;
+                uint64_t rust_padding_for_inode;
+        };
 
         /*
          * The Rust-side's change tracking state.
@@ -164,11 +170,11 @@ struct linux_file {
 static_assert(sizeof(struct sqlite3_file) == sizeof(void *),
     "vfs_ops.rs assumes sqlite3_file consists of one vtable pointer.");
 
-static_assert(sizeof(dev_t) == sizeof(uint64_t),
-    "vfs_ops.rs assumes dev_t as a u64.");
+static_assert(sizeof(dev_t) <= sizeof(uint64_t),
+    "vfs_ops.rs assumes dev_t fits in a u64.");
 
-static_assert(sizeof(ino_t) == sizeof(uint64_t),
-    "vfs_ops.rs assumes ino_t as a u64.");
+static_assert(sizeof(ino_t) <= sizeof(uint64_t),
+    "vfs_ops.rs assumes ino_t fits in a u64.");
 
 struct snapshot_file {
         sqlite3_file base;
