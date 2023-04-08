@@ -1360,7 +1360,13 @@ now_ms_boottime(void)
 {
         struct timespec now;
 
-        clock_gettime(CLOCK_BOOTTIME, &now);
+#ifdef __APPLE__
+        const clockid_t clock = CLOCK_UPTIME_RAW;
+#else
+        const clockid_t clock = CLOCK_BOOTTIME;
+#endif
+
+        clock_gettime(clock, &now);
         return 1000 * (uint64_t)now.tv_sec + (now.tv_nsec / 1000000);
 }
 
