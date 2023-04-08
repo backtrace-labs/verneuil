@@ -13,7 +13,12 @@ verneuil__getxattr(int fd, const char *name, void *buf, size_t bufsz)
         ssize_t ret;
 
         do {
+#ifdef __APPLE__
+                ret = fgetxattr(fd, name, buf, bufsz, /*position=*/0, /*options=*/0);
+#else
+                /* Assume this is linux-compatible. */
                 ret = fgetxattr(fd, name, buf, bufsz);
+#endif
         } while (ret < 0 && errno == EINTR);
 
         if (ret >= 0)
@@ -31,7 +36,11 @@ verneuil__setxattr(int fd, const char *name, const void *buf, size_t bufsz)
         ssize_t ret;
 
         do {
+#ifdef __APPLE__
+                ret = fsetxattr(fd, name, buf, bufsz, /*position=*/0, /*options=*/0);
+#else
                 ret = fsetxattr(fd, name, buf, bufsz, /*flags=*/0);
+#endif
         } while (ret < 0 && errno == EINTR);
 
         if (ret == 0)
