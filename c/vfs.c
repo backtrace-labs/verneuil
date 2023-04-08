@@ -649,41 +649,69 @@ linux_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *vfile,
          */
         if (name == NULL || (flags & SQLITE_OPEN_DELETEONCLOSE) != 0) {
                 const char *base;
+                /* Non-null if there's something to unlink there. */
+                char *temp_path = NULL;
+                int r;
+                bool use_fallback;
 
                 base = get_tempdir_base();
 
                 file->path = NULL;
+#ifdef O_TMPFILE
                 fd = linux_safe_open(base, O_TMPFILE | O_EXCL | open_flags, 0600);
+                use_fallback = fd < 0 && errno == EOPNOTSUPP;
+#else
+                fd = -1;
+                use_fallback = true;
+#endif
+                /*
+                 * Some OSes and filesystems do not support O_TMPFILE.
+                 * Try a minimalistic mkstemp-based fallback.
+                 */
+                if (use_fallback)
+                        errno = EINTR;
+
+                while (use_fallback && fd < 0 && errno == EINTR) {
+                        if (asprintf(&temp_path, "%s/verneuil.XXXXXX", base) < 0) {
+                                rc = SQLITE_CANTOPEN;
+                                goto fail;
+                        }
+
+                        fd = mkostemp(temp_path, O_CLOEXEC | O_LARGEFILE);
+                        if (fd < 0) {
+                                int err = errno;
+
+                                free(temp_path);
+                                temp_path = NULL;
+                                errno = err;
+                        }
+                }
 
                 if (fd < 0 && errno == EACCES) {
                         rc = SQLITE_READONLY_DIRECTORY;
                         goto fail;
                 }
 
-                /*
-                 * Some filesystems do not support O_TMPFILE.  Try a
-                 * minimalistic mkstemp-based fallback.  If anything
-                 * goes wrong, propagate the EOPNOTSUPP error: we
-                 * don't really care too much about such filesystems.
-                 */
-                if (fd < 0 && errno == EOPNOTSUPP) {
-                        char *path;
+                if (fd < 0) {
+                        rc = SQLITE_CANTOPEN;
+                        goto fail;
+                }
 
-                        if (asprintf(&path, "%s/verneuil.XXXXXX", base) < 0) {
-                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
-                                goto fail;
-                        }
+                if (temp_path != NULL) {
+                        do {
+                                r = unlink(temp_path);
+                        } while (r != 0 && errno == EINTR);
+                        /*
+                         * Unclear what to do with errors; SQLite
+                         * doesn't handle any...
+                         */
+                }
 
-                        fd = mkostemp(path, O_CLOEXEC | O_LARGEFILE);
-                        if (fd >= 0)
-                                (void)unlink(path);
-
-                        free(path);
-                        fd = linux_ensure_high_fd(fd);
-                        if (fd < 0) {
-                                rc = SQLITE_CANTOPEN_NOTEMPDIR;
-                                goto fail;
-                        }
+                free(temp_path);
+                fd = linux_ensure_high_fd(fd);
+                if (fd < 0) {
+                        rc = SQLITE_CANTOPEN;
+                        goto fail;
                 }
         } else {
                 if ((flags & SQLITE_OPEN_CREATE) != 0)
