@@ -1,6 +1,14 @@
 #include "verneuil.h"
 #include "vfs.h"
 
+#ifdef __APPLE__
+/*
+ * Some SQLite sources like to unconditionally define _GNU_SOURCE,
+ * but that only makes sense for glibc.
+ */
+# undef _GNU_SOURCE
+#endif
+
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>

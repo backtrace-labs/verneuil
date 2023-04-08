@@ -100,9 +100,10 @@ fn main() {
         build.define("SQLITE_CORE", None);
     }
 
+    // We want GNU extensions on Linux.
+    #[cfg(target_os = "linux")]
+    build.define("_GNU_SOURCE", None);
     build
-        // We want GNU extensions.
-        .define("_GNU_SOURCE", None)
         // We know the linuxvfs doesn't implement dirsync.
         .define("SQLITE_DISABLE_DIRSYNC", None)
         .file("c/file_ops.c")
