@@ -7,6 +7,11 @@
  * but that only makes sense for glibc.
  */
 # undef _GNU_SOURCE
+/*
+ * If someone ever manages to #include a version of `fcntl.h` with the
+ * #ifdef PRIVATE definitions, we'll be able to detect mismatches.
+ */
+# define PRIVATE
 #endif
 
 #include <assert.h>
@@ -68,20 +73,39 @@ SQLITE_EXTENSION_INIT1
 # define O_LARGEFILE 0
 #endif
 
+#ifdef __linux__
 /**
  * Some older distributions fail to expose these constants.  Hardcode
  * them if necessary: open file description locks have been around
  * since Linux 3.15, and we don't try to support anything that old
  * (getrandom was introduced in 3.17, and we also use that).
  */
-#ifndef F_OFD_GETLK
-#define F_OFD_GETLK     36
-#define F_OFD_SETLK     37
-#define F_OFD_SETLKW    38
+# ifndef F_OFD_GETLK
+#  define F_OFD_GETLK     36
+#  define F_OFD_SETLK     37
+#  define F_OFD_SETLKW    38
+# endif
+
+# if (F_OFD_GETLK != 36) || (F_OFD_SETLK != 37) || (F_OFD_SETLKW != 38)
+#  error "Mismatch in fallback OFD fcntl constants for Linux."
+# endif
 #endif
 
-#if (F_OFD_GETLK != 36) || (F_OFD_SETLK != 37) || (F_OFD_SETLKW != 38)
-# error "Mismatch in fallback OFD fcntl constants."
+#ifdef __APPLE__
+# ifndef F_OFD_GETLK
+/*
+ * Copy fallback definitions from
+ * https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/fcntl.h#L360-L363
+ */
+#  define F_OFD_SETLK             90
+#  define F_OFD_SETLKW            91
+#  define F_OFD_GETLK             92
+# endif
+
+/* On the off chance someone builds with a full fcntl.h */
+# if (F_OFD_SETLK != 90) || (F_OFD_SETLKW != 91) || (F_OFD_GETLK != 92)
+#  error "Unexpected drift in private OFD fcntl constants for darwin."
+# endif
 #endif
 
 #ifdef SQLITE_TEST
