@@ -1877,18 +1877,17 @@ linux_file_control(sqlite3_file *vfile, int op, void *arg)
 static int
 linux_file_sector_size(sqlite3_file *vfile)
 {
-        enum {
-                /*
-                 * sqlite assumes the sector size is a multiple of its
-                 * min value, 512 bytes.
-                 */
-                MIN_SECTOR_SIZE = 512,
+        /*
+         * sqlite assumes the sector size is a multiple of its min
+         * value, 512 bytes.
+         */
+        const size_t min_sector_size = 512;
 #ifdef PAGE_SIZE
-                DEFAULT_SECTOR_SIZE = PAGE_SIZE,
+        const size_t default_sector_size = PAGE_SIZE;
 #else
-                DEFAULT_SECTOR_SIZE = 4096,
+        const size_t default_sector_size = 4096;
 #endif
-        };
+
         static atomic_int cached_sector_size = 0;
         long sector_size;
 
@@ -1915,10 +1914,10 @@ linux_file_sector_size(sqlite3_file *vfile)
          */
         sector_size = sysconf(_SC_PAGESIZE);
         if (sector_size <= 0 || sector_size > INT_MAX)
-                sector_size = DEFAULT_SECTOR_SIZE;
+                sector_size = default_sector_size;
 
-        if ((sector_size % MIN_SECTOR_SIZE) != 0)
-                sector_size = MIN_SECTOR_SIZE;
+        if ((sector_size % min_sector_size) != 0)
+                sector_size = min_sector_size;
 
         atomic_store_explicit(&cached_sector_size, sector_size,
             memory_order_relaxed);
