@@ -85,7 +85,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["tracing-lo
 uluru = "3"
 umash = "0.4"
 uuid = { version = "0.8", features = ["v4"] }
-zstd = "0.10"
+zstd = "0.11"
 
 [dev-dependencies]
 rusqlite = { version = "0.26" }  # For the sample rusqlite_integration.
