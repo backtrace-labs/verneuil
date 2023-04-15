@@ -383,8 +383,7 @@ pub(crate) fn construct_tapped_manifest_path(
     // Go up two directories, to go from `.../$MANGLED_PATH/$DEV.$INO` to the prefix, `...`.
     let base = spool_dir
         .parent()
-        .map(Path::parent)
-        .flatten()
+        .and_then(Path::parent)
         .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
 
     tapped_manifest_path_in_spool_prefix(Some(base.to_path_buf()), source_db)
@@ -404,8 +403,7 @@ pub(crate) fn tap_manifest_file(
     // in ".../.tap/"
     let base = spool_dir
         .parent()
-        .map(Path::parent)
-        .flatten()
+        .and_then(Path::parent)
         .ok_or_else(|| fresh_error!("invalid spool directory", ?spool_dir))?;
     let mut tap = base.to_path_buf();
 

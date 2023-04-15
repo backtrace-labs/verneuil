@@ -569,7 +569,7 @@ impl Tracker {
         // mark them as dirty: it doesn't matter that we didn't change
         // them, we can't refer to them without making sure they're
         // available for readers.
-        if let Some(v1) = current_manifest.as_ref().map(|x| x.0.v1.as_ref()).flatten() {
+        if let Some(v1) = current_manifest.as_ref().and_then(|x| x.0.v1.as_ref()) {
             for bundled in &v1.bundled_chunks {
                 self.dirty_chunks.insert(bundled.chunk_offset, None);
             }
@@ -598,11 +598,8 @@ impl Tracker {
 
         let flattened = flatten_chunk_fprints(&chunks);
         let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
-        let (compressible, base_chunk) = reencode_flattened_chunks(
-            &self.buffer,
-            current_manifest.map(|x| x.1).flatten(),
-            flattened,
-        )?;
+        let (compressible, base_chunk) =
+            reencode_flattened_chunks(&self.buffer, current_manifest.and_then(|x| x.1), flattened)?;
 
         let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
 
