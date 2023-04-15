@@ -828,3 +828,110 @@ fn test_manifest_default() {
         .expect("default Manifest should serialise");
     assert_eq!(encoded, b"");
 }
+
+/// Make sure we can set/get xattrs.
+#[cfg(not(feature = "no_xattr"))]
+#[test]
+fn test_xattr() {
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+    use test_dir::{DirBuilder, FileType, TestDir};
+    use uuid::adapter::Hyphenated;
+
+    extern "C" {
+        fn verneuil__getxattr(fd: i32, name: *const i8, buf: *mut u8, bufsz: usize) -> isize;
+        fn verneuil__setxattr(fd: i32, name: *const i8, buf: *const u8, bufsz: usize) -> isize;
+    }
+
+    let temp = TestDir::temp().create("empty", FileType::EmptyFile);
+
+    let path: PathBuf = temp.path("empty");
+    let file = File::open(&path).expect("should be able to open file");
+
+    let mut buf = Vec::<u8>::new();
+    buf.resize(XATTR_MAX_VALUE_SIZE, 0u8);
+    let initial_ret = unsafe {
+        verneuil__getxattr(
+            file.as_raw_fd(),
+            XATTR_NAME.as_ptr() as *const _,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+
+    // This initial read should be empty.
+    assert_eq!(initial_ret, 0);
+
+    let mut wbuf = [0u8; Hyphenated::LENGTH];
+
+    let write_ret = {
+        let tag = Uuid::new_v4().to_hyphenated().encode_lower(&mut wbuf);
+        unsafe {
+            verneuil__setxattr(
+                file.as_raw_fd(),
+                XATTR_NAME.as_ptr() as *const _,
+                tag.as_ptr(),
+                tag.len(),
+            )
+        }
+    };
+
+    assert_eq!(write_ret, 0);
+
+    let final_ret = unsafe {
+        verneuil__getxattr(
+            file.as_raw_fd(),
+            XATTR_NAME.as_ptr() as *const _,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+
+    assert_eq!(final_ret, Hyphenated::LENGTH as isize);
+    buf.resize(final_ret as usize, 0u8);
+    assert_eq!(buf, wbuf);
+
+    // Clear the xattr.
+    clear_version_id(&file).expect("clear_version_id should suceed.");
+
+    let cleared_ret = unsafe {
+        verneuil__getxattr(
+            file.as_raw_fd(),
+            XATTR_NAME.as_ptr() as *const _,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+
+    // This read should now be empty.
+    assert_eq!(cleared_ret, 0);
+}
+
+/// Exercise update_version_id / extract_version_id
+#[cfg(not(feature = "no_xattr"))]
+#[test]
+fn test_version_id() {
+    use std::path::PathBuf;
+    use test_dir::{DirBuilder, FileType, TestDir};
+    use uuid::adapter::Hyphenated;
+
+    let temp = TestDir::temp().create("empty", FileType::EmptyFile);
+
+    let path: PathBuf = temp.path("empty");
+    let file = File::open(&path).expect("should be able to open file");
+
+    // Empty xattr, shouldn't have a version.
+    let initial_version = extract_version_id(&file, None, Vec::new());
+    assert_eq!(initial_version, Vec::<u8>::new());
+
+    let uuid = Uuid::new_v4();
+    update_version_id(&file, Some(uuid)).expect("update_version_id should succeed");
+
+    let mut ebuf = [0u8; Hyphenated::LENGTH];
+    let expected = uuid.to_hyphenated().encode_lower(&mut ebuf);
+
+    let actual = extract_version_id(&file, None, Vec::new());
+    println!("expected: {:?}", expected.as_bytes());
+    println!("  actual: {:?}", actual);
+    assert!(actual.starts_with(expected.as_bytes()));
+}
