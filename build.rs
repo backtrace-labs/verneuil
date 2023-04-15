@@ -76,7 +76,16 @@ fn main() {
 
     if cfg!(feature = "test_vfs") {
         // Enable test-only code.
-        build.define("TEST_VFS", None).define("SQLITE_TEST", None);
+        build
+            .define("TEST_VFS", None)
+            .define("SQLITE_TEST", None)
+            // -fcommon to avoid collisions between test-only counters
+            // like `sqlite3_sync_count` that must be defined redundantly
+            // in vfs.c (and are always defined in SQLite's test binary).
+            //
+            // This lets us build libverneuil *once* and use it in SQLite
+            // test binaries that do and don't define the counters.
+            .flag_if_supported("-fcommon");
     }
 
     if cfg!(feature = "dynamic_vfs") {

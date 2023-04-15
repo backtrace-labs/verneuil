@@ -50,7 +50,11 @@ OPTS="-DSQLITE_EXTRA_INIT=sqlite3_verneuil_test_only_register -DSQLITE_MAX_MMAP_
 # importantly for us, means that the bitwise representation of a DB
 # may change in semantically irrelevant ways after a rollback.
 # We avoid all that with calloc.
-CFLAGS="-g -O2 -DSQLITE_OS_UNIX=1 -include '$HERE/../c/replace_malloc.h'"
+#
+# We also set `-fcommon` because, in test mode, vfs.c redundantly
+# defines counters like `sqlite3_sync_count`, and we need them to be
+# merged instead of flagged as collisions.
+CFLAGS="-g -O2 -fcommon -DSQLITE_OS_UNIX=1 -include '$HERE/../c/replace_malloc.h'"
 
 make clean
 
