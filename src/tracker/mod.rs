@@ -136,14 +136,13 @@ impl Tracker {
             None => return Ok(None),
         };
         let replication_targets = crate::replication_target::get_default_replication_targets();
-        let copier;
 
         // Let the copier pick up any ready snapshot left behind, e.g,
         // by an older crashed process.
-
+        //
         // But first, make sure to overwrite the replication config with our own.
         buffer.ensure_staging_dir(&replication_targets, /*overwrite_meta=*/ true);
-        copier = Copier::get_global_copier().with_spool_path(
+        let copier = Copier::get_global_copier().with_spool_path(
             Arc::new(buffer.spooling_directory().to_owned()),
             path.clone(),
         );
