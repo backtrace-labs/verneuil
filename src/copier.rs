@@ -1306,8 +1306,8 @@ impl CopierWorker {
             let chunks_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
-                .flatten() // TODO: how do we want to handle failures here?
+                // TODO: how do we want to handle failures here?
+                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
                 .flatten() // remove None
                 .collect::<Vec<_>>();
 
@@ -1358,8 +1358,8 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
-                .flatten() // TODO: how do we want to handle failures here?
+                // TODO: how do we want to handle failures here?
+                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1475,8 +1475,8 @@ impl CopierWorker {
             let chunks_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
-                .flatten() // TODO: how do we want to handle failures here?
+                // TODO: how do we want to handle failures here?
+                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
                 .flatten() // Drop `None`.
                 .collect::<Vec<_>>();
 
@@ -1580,8 +1580,8 @@ impl CopierWorker {
             let meta_buckets = targets
                 .replication_targets
                 .iter()
-                .map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
-                .flatten() // TODO: how do we want to handle failures here?
+                // TODO: how do we want to handle failures here?
+                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1908,8 +1908,8 @@ impl CopierWorker {
         let mut chunks_buckets = targets
             .replication_targets
             .iter()
-            .map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
-            .flatten() // TODO: how do we want to handle failures here?
+            // TODO: how do we want to handle failures here?
+            .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
             .flatten() // Drop `None`
             .collect::<Vec<_>>();
 
@@ -2223,7 +2223,7 @@ impl CopierBackend {
         let stats: BTreeMap<String, CopierSpoolLagInfo> = self
             .active_spool_paths
             .values()
-            .map(|spool_state| -> Result<_> {
+            .flat_map(|spool_state| -> Result<_> {
                 let old_stale = spool_state.stale.load(Ordering::Relaxed);
 
                 let (k, v) = spool_state.lag_info().map_err(|e| {
@@ -2242,7 +2242,6 @@ impl CopierBackend {
 
                 Ok((k.to_string_lossy().into_owned(), v))
             })
-            .flatten()
             .collect();
 
         newly_stale.shuffle(&mut rand::thread_rng());
