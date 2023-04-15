@@ -462,13 +462,13 @@ fn replace_slashes(input: &str) -> String {
     const ESCAPED: percent_encoding::AsciiSet = percent_encoding::CONTROLS.add(b'#').add(b'%');
 
     percent_encoding::utf8_percent_encode(input, &ESCAPED)
-        .map(|fragment| fragment.replace("/", "#"))
+        .map(|fragment| fragment.replace('/', "#"))
         .collect()
 }
 
 /// Reverses `replace_slashes` if possible.
 pub(crate) fn restore_slashes(input: &str) -> Result<Option<String>> {
-    let slashified = input.replace("#", "/");
+    let slashified = input.replace('#', "/");
 
     // If the input string is more than `MAX_MANGLED_NAME_LENGTH`
     // bytes, assume it had to be truncated.
@@ -698,7 +698,7 @@ fn delete_orphan_tapped_manifest_files(spooling: PathBuf) -> Result<()> {
         .to_string();
 
     // Find the hostname-specific prefix (up to and including the last colon).
-    let local_prefix = match decoded_name.rsplit_once(":") {
+    let local_prefix = match decoded_name.rsplit_once(':') {
         Some((prefix, _)) => format!("{}:", prefix),
         None => {
             return Err(fresh_error!(
@@ -715,8 +715,8 @@ fn delete_orphan_tapped_manifest_files(spooling: PathBuf) -> Result<()> {
         // Extract the `{path_hash}/{path}` suffix, and, from that,
         // the final `path` component.
         let suffix = match decoded_name
-            .rsplit_once(":")
-            .and_then(|(_, hash_path)| hash_path.split_once("/"))
+            .rsplit_once(':')
+            .and_then(|(_, hash_path)| hash_path.split_once('/'))
         {
             Some((_hash, path)) => path,
             None => return Ok(()),

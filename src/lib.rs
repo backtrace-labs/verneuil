@@ -465,7 +465,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
         use s3::bucket::Bucket;
         use s3::creds::Credentials;
 
-        let (bucket_region, blob) = match path.split_once("/") {
+        let (bucket_region, blob) = match path.split_once('/') {
             Some(pair) => pair,
             None => {
                 return Err(fresh_error!(
@@ -474,7 +474,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
             }
         };
 
-        let (bucket, region) = match bucket_region.split_once(".") {
+        let (bucket, region) = match bucket_region.split_once('.') {
             Some(pair) => pair,
             None => {
                 return Err(fresh_error!(
@@ -494,7 +494,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
 
         loader::load_from_source(&bucket, blob)
     } else if let Some(suffix) = path.strip_prefix("verneuil://") {
-        let (machine, path) = match suffix.split_once("/") {
+        let (machine, path) = match suffix.split_once('/') {
             Some((machine, path)) => (machine, format!("/{}", path)),
             None => {
                 return Err(fresh_error!(

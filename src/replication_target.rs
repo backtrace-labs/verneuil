@@ -223,7 +223,7 @@ pub(crate) fn parse_s3_region_specification(region: &str, endpoint: Option<&str>
     match region.parse() {
         Ok(region) if !matches!(region, s3::Region::Custom { .. }) => region,
         _ => {
-            let (region_name, endpoint) = match region.split_once(".") {
+            let (region_name, endpoint) = match region.split_once('.') {
                 Some(pair) => pair,
                 None => (region, region),
             };
