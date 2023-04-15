@@ -785,13 +785,14 @@ fn call_with_temp_file(
 
     let (mut temp, _) = create_scratch_file(spool_dir)
         .map_err(|e| chain_error!(e, "failed to prepare for publication", ?target))?;
-    let result = worker(temp.as_file_mut())?;
+
+    worker(temp.as_file_mut())?;
     match temp.persist_noclobber(target) {
-        Ok(_) => Ok(result),
+        Ok(_) => Ok(()),
         Err(tempfile::PersistError { error: e, .. })
             if e.kind() == ErrorKind::AlreadyExists || target.exists() =>
         {
-            Ok(result)
+            Ok(())
         }
         Err(e) => Err(chain_error!(e, "failed to publish temporary file", ?target)),
     }
