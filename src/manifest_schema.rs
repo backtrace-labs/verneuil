@@ -325,7 +325,7 @@ impl Manifest {
 }
 
 /// Computes the `header_fprint` for a sqlite database.  The 100-byte header
-/// (https://www.sqlite.org/fileformat.html#:~:text=1.3.%20the%20database%20header)
+/// <https://www.sqlite.org/fileformat.html#:~:text=1.3.%20the%20database%20header>
 /// includes a "file change counter" field at offset 24; that field is updated
 /// as part of every transaction commit . Fingerprinting the first 100 bytes
 /// of a sqlite database should thus give us something that reliably changes

@@ -126,7 +126,7 @@ const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
 /// with ordering of PUTs that are too close in real time.
 ///
 /// For example,
-/// https://www.backblaze.com/b2/docs/s3_compatible_api.html says:
+/// <https://www.backblaze.com/b2/docs/s3_compatible_api.html> says:
 ///
 /// "When uploading multiple versions of the same file within the same
 /// second, the possibility exists that the processing of these
@@ -135,7 +135,7 @@ const MIN_COPY_PERIOD: Duration = Duration::from_millis(500);
 /// second to avoid this situation."
 ///
 /// (Might see some noise on this issue
-/// https://github.com/s3fs-fuse/s3fs-fuse/issues/272 when Backblaze
+/// <https://github.com/s3fs-fuse/s3fs-fuse/issues/272> when Backblaze
 /// fixes this).
 ///
 /// We thus impose a delay slightly greater than one second between
