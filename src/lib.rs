@@ -1,3 +1,4 @@
+mod atomic_kv32;
 mod copier;
 mod executor;
 mod instance_id;
