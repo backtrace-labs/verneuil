@@ -56,6 +56,11 @@ OPTS="-DSQLITE_EXTRA_INIT=sqlite3_verneuil_test_only_register -DSQLITE_MAX_MMAP_
 # merged instead of flagged as collisions.
 CFLAGS="-g -O2 -fcommon -DSQLITE_OS_UNIX=1 -include '$HERE/../c/replace_malloc.h'"
 
+if ! env | grep -iq eatmydata ;
+then
+    echo "Tests are much faster under eatmydata (https://github.com/stewartsmith/libeatmydata), or with tmpfs mounts for ./minio/, ./testdir/, and /tmp/verneuil-cache/";
+fi
+
 make clean
 
 function cleanup() {
