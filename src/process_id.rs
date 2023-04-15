@@ -1,15 +1,13 @@
-//! Descrives the current process textually.  Operating systems
-//! can reuse pids, so we couple that with the time at which
-//! the process was spawned.
-use regex::Regex;
+//! Describes the current process textually.  Operating systems can
+//! reuse pids, so we couple that with the time at which the process
+//! was spawned, when possible, and with a randomly generated integer
+//! otherwise.
 use std::fs::File;
 use std::io::BufRead;
-use std::io::Error;
-use std::io::ErrorKind;
-use std::io::Result;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+
+use regex::Regex;
+
+use crate::atomic_kv32::AtomicKV32;
 
 lazy_static::lazy_static! {
     // A stat line is "pid comm state ...", where `pid` is an
@@ -37,27 +35,22 @@ fn find_btime_in_line(line: &str) -> Option<&str> {
 /// Find the time at which `pid` was spawned, via `/proc/[pid]/stat`.
 /// The return value should be treated like an opaque counter; in
 /// practice, it counts clock ticks between boot and spawning.
-fn compute_birth(pid: u32) -> Result<u64> {
-    let file = File::open(format!("/proc/{}/stat", pid))?;
+///
+/// Returns `None` on any kind of failure: its caller has a graceful
+/// fallback mechanism.
+fn compute_birth(pid: u32) -> Option<u64> {
+    let file = File::open(format!("/proc/{}/stat", pid)).ok()?;
 
-    let mut btime: Option<Result<u64>> = None;
+    let mut btime: Option<u64> = None;
     // Use the last match: someone could in theory stash something
     // that looks like a valid stat line in the comm field.
     for line in std::io::BufReader::new(file).lines().flatten() {
         if let Some(tick) = find_btime_in_line(&line) {
-            let value = tick
-                .parse()
-                .map_err(|_| Error::new(ErrorKind::Other, "failed to parse birth tick"));
-            btime = Some(value);
+            btime = tick.parse().ok();
         }
     }
 
-    btime.unwrap_or_else(|| {
-        Err(Error::new(
-            ErrorKind::Other,
-            "failed to parse /proc/pid/stat",
-        ))
-    })
+    btime
 }
 
 /// Returns a string that (should) uniquely identify the current
@@ -65,20 +58,32 @@ fn compute_birth(pid: u32) -> Result<u64> {
 ///
 /// The string consists of `$pid.$birth_tick`, where `birth_tick`
 /// represents the time at which the process was created.
+///
+/// When the birth time isn't available, we generate a random u32.
 pub(crate) fn process_id() -> String {
-    static PID: AtomicU32 = AtomicU32::new(0);
-    static BIRTH: AtomicU64 = AtomicU64::new(0);
+    use rand::Rng;
+
+    static PID_INFO: AtomicKV32 = AtomicKV32::new(0, 0);
+
+    let (mut cached_pid, mut cached_birth) = PID_INFO.get();
 
     let current_pid = std::process::id();
-    let mut cached_pid = PID.load(Ordering::Acquire);
-    let mut cached_birth = BIRTH.load(Ordering::Acquire);
+    // Only execute the next block:
+    //   - on the first call (cached_id is initially 0, reserved on all OSes).
+    //   - after a fork (as the PID as changed)
+    if current_pid != cached_pid {
+        // Use the low 32 bits of the btime if we have one: that has
+        // more entropy than the high bits.
+        let btime = match compute_birth(current_pid) {
+            Some(value) => value as u32,
+            // Otherwise, generate a random value (it'll be cached for
+            // the lifetime of the current process).
+            None => rand::thread_rng().gen::<u32>(),
+        };
 
-    if cached_pid != current_pid {
-        cached_birth = compute_birth(current_pid).unwrap_or(u64::MAX);
-        cached_pid = current_pid;
-
-        BIRTH.store(cached_birth, Ordering::Release);
-        PID.store(cached_pid, Ordering::Release);
+        // We can't assume our write won.  Get the actual resulting
+        // key-value pair from PID_INFO.
+        (cached_pid, cached_birth) = PID_INFO.set(current_pid, btime);
     }
 
     format!("{}.{}", cached_pid, cached_birth)
@@ -107,6 +112,7 @@ fn test_funny_comm_break_end() {
     assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_funny_comm_break_end_with_paren() {
     // Assume a newline at the end of comm, just before the closing parenthesis
