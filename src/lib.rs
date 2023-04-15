@@ -293,7 +293,7 @@ impl ReplicationProtoData {
     /// application-level validation.
     fn new(bytes: Vec<u8>) -> Result<Option<ReplicationProtoData>> {
         let v1 = match manifest_schema::Manifest::decode_and_validate(
-            &*bytes,
+            &bytes,
             Default::default(),
             None,
             "bytes",

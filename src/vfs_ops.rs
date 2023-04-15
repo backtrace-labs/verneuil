@@ -156,7 +156,7 @@ extern "C" fn verneuil__file_write(
         // A tracker has state to invoke this function more
         // efficiently.  If we don't have one, let's still update the
         // db file's version id, the slow way.
-        drop_result!(crate::manifest_schema::update_version_id(&*db, None),
+        drop_result!(crate::manifest_schema::update_version_id(&db, None),
                      e => chain_error!(e, "failed to mark db file as updated",
                                        %file.device, %file.inode));
     }

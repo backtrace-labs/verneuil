@@ -48,7 +48,7 @@ impl OfdLock {
             .read(true)
             .write(true)
             .create(true)
-            .open(&lock_path)
+            .open(lock_path)
             .map_err(|e| chain_error!(e, "failed to open ofd lock file", ?lock_path))?;
 
         match unsafe { verneuil__ofd_lock_exclusive(file.as_raw_fd()) } {

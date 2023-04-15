@@ -526,7 +526,7 @@ pub fn copy_spool_path(path: &Path) -> Result<()> {
 /// Returns Ok if this was achieved, and Err otherwise.
 #[instrument(level = "debug")]
 fn ensure_directory_removed(target: &Path) -> Result<()> {
-    match std::fs::remove_dir(&target) {
+    match std::fs::remove_dir(target) {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(chain_error!(e, "failed to remove directory", ?target)),
@@ -613,7 +613,7 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
                                 // the file, or `ensure_directory_removed`
                                 // will fail, correctly signaling failure.
                                 drop_result!(
-                                std::fs::remove_file(&to_consume),
+                                std::fs::remove_file(to_consume),
                                 e => filtered_io_error!(
                                     e, ErrorKind::NotFound => Level::DEBUG,
                                     "failed to remove consumed file", path=?to_consume));
@@ -1143,7 +1143,7 @@ fn force_full_snapshot(spool_path: &Path, source: &Path) {
             .create(false)
             .write(true)
             .truncate(false)
-            .open(&path)
+            .open(path)
         {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1723,7 +1723,7 @@ impl CopierWorker {
                 // It's not an error if this fails: we expect failures
                 // when the directory becomes non-empty, and we never
                 // lose data.
-                drop_result!(std::fs::remove_dir(&cleanup),
+                drop_result!(std::fs::remove_dir(cleanup),
                              e => filtered_io_error!(e, ErrorKind::NotFound => Level::DEBUG,
                                                      "failed to remove directory", ?cleanup));
             }
@@ -2055,7 +2055,7 @@ impl CopierWorker {
             let mut success = false;
 
             if let Ok(mut upload_state) = state.upload_lock.try_lock() {
-                follow_up_work = handle(&state, &mut *upload_state);
+                follow_up_work = handle(&state, &mut upload_state);
                 success = true;
             }
 

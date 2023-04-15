@@ -731,7 +731,7 @@ fn delete_orphan_tapped_manifest_files(spooling: PathBuf) -> Result<()> {
             return Ok(());
         }
 
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_file(path) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(chain_error!(e, "failed to delete orphan tap file", ?path)),
@@ -920,7 +920,7 @@ fn read_manifest_at_path(
     file.read_to_end(&mut contents)
         .map_err(|e| chain_error!(e, "failed to read manifest", ?file_path))?;
 
-    match Manifest::decode_and_validate(&*contents, cache_builder, Some(targets), file_path) {
+    match Manifest::decode_and_validate(&contents, cache_builder, Some(targets), file_path) {
         Ok(ret) => Ok(Some(ret)),
         Err(e) => {
             use std::os::unix::fs::MetadataExt;
@@ -1280,7 +1280,7 @@ impl ReplicationBuffer {
         };
 
         match src() {
-            Ok(src) => std::fs::symlink_metadata(&src).is_ok(),
+            Ok(src) => std::fs::symlink_metadata(src).is_ok(),
             Err(_) => false,
         }
     }
