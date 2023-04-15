@@ -77,7 +77,7 @@ pub(crate) fn try_to_unzstd(
     decompressed_size_limit: usize,
 ) -> Option<std::io::Result<Vec<u8>>> {
     fn decompress(payload: &[u8], decompressed_size_limit: usize) -> std::io::Result<Vec<u8>> {
-        let mut decoder = zstd::Decoder::new(&*payload)?;
+        let mut decoder = zstd::Decoder::new(payload)?;
         let mut sink = BoundedVectorSink::new(decompressed_size_limit);
 
         std::io::copy(&mut decoder, &mut sink)?;

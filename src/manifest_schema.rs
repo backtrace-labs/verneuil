@@ -685,7 +685,7 @@ pub(crate) fn parse_manifest_chunks(
     match std::fs::read(path) {
         Ok(contents) => {
             let (manifest, base_or) = Manifest::decode_and_validate(
-                &*contents,
+                &contents,
                 Default::default(),
                 Some(replication_targets),
                 path,
