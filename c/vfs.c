@@ -1582,9 +1582,36 @@ verneuil__file_sync_impl(sqlite3_file *vfile, int flags)
         if (file->path == NULL)
                 return SQLITE_OK;
 
+#ifdef __APPLE__
         do {
-                r = fsync(file->fd);
+                /*
+                 * Per
+                 * https://developer.apple.com/documentation/xcode/reducing-disk-writes#Minimize-explicit-storage-synchronization,
+                 * Apple devices usually want F_BARRIERFSYNC (fsync +
+                 * barrier), while F_FULLFSYNC is the working fsync
+                 * (flushes the storage device's volatile cache).
+                 *
+                 * In either case, we won't corrupt data (unlike plain
+                 * fsync, in case of power failure?), but
+                 * F_BARRIERFSYNC may lose transactions committed to
+                 * the kernel but not yet persisted.
+                 *
+                 * Set `PRAGMA fullfsync = on` for F_FULLSYNC.
+                 */
+                int request = ((flags & 0x0F) == SQLITE_SYNC_FULL)
+                        ? F_FULLFSYNC
+                        : F_BARRIERFSYNC;
+                r = fcntl(file->fd, request, 0);
         } while (r != 0 && errno == EINTR);
+#else
+        r = -1;
+#endif
+
+        if (r != 0) {
+                do {
+                        r = fdatasync(file->fd);
+                } while (r != 0 && errno == EINTR);
+        }
 
         if (r != 0) {
                 switch (errno) {
