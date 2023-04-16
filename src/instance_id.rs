@@ -2,7 +2,9 @@
 //! The description should be constant until the next reboot, and
 //! change after each reboot.
 use std::boxed::Box;
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::BufRead;
 use std::io::Error;
 use std::io::ErrorKind;
@@ -13,6 +15,30 @@ const DEFAULT_HOSTNAME: &str = "no.hostname.verneuil";
 /// On Linux, we use `/proc` (sysctl has been deprecated since 2.6,
 /// and was *removed* in 5.5).  BSDs probably expect to use sysctl;
 /// Darwin certainly does.
+
+/// Finds the mib for sysctl `name`.
+#[cfg(not(target_os = "linux"))]
+fn resolve_sysctl(name: &str) -> Result<Vec<libc::c_int>> {
+    let c_name = std::ffi::CString::new(name)?;
+    let mut name = Vec::<libc::c_int>::new();
+
+    // All the names I've seen top out at a depth of 4.
+    name.resize(16, 0);
+    loop {
+        let mut len = name.len();
+        let rc = unsafe { libc::sysctlnametomib(c_name.as_ptr(), name.as_mut_ptr(), &mut len) };
+
+        if rc == 0 {
+            name.resize(len, 0);
+            return Ok(name);
+        }
+
+        let err = Error::last_os_error();
+        if err.kind() != ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
 
 /// Calls `sysctl(3)` to store the value of `mib` in `value` / `len`.
 ///
@@ -41,6 +67,39 @@ fn robust_sysctl<T>(mib: &mut [libc::c_int], value: *mut T, len: &mut usize) -> 
             return Err(err);
         }
     }
+}
+
+/// Gets the string-valued sysctl at `mib`.
+#[cfg(not(target_os = "linux"))]
+fn get_sysctl_string(mib: &mut [libc::c_int]) -> Result<String> {
+    // Repeat a bounded number of times.
+    for _ in 0..4 {
+        let mut len = 0usize;
+
+        // Get the value's size.
+        robust_sysctl(mib, std::ptr::null_mut() as *mut u8, &mut len)?;
+
+        let mut val = Vec::<u8>::new();
+        val.resize(len, 0u8);
+
+        // Grab the value.
+        match robust_sysctl(mib, val.as_mut_ptr(), &mut len) {
+            Ok(()) => {
+                // Drop NUL terminators.
+                while val.last() == Some(&0) {
+                    val.pop();
+                }
+                return Ok(String::from_utf8_lossy(&val).into_owned());
+            }
+            Err(e) if e.kind() == ErrorKind::OutOfMemory => {
+                // Try again, looks like the size changed?!
+                continue;
+            }
+            e => e?,
+        }
+    }
+
+    Err(Error::last_os_error())
 }
 
 #[cfg(target_os = "linux")]
@@ -99,6 +158,7 @@ pub(crate) fn boot_timestamp() -> u64 {
     *TIMESTAMP
 }
 
+#[cfg(target_os = "linux")]
 fn find_boot_id() -> Result<&'static str> {
     let file = File::open("/proc/sys/kernel/random/boot_id")?;
 
@@ -109,15 +169,24 @@ fn find_boot_id() -> Result<&'static str> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn find_boot_id() -> Result<&'static str> {
+    // Or should we use kern.bootuuid? bootsessionuuid seems more
+    // conservative (more likely to change).
+    let mut mib = resolve_sysctl("kern.bootsessionuuid")?;
+    Ok(Box::leak(get_sysctl_string(&mut mib)?.into_boxed_str()))
+}
+
 /// Returns the randomly generated UUID for this boot.
 pub(crate) fn boot_id() -> &'static str {
     lazy_static::lazy_static! {
-        static ref ID: &'static str = find_boot_id().expect("`/proc/sys/kernel/random/boot_id` should be set");
+        static ref ID: &'static str = find_boot_id().expect("boot id should be set");
     }
 
     &ID
 }
 
+#[cfg(target_os = "linux")]
 fn find_hostname() -> Result<&'static str> {
     let file = File::open("/etc/hostname")?;
 
@@ -126,6 +195,12 @@ fn find_hostname() -> Result<&'static str> {
         Some(Err(e)) => Err(e),
         Some(Ok(line)) => Ok(Box::leak(line.into_boxed_str())),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn find_hostname() -> Result<&'static str> {
+    let mut mib = resolve_sysctl("kern.hostname")?;
+    Ok(Box::leak(get_sysctl_string(&mut mib)?.into_boxed_str()))
 }
 
 /// Returns the machine's hostname, or a default placeholder if none.
@@ -198,7 +273,7 @@ fn print_boot_time() {
 
 #[test]
 fn print_boot_id() {
-    assert_ne!(boot_id(), "");
+    assert_ne!(find_boot_id().expect("should have boot id"), "");
     println!("Boot id = {}", boot_id());
 }
 
@@ -209,6 +284,7 @@ fn print_instance_id() {
 
 #[test]
 fn print_hostname() {
+    assert_ne!(find_hostname().expect("should have hostname"), "");
     assert_ne!(hostname(), DEFAULT_HOSTNAME);
     println!(
         "hostname = '{}', hash = '{}'",
