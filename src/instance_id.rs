@@ -10,6 +10,40 @@ use std::io::Result;
 
 const DEFAULT_HOSTNAME: &str = "no.hostname.verneuil";
 
+/// On Linux, we use `/proc` (sysctl has been deprecated since 2.6,
+/// and was *removed* in 5.5).  BSDs probably expect to use sysctl;
+/// Darwin certainly does.
+
+/// Calls `sysctl(3)` to store the value of `mib` in `value` / `len`.
+///
+/// In practice, `mib` is immutable, but the C prototype says it's
+/// mutable.
+#[cfg(not(target_os = "linux"))]
+fn robust_sysctl<T>(mib: &mut [libc::c_int], value: *mut T, len: &mut usize) -> Result<()> {
+    loop {
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr() as *mut _,
+                mib.len() as _, // this is c_int or uint on different OSes
+                value as *mut _,
+                len as *mut usize,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if rc == 0 {
+            return Ok(());
+        }
+
+        let err = Error::last_os_error();
+        if err.kind() != ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn compute_boot_time_slow() -> Result<u64> {
     let file = File::open("/proc/stat")?;
 
@@ -25,6 +59,33 @@ fn compute_boot_time_slow() -> Result<u64> {
     }
 
     Err(Error::new(ErrorKind::Other, "btime not in `/proc/stat`"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn compute_boot_time_slow() -> Result<u64> {
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i32,
+    }
+
+    let tv_len = std::mem::size_of::<Timeval>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = tv_len;
+    robust_sysctl(&mut mib, &mut tv as *mut _, &mut len)?;
+
+    if len != tv_len {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("sysctl(boottime) returned an invalid size: {}", len),
+        ));
+    }
+
+    Ok(tv.tv_sec.max(0) as u64)
 }
 
 /// Returns the Unix timestamp at which the machine booted up.  This
@@ -130,6 +191,7 @@ pub(crate) fn likely_instance_ids(range: u64) -> Vec<String> {
 
 #[test]
 fn print_boot_time() {
+    assert_ne!(compute_boot_time_slow().expect("should have boot time"), 0);
     assert_ne!(boot_timestamp(), 0);
     println!("Boot time = {}", boot_timestamp());
 }
