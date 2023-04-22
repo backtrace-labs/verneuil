@@ -1287,6 +1287,7 @@ impl ReplicationBuffer {
     /// Attempts to parse the current "consuming" manifest file, and
     /// returns the current base chunk for the list of chunk
     /// fingerprints, if any.
+    #[cfg(feature = "test_vfs")]
     #[instrument(level = "trace", err)]
     pub fn read_consuming_manifest(
         &self,
@@ -1305,6 +1306,7 @@ impl ReplicationBuffer {
     /// Attempts to parse the current ready manifest file, and
     /// returns the current base chunk for the list of chunk
     /// fingerprints, if any.
+    #[cfg(feature = "test_vfs")]
     #[instrument(level = "trace", err)]
     pub fn read_ready_manifest(
         &self,
