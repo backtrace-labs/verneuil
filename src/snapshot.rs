@@ -37,10 +37,13 @@ struct LazyChunk {
 }
 
 /// How do we want to populate a snapshot's data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotLoadingPolicy {
     // Let the implementation decide.
+    #[default]
     Default,
     // Always fully load everything when creating the `Snapshot`.
     Eager,
@@ -49,13 +52,10 @@ pub enum SnapshotLoadingPolicy {
     // an internal default never less than `min`).
     //
     // We always load the first and last chunk.
-    Partial { min: Option<u64>, max: Option<u64> },
-}
-
-impl Default for SnapshotLoadingPolicy {
-    fn default() -> Self {
-        SnapshotLoadingPolicy::Default
-    }
+    Partial {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
 }
 
 pub struct Snapshot {
