@@ -22,7 +22,15 @@ lazy_static::lazy_static! {
 }
 
 fn find_btime_in_line(line: &str) -> Option<&str> {
-    let captures = STAT_RE.captures_iter(line).next()?;
+    // We expect a comm field terminated by a closing parenthesis.  If
+    // we have a parenthesis, parse everything after the last one: the
+    // remaining fields in the stat line are all single letters or
+    // integers.
+    let haystack = match line.rsplit_once(')') {
+        Some((_prefix, suffix)) => suffix,
+        None => line,
+    };
+    let captures = STAT_RE.captures_iter(haystack).next()?;
     Some(captures.get(1)?.as_str())
 }
 
@@ -32,18 +40,24 @@ fn find_btime_in_line(line: &str) -> Option<&str> {
 fn compute_birth(pid: u32) -> Result<u64> {
     let file = File::open(format!("/proc/{}/stat", pid))?;
 
+    let mut btime: Option<Result<u64>> = None;
+    // Use the last match: someone could in theory stash something
+    // that looks like a valid stat line in the comm field.
     for line in std::io::BufReader::new(file).lines().flatten() {
         if let Some(tick) = find_btime_in_line(&line) {
-            return tick
+            let value = tick
                 .parse()
                 .map_err(|_| Error::new(ErrorKind::Other, "failed to parse birth tick"));
+            btime = Some(value);
         }
     }
 
-    Err(Error::new(
-        ErrorKind::Other,
-        "failed to parse /proc/pid/stat",
-    ))
+    btime.unwrap_or_else(|| {
+        Err(Error::new(
+            ErrorKind::Other,
+            "failed to parse /proc/pid/stat",
+        ))
+    })
 }
 
 /// Returns a string that (should) uniquely identify the current
@@ -89,6 +103,22 @@ fn test_funny_comm_line() {
 fn test_funny_comm_break_end() {
     // Assume a newline at the end of comm.
     const BROKEN_LINE: &str = " S 0 1 1 0 -1 1077952768 57853 9890418 44 3013 399 704 48385 118027 20 0 1 0 1118 173748224 1855 18446744073709551615 1 1 0 0 0 0 671173123 4096 1260 0 0 0 17 1 0 0 290 0 0 0 0 0 0 0 0 0 0";
+
+    assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
+}
+
+#[test]
+fn test_funny_comm_break_end_with_paren() {
+    // Assume a newline at the end of comm, just before the closing parenthesis
+    const BROKEN_LINE: &str = ") S 0 1 1 0 -1 1077952768 57853 9890418 44 3013 399 704 48385 118027 20 0 1 0 1118 173748224 1855 18446744073709551615 1 1 0 0 0 0 671173123 4096 1260 0 0 0 17 1 0 0 290 0 0 0 0 0 0 0 0 0 0";
+
+    assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
+}
+
+#[test]
+fn test_funny_comm_space() {
+    // Assume a space in the middle of comm
+    const BROKEN_LINE: &str = "asd sdf) S 0 1 1 0 -1 1077952768 57853 9890418 44 3013 399 704 48385 118027 20 0 1 0 1118 173748224 1855 18446744073709551615 1 1 0 0 0 0 671173123 4096 1260 0 0 0 17 1 0 0 290 0 0 0 0 0 0 0 0 0 0";
 
     assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
 }
