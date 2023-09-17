@@ -38,6 +38,10 @@ fn find_btime_in_line(line: &str) -> Option<&str> {
 ///
 /// Returns `None` on any kind of failure: its caller has a graceful
 /// fallback mechanism.
+///
+/// This is only expected to work on Linux, but a spurious success
+/// seems unlikely; if an operating system has a linux-compatible
+/// procfs, we might as well try to use it.
 fn compute_birth(pid: u32) -> Option<u64> {
     let file = File::open(format!("/proc/{}/stat", pid)).ok()?;
 
@@ -112,7 +116,6 @@ fn test_funny_comm_break_end() {
     assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn test_funny_comm_break_end_with_paren() {
     // Assume a newline at the end of comm, just before the closing parenthesis
@@ -129,6 +132,7 @@ fn test_funny_comm_space() {
     assert_eq!(find_btime_in_line(BROKEN_LINE), Some("1118"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn print_pid1_birth() {
     println!(
