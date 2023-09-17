@@ -601,10 +601,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
 
     if cfg!(target_endian = "little") {
         let slice = unsafe {
-            std::slice::from_raw_parts(
-                chunks.as_ptr() as *const u8,
-                std::mem::size_of_val(chunks),
-            )
+            std::slice::from_raw_parts(chunks.as_ptr() as *const u8, std::mem::size_of_val(chunks))
         };
 
         return fingerprinter.write(slice).digest();
