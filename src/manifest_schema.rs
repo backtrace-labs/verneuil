@@ -603,7 +603,7 @@ pub(crate) fn fingerprint_v1_chunk_list(chunks: &[u64]) -> Fingerprint {
         let slice = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,
-                chunks.len() * std::mem::size_of::<u64>(),
+                std::mem::size_of_val(chunks),
             )
         };
 
