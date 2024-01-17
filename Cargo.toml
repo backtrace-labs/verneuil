@@ -53,6 +53,7 @@ test_validate_all = ["test_validate_writes", "test_validate_reads"]
 
 [dependencies]
 attohttpc = { version = "0.18", default-features = false }
+aws-region = { version = "0.23" }  # we just want the same as rust-s3
 backtrace = "0.3"
 # We use blake2b to compare the actual db file and our replicated snapshot,
 # but only during tests.
@@ -62,6 +63,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # build verneuil's examples out of tree.
 clap = { version = "3", optional = true }
 crossbeam-channel = "0.5"
+derivative = "2.2.0"
 governor = { version = "0.4", default-features = false, features = ["std", "jitter"] }  # 0.4 doesn't build without "jitter"
 itertools = "0.10"
 kismet-cache = "0.2"
