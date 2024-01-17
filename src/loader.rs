@@ -83,10 +83,36 @@ impl Chunk {
     }
 }
 
-#[derive(Debug)]
+/// Workaround for the fact that rust-s3 doesn't redact credentials in debug
+/// impls.
+#[allow(clippy::ptr_arg)]
+fn redacted_bucket_fmt(buckets: &Vec<Bucket>, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+    #[derive(Debug)]
+    #[allow(dead_code)] // Because we disregard Debug in dead code analysis.
+    struct RedactedBucket<'a> {
+        name: &'a str,
+        region: &'a awsregion::Region,
+    }
+
+    let redacted = buckets
+        .iter()
+        .map(|x| RedactedBucket {
+            name: x.name.as_str(),
+            region: &x.region,
+        })
+        .collect::<Vec<_>>();
+
+    write!(fmt, "{:?}", redacted)
+}
+
+#[derive(derivative::Derivative)]
+#[derivative(Debug)]
 pub(crate) struct Loader {
     cache: kismet_cache::Cache,
+
+    #[derivative(Debug(format_with = "redacted_bucket_fmt"))]
     remote_sources: Vec<Bucket>,
+
     // These chunks will be returned without involving any cache nor
     // `remote_sources`.
     known_chunks: HashMap<Fingerprint, Arc<Chunk>>,
@@ -655,4 +681,28 @@ fn load_from_source_impl(source: &Bucket, name: &str) -> Result<Option<Vec<u8>>>
     }
 
     std::unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_loader_no_credential() {
+        let mut loader = Loader {
+            cache: kismet_cache::CacheBuilder::new().build(),
+            remote_sources: Vec::new(),
+            known_chunks: HashMap::new(),
+        };
+
+        loader
+            .remote_sources
+            .push(Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap());
+
+        println!("Loader: {:?}", loader);
+        let debug_output = format!("{:?}", loader);
+        assert!(!debug_output.to_lowercase().contains("credential"));
+        assert!(!debug_output.to_lowercase().contains("key"));
+        assert!(!debug_output.to_lowercase().contains("token"));
+    }
 }
