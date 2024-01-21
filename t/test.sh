@@ -75,6 +75,14 @@ trap cleanup EXIT
 mkdir -p minio
 rm -rf minio/*
 
+# We use minio to spin up a local s3-compatible service on localhost:7777
+#
+# The data files in the data volume aren't as simple as they once were; the
+# easiest way to see what's stored in the local buckets is probably
+#
+# $ docker run --security-opt label=disable -v ./escape-hatch:/out --net=host -it --entrypoint=/bin/sh docker.io/minio/mc
+# sh-5.1# mc alias set verneuil http://localhost:7777 VERNEUIL_TEST_ACCOUNT VERNEUIL_TEST_KEY
+# sh-5.1# mc ls verneuil  # etc.
 EXTRA_DOCKER_ARGS=${EXTRA_DOCKER_ARGS:-}
 if docker info | grep -q 'rootless: true' ; then
     # rootless, no need for fancy user mapping, and also can't assume
@@ -98,6 +106,9 @@ docker run --net=host $EXTRA_DOCKER_ARGS \
   -e "MINIO_ROOT_PASSWORD=VERNEUIL_TEST_KEY" \
   docker.io/minio/minio server --address 127.0.0.1:7777  /data &
 
+# Leftover state shouldn't result in incorrect replication, but does trigger extra assertions
+# that assume a clean initial state.
+echo "About to run integration tests. Remember to clear leftover state under '/tmp/verneuil-*' if running with extra (read) validation."
 sleep 5;
 
 OFFLINE_CONFIG=$(cat <<'EOF'
