@@ -7,8 +7,10 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// How big to set the initial capacity by default.
 ///
 /// We expect to mostly decompress chunks of this size.
-const BOUNDED_VECTOR_SIZE_INITIAL_CAPACITY: usize =
-    crate::tracker::WRITE_SNAPSHOT_GRANULARITY as usize;
+fn bounded_vector_size_initial_capacity() -> usize {
+    crate::tracker::DEFAULT_WRITE_SNAPSHOT_GRANULARITY
+        .max(crate::tracker::write_snapshot_granularity()) as usize
+}
 
 /// A `Writer` that dumps bytes to `dst` and fails instead of writing
 /// more than `max` bytes.
@@ -27,7 +29,7 @@ impl BoundedVectorSink {
     fn new(max: usize) -> Self {
         Self {
             dst: Some(Vec::with_capacity(
-                max.clamp(0, BOUNDED_VECTOR_SIZE_INITIAL_CAPACITY),
+                max.clamp(0, bounded_vector_size_initial_capacity()),
             )),
             max,
         }
