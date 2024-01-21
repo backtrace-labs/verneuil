@@ -127,9 +127,8 @@ fn reencode_flattened_chunks(
 
     // Copy the original value of `chunks` in `base`, as little-endian
     // bytes.
-    let mut base: Vec<u8> = Vec::new();
+    let mut base: Vec<u8> = Vec::with_capacity(chunks.len() * std::mem::size_of::<u64>());
 
-    base.reserve(chunks.len() * std::mem::size_of::<u64>());
     for chunk in chunks.iter() {
         base.extend(chunk.to_le_bytes());
     }
