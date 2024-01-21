@@ -92,6 +92,10 @@ pub struct BundledChunk {
     pub chunk_data: Vec<u8>,
 }
 
+/// We assume manifests snapshotted db files in 64 KB chunks when
+/// the manifest doesn't specify `base_chunk_size`.
+pub const DEFAULT_BASE_CHUNK_SIZE: u64 = 1 << 16;
+
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct ManifestV1 {
     // The fingerprint for the file's 100-byte sqlite header.  There
@@ -173,6 +177,12 @@ pub struct ManifestV1 {
     // the content-addressed store.
     #[prost(message, repeated, tag = "16")]
     pub bundled_chunks: Vec<BundledChunk>,
+
+    // Default chunk size for this manifest.  All but the last chunk
+    // must have this size if provided.  Defaults to
+    // `DEFAULT_BASE_CHUNK_SIZE` when missing.
+    #[prost(uint64, optional, tag = "10")]
+    pub base_chunk_size: Option<u64>,
 }
 
 /// When deserialising a `Manifest`, it usually makes sense to use
@@ -794,6 +804,7 @@ fn test_manifest_v1_default() {
         generated_by: vec![],
         chunks: vec![],
         bundled_chunks: vec![],
+        base_chunk_size: None,
     };
 
     let empty: &[u8] = b"";

@@ -28,7 +28,7 @@ use crate::result::Result;
 use super::MutationState;
 use super::Tracker;
 use super::BASE_CHUNK_MIN_LENGTH;
-use super::SNAPSHOT_GRANULARITY;
+use super::WRITE_SNAPSHOT_GRANULARITY;
 
 /// What should we do with the current base chunk fingerprint list?
 enum BaseChunkAction {
@@ -374,8 +374,8 @@ impl Tracker {
             .metadata()
             .map_err(|e| chain_error!(e, "failed to stat file", ?self.path))?
             .len();
-        let num_chunks = len / SNAPSHOT_GRANULARITY
-            + (if (len % SNAPSHOT_GRANULARITY) > 0 {
+        let num_chunks = len / WRITE_SNAPSHOT_GRANULARITY
+            + (if (len % WRITE_SNAPSHOT_GRANULARITY) > 0 {
                 1
             } else {
                 0
@@ -398,7 +398,7 @@ impl Tracker {
             let grown = (fprints.len() as u64) < num_chunks;
             let wrote_past_end = self
                 .dirty_chunks
-                .range(fprints.len() as u64 * SNAPSHOT_GRANULARITY..=u64::MAX)
+                .range(fprints.len() as u64 * WRITE_SNAPSHOT_GRANULARITY..=u64::MAX)
                 .next()
                 .is_some();
             let delta = (grown || wrote_past_end) as u64;
@@ -419,7 +419,7 @@ impl Tracker {
         chunk_fprints.resize(num_chunks as usize, Fingerprint::new(0, 0));
 
         // Box this allocation to avoid a 64KB stack allocation.
-        let mut buf = Box::new([0u8; SNAPSHOT_GRANULARITY as usize]);
+        let mut buf = Box::new([0u8; WRITE_SNAPSHOT_GRANULARITY as usize]);
 
         let mut num_snapshotted: usize = 0;
         let mut bundled_chunks = Vec::new();
@@ -434,9 +434,9 @@ impl Tracker {
         let update = &mut |chunk_index, expected_fprint| -> Result<bool> {
             num_snapshotted += 1;
 
-            let begin = chunk_index * SNAPSHOT_GRANULARITY;
-            let end = if (len - begin) > SNAPSHOT_GRANULARITY {
-                begin + SNAPSHOT_GRANULARITY
+            let begin = chunk_index * WRITE_SNAPSHOT_GRANULARITY;
+            let end = if (len - begin) > WRITE_SNAPSHOT_GRANULARITY {
+                begin + WRITE_SNAPSHOT_GRANULARITY
             } else {
                 len
             };
@@ -483,7 +483,7 @@ impl Tracker {
         };
 
         for (base, expected_fprint) in &self.dirty_chunks {
-            let chunk_index = base / SNAPSHOT_GRANULARITY;
+            let chunk_index = base / WRITE_SNAPSHOT_GRANULARITY;
 
             // Everything greater than or equal to `backfill_begin`
             // will be handled by the loop below.  This avoids
@@ -514,7 +514,7 @@ impl Tracker {
             if cfg!(not(feature = "test_vfs"))
                 && !self
                     .dirty_chunks
-                    .contains_key(&(random_index * SNAPSHOT_GRANULARITY))
+                    .contains_key(&(random_index * WRITE_SNAPSHOT_GRANULARITY))
             {
                 // We don't *have* to get these additional chunks, so
                 // we don't want to bubble up errors.
@@ -615,6 +615,7 @@ impl Tracker {
                 generated_by: crate::manifest_schema::generator_version_bytes(),
                 chunks: compressible,
                 bundled_chunks,
+                base_chunk_size: None,
             }),
         };
 

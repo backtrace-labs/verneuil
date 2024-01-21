@@ -208,7 +208,7 @@ const FAST_COMPRESSION_LEVEL: i32 = 1;
 /// When the raw data is at least this large, convert default (0)
 /// compression to `FAST_COMPRESSION_LEVEL`: we assume that's not
 /// sqlite db data, and probably incompressible.
-const FAST_COMPRESSION_AUTO_SIZE: usize = (crate::tracker::SNAPSHOT_GRANULARITY as usize) + 1;
+const FAST_COMPRESSION_AUTO_SIZE: usize = (crate::tracker::WRITE_SNAPSHOT_GRANULARITY as usize) + 1;
 
 lazy_static::lazy_static! {
     static ref RECENT_WORK: Mutex<RecentWorkSet> = Mutex::new(RecentWorkSet::new(COPY_REQUEST_MEMORY, COPY_REQUEST_JITTER));

@@ -31,7 +31,13 @@ mod invariants;
 mod snapshot_file_contents;
 
 /// We snapshot db files in 64KB content-addressed chunks.
-pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
+///
+/// When changing this value, consider tweaking the set of well-known
+/// chunks that writers do no need to publish.  Currently, this set
+/// only contains the chunk of 64 KiB (`loader::WELL_KNOWN_ZERO_CHUNK_SIZE`)
+/// bytes.  This set can grow backward compatibly, as long as readers
+/// learn about well-known chunks before writers.
+pub(crate) const WRITE_SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
 /// Don't generate a base fingerprint chunk for a list of fingerprints
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
@@ -273,8 +279,8 @@ impl Tracker {
         self.backing_file_state = MutationState::Dirty;
 
         if !buf.is_null()
-            && count == SNAPSHOT_GRANULARITY
-            && (offset % SNAPSHOT_GRANULARITY) == 0
+            && count == WRITE_SNAPSHOT_GRANULARITY
+            && (offset % WRITE_SNAPSHOT_GRANULARITY) == 0
             && !self.should_bundle_chunk_at_offset(offset)
         {
             // When sqlite fires off a writes that's exactly
@@ -298,12 +304,12 @@ impl Tracker {
 
             self.dirty_chunks.insert(offset, value);
         } else if count > 0 {
-            let min = offset / SNAPSHOT_GRANULARITY;
-            let max = offset.saturating_add(count - 1) / SNAPSHOT_GRANULARITY;
+            let min = offset / WRITE_SNAPSHOT_GRANULARITY;
+            let max = offset.saturating_add(count - 1) / WRITE_SNAPSHOT_GRANULARITY;
 
             for chunk_index in min..=max {
                 self.dirty_chunks
-                    .insert(SNAPSHOT_GRANULARITY * chunk_index, None);
+                    .insert(WRITE_SNAPSHOT_GRANULARITY * chunk_index, None);
             }
         }
     }

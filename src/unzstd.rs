@@ -7,7 +7,8 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// How big to set the initial capacity by default.
 ///
 /// We expect to mostly decompress chunks of this size.
-const BOUNDED_VECTOR_SIZE_INITIAL_CAPACITY: usize = crate::tracker::SNAPSHOT_GRANULARITY as usize;
+const BOUNDED_VECTOR_SIZE_INITIAL_CAPACITY: usize =
+    crate::tracker::WRITE_SNAPSHOT_GRANULARITY as usize;
 
 /// A `Writer` that dumps bytes to `dst` and fails instead of writing
 /// more than `max` bytes.
