@@ -73,8 +73,7 @@ cleanup
 trap cleanup EXIT
 
 mkdir -p minio
-rm -rf minio
-mkdir -p minio
+rm -rf minio/*
 
 EXTRA_DOCKER_ARGS=${EXTRA_DOCKER_ARGS:-}
 if docker info | grep -q 'rootless: true' ; then
