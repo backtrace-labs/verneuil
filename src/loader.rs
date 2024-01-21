@@ -65,6 +65,13 @@ const LOADER_POOL_SIZE: usize = 10;
 /// bytes) for its references to data chunks.
 const DECODED_CHUNK_SIZE_LIMIT: usize = 3usize << 27;
 
+/// The write-side expects us to recognize the fingerprint for a chunk
+/// of 65536 zero bytes, and not need to load it from remote storage.
+///
+/// In the future, we may gain more "well known" chunks; if we do so,
+/// we must make sure to have them be known to readers before writers.
+const WELL_KNOWN_ZERO_CHUNK_SIZE: usize = 1usize << 16;
+
 #[derive(Debug)]
 pub struct Chunk {
     fprint: Fingerprint,
@@ -117,8 +124,7 @@ lazy_static::lazy_static! {
     // when this optimisation does not trigger.
     static ref ZERO_FILLED_CHUNK: (Fingerprint, Arc<Chunk>) = {
         let payload =
-            memmap2::MmapMut::map_anon(
-                crate::tracker::SNAPSHOT_GRANULARITY as usize)
+            memmap2::MmapMut::map_anon(WELL_KNOWN_ZERO_CHUNK_SIZE)
             .expect("failed to create anonymous mapping")
             .make_read_only()
             .expect("failed to make mapping read-only");
