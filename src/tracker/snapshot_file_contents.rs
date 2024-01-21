@@ -250,7 +250,7 @@ enum CurrentManifest {
     // Snapshot from scratch.
     Desync,
     // Use the previous manifest as an initial snapshot.
-    Initial(Manifest, Option<Arc<Chunk>>),
+    Initial(Box<Manifest>, Option<Arc<Chunk>>),
 }
 
 // This impl block has all the snapshot update logic.
@@ -352,7 +352,7 @@ impl Tracker {
 
         match current_manifest {
             None => CurrentManifest::Desync,
-            Some((manifest, base)) => CurrentManifest::Initial(manifest, base),
+            Some((manifest, base)) => CurrentManifest::Initial(Box::new(manifest), base),
         }
     }
 
@@ -551,7 +551,7 @@ impl Tracker {
         &mut self,
         header_fprint: Fingerprint,
         version_id: Vec<u8>,
-        current_manifest: Option<(Manifest, Option<Arc<Chunk>>)>,
+        current_manifest: Option<(Box<Manifest>, Option<Arc<Chunk>>)>,
     ) -> Result<(usize, Vec<Fingerprint>, Option<Fingerprint>)> {
         use std::os::unix::fs::MetadataExt;
 
@@ -584,7 +584,7 @@ impl Tracker {
         }
 
         // Try to get an initial list of chunks to work off.
-        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
+        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &*x.0));
 
         let (len, mut chunks, bundled_chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
 
@@ -725,7 +725,7 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> =
+        let current_manifest: Option<(Box<Manifest>, Option<Arc<Chunk>>)> =
             match self.judge_current_manifest(&version_id) {
                 CurrentManifest::UpToDate => return Ok(()),
                 CurrentManifest::Desync => None,
