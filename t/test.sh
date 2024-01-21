@@ -76,21 +76,28 @@ mkdir -p minio
 rm -rf minio
 mkdir -p minio
 
-EXTRA_DOCKER_ARGS=
-# If there are at least 4 CPUs on this machine, restrict minio to 2
-# cores: goodput scales negatively at some point around 256 cores.
-if grep -q '^processor\s*:\s*3$' /proc/cpuinfo ;
-then
-    EXTRA_DOCKER_ARGS="$EXTRA_DOCKER_ARGS --cpuset-cpus=1-2"
+EXTRA_DOCKER_ARGS=${EXTRA_DOCKER_ARGS:-}
+if docker info | grep -q 'rootless: true' ; then
+    # rootless, no need for fancy user mapping, and also can't assume
+    # we can tweak our cpuset... but then we have to calm down selinux,
+    # to let the container write to bind mounted directories.
+    EXTRA_DOCKER_ARGS="$EXTRA_DOCKER_ARGS --replace --security-opt label=disable"
+else
+    EXTRA_DOCKER_ARG="$EXTRA_DOCKER_ARG --user $(id -u):$(id -g)"
+    # If there are at least 4 CPUs on this machine, restrict minio to 2
+    # cores: goodput scales negatively at some point around 256 cores.
+    if grep -q '^processor\s*:\s*3$' /proc/cpuinfo ;
+    then
+        EXTRA_DOCKER_ARGS="$EXTRA_DOCKER_ARGS --cpuset-cpus=1-2"
+    fi
 fi
 
 docker run --net=host $EXTRA_DOCKER_ARGS \
-  --user $(id -u):$(id -g) \
   --name verneuil_test_minio \
   -v $CURRENT/minio:/data \
   -e "MINIO_ROOT_USER=VERNEUIL_TEST_ACCOUNT" \
   -e "MINIO_ROOT_PASSWORD=VERNEUIL_TEST_KEY" \
-  minio/minio server --address 127.0.0.1:7777  /data &
+  docker.io/minio/minio server --address 127.0.0.1:7777  /data &
 
 sleep 5;
 
