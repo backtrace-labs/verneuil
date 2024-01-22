@@ -17,6 +17,10 @@ SQLite databases that range in size from 100KB to a few gigabytes,
 some of which see updates every second... for less than $40/day in S3
 costs.
 
+It has been tested on linux/amd64, linux/aarch64 (little endian), and
+darwin/aarch64.  The sqlite file format and the Verneuil replication
+data are all platform agnostic.
+
 [^verneuil-process]:  The [Verneuil process](https://en.wikipedia.org/wiki/Verneuil_method) was the first commercial method of manufacturing synthetic gemstones... and DRH insists on pronouncing SQLite like a mineral, surely a precious one (:
 
 The primary design goal of Verneuil is to add asynchronous read
