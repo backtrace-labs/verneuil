@@ -39,6 +39,10 @@ mod snapshot_file_contents;
 /// learn about well-known chunks before writers.
 pub(crate) const DEFAULT_WRITE_SNAPSHOT_GRANULARITY: u64 = 1 << 16;
 
+/// The write snapshot granularity is configurable, but zero wouldn't work,
+/// and too small would be amazingly wasteful.
+const MIN_WRITE_SNAPSHOT_GRANULARITY: u64 = 64;
+
 /// Don't generate a base fingerprint chunk for a list of fingerprints
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
 ///
@@ -58,10 +62,58 @@ const BASE_CHUNK_MIN_LENGTH: usize = 600;
 /// essentially never the same.
 const BUNDLED_CHUNK_OFFSETS: [u64; 1] = [0];
 
+const VERNEUIL_WRITE_SNAPSHOT_ENV_VAR: &str = "VERNEUIL_WRITE_SNAPSHOT_GRANULARITY";
+
 /// We snapshot db files in content-addressed chunks of this many
 /// bytes.
 pub(crate) fn write_snapshot_granularity() -> u64 {
-    DEFAULT_WRITE_SNAPSHOT_GRANULARITY
+    fn compute_snapshot_granularity() -> Option<u64> {
+        let os_value = std::env::var_os(VERNEUIL_WRITE_SNAPSHOT_ENV_VAR)?;
+        let value = if let Some(value) = os_value.to_str() {
+            value
+        } else {
+            tracing::warn!(
+                ?os_value,
+                VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                "invalid value for verneuil write snapshot granularity"
+            );
+            return None;
+        };
+
+        if value.is_empty() {
+            return None;
+        }
+
+        match value.parse::<u64>() {
+            Ok(value) if value >= MIN_WRITE_SNAPSHOT_GRANULARITY => {
+                tracing::info!(
+                    ?value,
+                    VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                    "Overriding verneuil write snapshot granularity"
+                );
+                Some(value)
+            }
+            Ok(value) => {
+                tracing::warn!(?value, MIN_WRITE_SNAPSHOT_GRANULARITY, VERNEUIL_WRITE_SNAPSHOT_ENV_VAR, "Found overly small override verneuil write snapshot granularity; using min value");
+                Some(MIN_WRITE_SNAPSHOT_GRANULARITY)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?value,
+                    ?e,
+                    VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                    "Failed to parse verneuil write snapshot granularity"
+                );
+                None
+            }
+        }
+    }
+
+    lazy_static::lazy_static! {
+        static ref GRANULARITY : u64 = compute_snapshot_granularity().unwrap_or(DEFAULT_WRITE_SNAPSHOT_GRANULARITY);
+    }
+
+    *GRANULARITY
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
