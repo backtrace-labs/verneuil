@@ -30,8 +30,18 @@ use crate::result::Result;
 mod invariants;
 mod snapshot_file_contents;
 
-/// We snapshot db files in 64KB content-addressed chunks.
-pub(crate) const SNAPSHOT_GRANULARITY: u64 = 1 << 16;
+/// We snapshot db files in 64KB content-addressed chunks by default.
+///
+/// When changing this value, consider tweaking the set of well-known
+/// chunks that writers do no need to publish.  Currently, this set
+/// only contains the chunk of 64 KiB (`loader::WELL_KNOWN_ZERO_CHUNK_SIZE`)
+/// bytes.  This set can grow backward compatibly, as long as readers
+/// learn about well-known chunks before writers.
+pub(crate) const DEFAULT_WRITE_SNAPSHOT_GRANULARITY: u64 = 1 << 16;
+
+/// The write snapshot granularity is configurable, but zero wouldn't work,
+/// and too small would be amazingly wasteful.
+const MIN_WRITE_SNAPSHOT_GRANULARITY: u64 = 64;
 
 /// Don't generate a base fingerprint chunk for a list of fingerprints
 /// shorter than `BASE_CHUNK_MIN_LENGTH`.
@@ -51,6 +61,60 @@ const BASE_CHUNK_MIN_LENGTH: usize = 600;
 /// transaction.  There's no point trying to deduplicate it, it's
 /// essentially never the same.
 const BUNDLED_CHUNK_OFFSETS: [u64; 1] = [0];
+
+const VERNEUIL_WRITE_SNAPSHOT_ENV_VAR: &str = "VERNEUIL_WRITE_SNAPSHOT_GRANULARITY";
+
+/// We snapshot db files in content-addressed chunks of this many
+/// bytes.
+pub(crate) fn write_snapshot_granularity() -> u64 {
+    fn compute_snapshot_granularity() -> Option<u64> {
+        let os_value = std::env::var_os(VERNEUIL_WRITE_SNAPSHOT_ENV_VAR)?;
+        let value = if let Some(value) = os_value.to_str() {
+            value
+        } else {
+            tracing::warn!(
+                ?os_value,
+                VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                "invalid value for verneuil write snapshot granularity"
+            );
+            return None;
+        };
+
+        if value.is_empty() {
+            return None;
+        }
+
+        match value.parse::<u64>() {
+            Ok(value) if value >= MIN_WRITE_SNAPSHOT_GRANULARITY => {
+                tracing::info!(
+                    ?value,
+                    VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                    "Overriding verneuil write snapshot granularity"
+                );
+                Some(value)
+            }
+            Ok(value) => {
+                tracing::warn!(?value, MIN_WRITE_SNAPSHOT_GRANULARITY, VERNEUIL_WRITE_SNAPSHOT_ENV_VAR, "Found overly small override verneuil write snapshot granularity; using min value");
+                Some(MIN_WRITE_SNAPSHOT_GRANULARITY)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?value,
+                    ?e,
+                    VERNEUIL_WRITE_SNAPSHOT_ENV_VAR,
+                    "Failed to parse verneuil write snapshot granularity"
+                );
+                None
+            }
+        }
+    }
+
+    lazy_static::lazy_static! {
+        static ref GRANULARITY : u64 = compute_snapshot_granularity().unwrap_or(DEFAULT_WRITE_SNAPSHOT_GRANULARITY);
+    }
+
+    *GRANULARITY
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
@@ -100,6 +164,9 @@ pub(crate) struct Tracker {
     // this db's manifest.  Keeping this chunk alive guarantees we can
     // find it in the global cache, and thus avoids useless GETs.
     recent_base_chunk: Option<Arc<crate::loader::Chunk>>,
+
+    // Base size for content-addressable chunks.
+    snapshot_granularity: u64,
 }
 
 impl Tracker {
@@ -160,6 +227,7 @@ impl Tracker {
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
             recent_base_chunk: None,
+            snapshot_granularity: write_snapshot_granularity(),
         }))
     }
 
@@ -272,9 +340,10 @@ impl Tracker {
 
         self.backing_file_state = MutationState::Dirty;
 
+        let snapshot_granularity = write_snapshot_granularity();
         if !buf.is_null()
-            && count == SNAPSHOT_GRANULARITY
-            && (offset % SNAPSHOT_GRANULARITY) == 0
+            && count == snapshot_granularity
+            && (offset % snapshot_granularity) == 0
             && !self.should_bundle_chunk_at_offset(offset)
         {
             // When sqlite fires off a writes that's exactly
@@ -298,12 +367,12 @@ impl Tracker {
 
             self.dirty_chunks.insert(offset, value);
         } else if count > 0 {
-            let min = offset / SNAPSHOT_GRANULARITY;
-            let max = offset.saturating_add(count - 1) / SNAPSHOT_GRANULARITY;
+            let min = offset / snapshot_granularity;
+            let max = offset.saturating_add(count - 1) / snapshot_granularity;
 
             for chunk_index in min..=max {
                 self.dirty_chunks
-                    .insert(SNAPSHOT_GRANULARITY * chunk_index, None);
+                    .insert(snapshot_granularity * chunk_index, None);
             }
         }
     }

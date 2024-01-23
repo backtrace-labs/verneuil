@@ -12,9 +12,9 @@ use crate::fresh_error;
 use crate::loader::Chunk;
 use crate::loader::Loader;
 use crate::manifest_schema::Manifest;
+use crate::manifest_schema::DEFAULT_BASE_CHUNK_SIZE;
 use crate::replication_target::ReplicationTarget;
 use crate::result::Result;
-use crate::tracker::SNAPSHOT_GRANULARITY;
 
 /// When loading partially, always load at least this many chunks at
 /// the beginning of the file.
@@ -33,6 +33,7 @@ const PARTIAL_LOAD_MIN_CHUNK_COUNT: usize = 2;
 #[derive(Clone, Debug)]
 struct LazyChunk {
     fprint: Fingerprint,
+    size: u64,
     bytes: MonoArc<Chunk>,
 }
 
@@ -96,6 +97,7 @@ impl LazyChunk {
     fn from_chunk(chunk: Arc<Chunk>) -> Self {
         Self {
             fprint: chunk.fprint(),
+            size: chunk.payload().len() as u64,
             bytes: chunk.into(),
         }
     }
@@ -118,9 +120,9 @@ impl LazyChunk {
             .fetch_chunk(self.fprint)
             .map_err(|e| chain_error!(e, "failed to fetch chunk data on demand", ?fprint))?
         {
-            // We assume lazily loaded chunks are all exactly
-            // `SNAPSHOT_GRANULARITY` long when constructing the snapshot.
-            Some(chunk) if chunk.payload().len() == SNAPSHOT_GRANULARITY as usize => {
+            // We assume lazily loaded chunks are all exactly the
+            // expected size long when constructing the snapshot.
+            Some(chunk) if chunk.payload().len() == self.size as usize => {
                 // If `store` fails, that's because the `MonoArc`
                 // already holds a value; either way, our job's done.
                 let _ = self.bytes.store(chunk);
@@ -130,7 +132,7 @@ impl LazyChunk {
                 fresh_error!("invalid chunk size found during on-demand loading",
                              fprint=?self.fprint,
                              actual=chunk.payload().len(),
-                             expected=SNAPSHOT_GRANULARITY),
+                             expected=self.size),
             ),
             None => {
                 Err(fresh_error!("chunk not found during on-demand loading", fprint=?self.fprint))
@@ -183,7 +185,7 @@ fn decide_fprints_to_fetch(
             ret.extend_from_slice(&fprints[0..prefix_size.clamp(0, fprints.len())]);
 
             // We always want the last chunk: it (and no other chunk)
-            // could be shorter than a full SNAPSHOT_GRANULARITY, and
+            // could be shorter than a full base_chunk_size, and
             // we assume lazily loaded chunks are exactly that size.
             //
             // However, we only want to add it when it's missing: the
@@ -258,6 +260,7 @@ impl Snapshot {
 
         let fprints = crate::manifest_schema::extract_manifest_chunks(manifest)?;
         let mut loader = Loader::new(cache_builder, remote_sources)?;
+        let mut base_chunk_size = DEFAULT_BASE_CHUNK_SIZE;
 
         // Go through all `BundledChunk`s in the manifest, and register
         // them in `loader`.
@@ -271,6 +274,7 @@ impl Snapshot {
                         .or_else(|| Some(Chunk::arc_from_bytes(&bundled.chunk_data)))
                 })
                 .for_each(|chunk| loader.adjoin_known_chunk(chunk));
+            base_chunk_size = v1.base_chunk_size.unwrap_or(base_chunk_size);
         }
 
         let to_fetch = decide_fprints_to_fetch(load_policy, &fprints);
@@ -291,13 +295,13 @@ impl Snapshot {
                 let _chunk = find_chunk(fprint)?;
                 // All but the last chunk must be exactly snapshot-sized.
                 #[cfg(feature = "test_vfs")]
-                assert_eq!(_chunk.payload().len(), SNAPSHOT_GRANULARITY as usize);
+                assert_eq!(_chunk.payload().len(), base_chunk_size as usize);
             }
 
             let _chunk = find_chunk(last)?;
             // The last chunk may be short.
             #[cfg(feature = "test_vfs")]
-            assert!(_chunk.payload().len() <= SNAPSHOT_GRANULARITY as usize);
+            assert!(_chunk.payload().len() <= base_chunk_size as usize);
         }
 
         let mut len: u64 = 0;
@@ -309,7 +313,7 @@ impl Snapshot {
             let payload_len = chunk_or
                 .as_deref()
                 .map(|chunk| chunk.payload().len() as u64)
-                .unwrap_or(SNAPSHOT_GRANULARITY);
+                .unwrap_or(base_chunk_size);
 
             if chunk_or.is_none() {
                 any_missing_chunk = true;
@@ -328,6 +332,7 @@ impl Snapshot {
                 len,
                 LazyChunk {
                     fprint,
+                    size: payload_len,
                     bytes: chunk_or.into(),
                 },
             );
@@ -637,6 +642,7 @@ fn test_reader_one_chunk() {
                 500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 1000,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -645,6 +651,7 @@ fn test_reader_one_chunk() {
                 2500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 0,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -685,6 +692,7 @@ fn test_reader_one_chunk_short() {
                 500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 1000,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -693,6 +701,7 @@ fn test_reader_one_chunk_short() {
                 2500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 0,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -732,6 +741,7 @@ fn test_reader_one_chunk_short_from_start() {
                 500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 1000,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -740,6 +750,7 @@ fn test_reader_one_chunk_short_from_start() {
                 2500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 0,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -779,6 +790,7 @@ fn test_reader_one_chunk_exact() {
                 500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 1000,
                     bytes: MonoArc::empty(),
                 },
             ),
@@ -787,6 +799,7 @@ fn test_reader_one_chunk_exact() {
                 2500,
                 LazyChunk {
                     fprint: Fingerprint { hash: [0, 0] },
+                    size: 0,
                     bytes: MonoArc::empty(),
                 },
             ),
