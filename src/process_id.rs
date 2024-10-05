@@ -48,7 +48,7 @@ fn compute_birth(pid: u32) -> Option<u64> {
     let mut btime: Option<u64> = None;
     // Use the last match: someone could in theory stash something
     // that looks like a valid stat line in the comm field.
-    for line in std::io::BufReader::new(file).lines().flatten() {
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
         if let Some(tick) = find_btime_in_line(&line) {
             btime = tick.parse().ok();
         }
