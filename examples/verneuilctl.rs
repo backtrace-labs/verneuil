@@ -123,13 +123,13 @@ struct Restore {
 
     /// The path to the source file that was replicated by Verneuil,
     /// when it ran on `--hostname`.
-    #[clap(short, long, parse(from_os_str))]
+    #[clap(short, long)]
     source_path: Option<PathBuf>,
 
     /// The path to the reconstructed output file.
     ///
     /// Defaults to stdout.
-    #[clap(short, long, parse(from_os_str))]
+    #[clap(short, long)]
     out: Option<PathBuf>,
 }
 
@@ -181,7 +181,6 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
 /// the corresponding manifest file to stdout.
 struct ManifestName {
     /// The path to the source file that was replicated by Verneuil.
-    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// The hostname (/etc/hostname) of the machine that replicated
@@ -205,7 +204,6 @@ fn manifest_name(cmd: ManifestName) -> Result<()> {
 /// of the corresponding manifest file to `--out`, or stdout by default.
 struct Manifest {
     /// The path to the source file that was replicated by Verneuil.
-    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// The hostname (/etc/hostname) of the machine that replicated
@@ -216,7 +214,7 @@ struct Manifest {
     /// The path to the output manifest file.
     ///
     /// Defaults to stdout.
-    #[clap(short, long, parse(from_os_str))]
+    #[clap(short, long)]
     out: Option<PathBuf>,
 }
 
@@ -239,7 +237,6 @@ fn manifest(cmd: Manifest, config: Options) -> Result<()> {
 /// attempts to upload all the files pending replication in that directory.
 struct Flush {
     /// The replication spooling directory prefix.
-    #[clap(parse(from_os_str))]
     spooling: PathBuf,
 }
 
@@ -254,7 +251,6 @@ fn flush(cmd: Flush) -> Result<()> {
 /// On success, prints the manifest name to stdout.
 struct Sync {
     /// The source sqlite database file.
-    #[clap(parse(from_os_str))]
     source: PathBuf,
 
     /// Whether to optimize the database before uploading it.
@@ -314,7 +310,7 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
 }
 
 #[derive(Debug, Parser)]
-#[clap(setting = clap::AppSettings::TrailingVarArg)]
+#[clap(trailing_var_arg = true)]
 /// The verneuilctl shell utility accepts the path to a verneuil
 /// manifest file, and opens the snapshot it describes in the sqlite
 /// shell.
@@ -346,7 +342,7 @@ struct Shell {
 
     /// The path to the source file that was replicated by Verneuil,
     /// when it ran on `--hostname`.
-    #[clap(short, long, parse(from_os_str))]
+    #[clap(short, long)]
     source_path: Option<PathBuf>,
 
     /// The path to the sqlite3 shell executable; defaults to

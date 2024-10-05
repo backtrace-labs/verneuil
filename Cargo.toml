@@ -61,7 +61,7 @@ blake2b_simd = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 # Having dev dependencies as optional makes it possible to
 # build verneuil's examples out of tree.
-clap = { version = "3", optional = true }
+clap = { version = "4", optional = true }
 crossbeam-channel = "0.5"
 derivative = "2"
 governor = { version = "0.6", default-features = false, features = ["std"] }
@@ -93,7 +93,7 @@ zstd = "0.13"
 rusqlite = { version = "0.26" }  # For the sample rusqlite_integration.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }  # Examples set up tracing.
 
-clap = { version = "3", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 test_dir = "0.2"
 
 [build-dependencies]
