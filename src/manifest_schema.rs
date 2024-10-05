@@ -497,7 +497,7 @@ pub(crate) fn extract_version_id(
 #[instrument(err)]
 pub(crate) fn update_version_id(file: &File, cached_uuid: Option<Uuid>) -> Result<()> {
     use std::os::unix::io::AsRawFd;
-    use uuid::adapter::Hyphenated;
+    use uuid::fmt::Hyphenated;
 
     extern "C" {
         fn verneuil__setxattr(fd: i32, name: *const i8, buf: *const u8, bufsz: usize) -> isize;
@@ -513,7 +513,7 @@ pub(crate) fn update_version_id(file: &File, cached_uuid: Option<Uuid>) -> Resul
     let mut buf = [0u8; Hyphenated::LENGTH];
     let tag = cached_uuid
         .unwrap_or_else(Uuid::new_v4)
-        .to_hyphenated()
+        .hyphenated()
         .encode_lower(&mut buf);
 
     #[cfg(feature = "no_xattr")]

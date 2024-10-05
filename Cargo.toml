@@ -86,7 +86,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "3"
 umash = "0.6"
-uuid = { version = "0.8", features = ["v4"] }
+uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
 
 [dev-dependencies]
