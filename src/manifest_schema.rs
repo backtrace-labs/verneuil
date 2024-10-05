@@ -845,8 +845,7 @@ fn test_xattr() {
     let path: PathBuf = temp.path("empty");
     let file = File::open(&path).expect("should be able to open file");
 
-    let mut buf = Vec::<u8>::new();
-    buf.resize(XATTR_MAX_VALUE_SIZE, 0u8);
+    let mut buf = vec![0; XATTR_MAX_VALUE_SIZE];
     let initial_ret = unsafe {
         verneuil__getxattr(
             file.as_raw_fd(),
