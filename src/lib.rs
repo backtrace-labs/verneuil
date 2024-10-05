@@ -574,7 +574,7 @@ pub fn copy_all_spool_paths(
     to_copy
         .into_par_iter()
         .map(|path| copy_spool_path(&path))
-        .collect::<Result<_>>()?;
+        .collect::<Result<()>>()?;
     Ok(())
 }
 
