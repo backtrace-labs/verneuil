@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -61,7 +62,7 @@ impl RecentWorkSet {
     /// to `offset_range` will be subtracted from the work unit's
     /// start timestamp.  This avoids thundering herds by ensuring
     /// work units expire at different times.
-    pub fn new(capacity: usize, offset_range: Duration) -> RecentWorkSet {
+    pub fn new(capacity: NonZeroUsize, offset_range: Duration) -> RecentWorkSet {
         RecentWorkSet {
             recent: lru::LruCache::new(capacity),
             offset_range,

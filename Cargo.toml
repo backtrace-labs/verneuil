@@ -69,7 +69,7 @@ itertools = "0.13"
 kismet-cache = "0.2"
 lazy_static = "1"
 libc = "0.2"
-lru = { version = "0.7", default-features = false }  # Disable hashbrown
+lru = { version = "0.12", default-features = false }  # Disable hashbrown
 memmap2 = "0.7"
 percent-encoding = "2"
 prost = "0.13"
