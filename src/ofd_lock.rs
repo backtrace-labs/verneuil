@@ -48,6 +48,7 @@ impl OfdLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)
             .map_err(|e| chain_error!(e, "failed to open ofd lock file", ?lock_path))?;
 
