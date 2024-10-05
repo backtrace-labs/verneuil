@@ -161,7 +161,7 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
     // Use the global default target lists for the manifest and when
     // fetching its chunks.
     let (manifest, base) = verneuil::Manifest::decode_and_validate(
-        &*manifest_contents,
+        &manifest_contents,
         Default::default(),
         None,
         &cmd.manifest,
@@ -386,7 +386,7 @@ fn shell(cmd: Shell, config: Options) -> Result<()> {
         let self_path = std::fs::canonicalize(&self_path)
             .map_err(|e| chain_error!(e, "failed to canonicalise self path", ?self_path))?;
 
-        if let Some(parent) = self_path.parent().map(std::path::Path::parent).flatten() {
+        if let Some(parent) = self_path.parent().and_then(std::path::Path::parent) {
             let probe = parent.join("lib").join(format!("{}.so", VFS_NAME));
 
             if probe.exists() {
