@@ -19,6 +19,7 @@ use crate::chain_warn;
 use crate::drop_result;
 use crate::executor::block_on_with_executor;
 use crate::fresh_error;
+use crate::lazy_buckets::LazyVecBucket;
 use crate::manifest_schema::fingerprint_file_chunk;
 use crate::manifest_schema::hash_file_chunk;
 use crate::replication_target::apply_cache_replication_targets;
@@ -83,35 +84,11 @@ impl Chunk {
     }
 }
 
-/// Workaround for the fact that rust-s3 doesn't redact credentials in debug
-/// impls.
-#[allow(clippy::ptr_arg)]
-fn redacted_bucket_fmt(buckets: &Vec<Bucket>, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-    #[derive(Debug)]
-    #[allow(dead_code)] // Because we disregard Debug in dead code analysis.
-    struct RedactedBucket<'a> {
-        name: &'a str,
-        region: &'a awsregion::Region,
-    }
-
-    let redacted = buckets
-        .iter()
-        .map(|x| RedactedBucket {
-            name: x.name.as_str(),
-            region: &x.region,
-        })
-        .collect::<Vec<_>>();
-
-    write!(fmt, "{:?}", redacted)
-}
-
-#[derive(derivative::Derivative)]
-#[derivative(Debug)]
+#[derive(Debug)]
 pub(crate) struct Loader {
     cache: kismet_cache::Cache,
 
-    #[derivative(Debug(format_with = "redacted_bucket_fmt"))]
-    remote_sources: Vec<Bucket>,
+    remote_sources: LazyVecBucket,
 
     // These chunks will be returned without involving any cache nor
     // `remote_sources`.
@@ -358,7 +335,7 @@ impl Loader {
 
         Ok(Loader {
             cache: cache_builder.build(),
-            remote_sources,
+            remote_sources: LazyVecBucket::new_from_buckets(remote_sources),
             known_chunks: well_known_chunks()
                 .into_iter()
                 .map(|chunk| (chunk.fprint(), chunk))
@@ -434,7 +411,7 @@ impl Loader {
             use std::io::Error;
             use std::io::ErrorKind;
 
-            for source in &self.remote_sources {
+            for source in self.remote_sources.buckets()? {
                 if let Some(remote) = load_from_source(source, &name)
                     .map_err(|_| Error::new(ErrorKind::Other, "failed to fetch remote chunk"))?
                 {
@@ -689,15 +666,12 @@ mod tests {
 
     #[test]
     fn test_loader_no_credential() {
-        let mut loader = Loader {
+        let bucket = Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap();
+        let loader = Loader {
             cache: kismet_cache::CacheBuilder::new().build(),
-            remote_sources: Vec::new(),
+            remote_sources: LazyVecBucket::new_from_buckets(vec![bucket]),
             known_chunks: HashMap::new(),
         };
-
-        loader
-            .remote_sources
-            .push(Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap());
 
         println!("Loader: {:?}", loader);
         let debug_output = format!("{:?}", loader);

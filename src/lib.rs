@@ -2,6 +2,7 @@ mod atomic_kv32;
 mod copier;
 mod executor;
 mod instance_id;
+mod lazy_buckets; // For loader
 mod loader;
 mod manifest_schema;
 mod ofd_lock;
