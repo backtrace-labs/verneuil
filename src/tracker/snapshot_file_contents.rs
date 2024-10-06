@@ -241,15 +241,28 @@ impl Tracker {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviousManifestState {
+    // We think the manifest was up-to-date wrt the initial sqlite db
+    // file's state.  This means we can rely on our dirty page tracking.
+    Reliable,
+    // We can only assume the previous manifest was valid, but otherwise
+    // unrelated to the sqlite db file.  All pages are potentially dirty.
+    Arbitrary,
+}
+
+type ValidManifestInfo = Box<(PreviousManifestState, Manifest, Option<Arc<Chunk>>)>;
+
 /// How do we want to treat the current manifest (that we're about to
 /// replace)?
 enum CurrentManifest {
     // Don't generate a new snapshot at all.
     UpToDate,
-    // Snapshot from scratch.
-    Desync,
-    // Use the previous manifest as an initial snapshot.
-    Initial(Manifest, Option<Arc<Chunk>>),
+    // We don't have any initial manifest
+    FromScratch,
+    // Use the previous manifest as an initial snapshot, but be mindful
+    // of how much we trust that manifest.
+    Initial(ValidManifestInfo),
 }
 
 // This impl block has all the snapshot update logic.
@@ -262,11 +275,13 @@ enum CurrentManifest {
 impl Tracker {
     /// Loads the current manifest and figures out what to do with it.
     fn judge_current_manifest(&self, version_id: &[u8]) -> CurrentManifest {
-        let mut current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
+        let current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> = self
             .read_current_manifest()
             .map_err(|e| chain_info!(e, "failed to read staged manifest file"))
             .ok()
             .flatten();
+
+        let prev_manifest_state: PreviousManifestState;
 
         // If we're snapshotting after a write, we always want to go
         // through the whole process.  We made some changes, let's
@@ -326,10 +341,12 @@ impl Tracker {
                 up_to_date = false;
             }
 
-            // If the manifest isn't up to date, we can't use it.
-            if !up_to_date {
-                current_manifest = None;
-            }
+            // If the manifest isn't up to date, remember that.
+            prev_manifest_state = if up_to_date {
+                PreviousManifestState::Reliable
+            } else {
+                PreviousManifestState::Arbitrary
+            };
         } else {
             // If we're doing this opportunistically (not after a write)
             // and the staging manifest seems up to date, there's nothing
@@ -344,14 +361,16 @@ impl Tracker {
             }
 
             // If we think there's work to do after a read
-            // transaction, assume the worst, and rebuild
-            // the snapshot from scratch.
-            current_manifest = None;
+            // transaction, assume the worst, and rescan
+            // the whole file
+            prev_manifest_state = PreviousManifestState::Arbitrary;
         }
 
         match current_manifest {
-            None => CurrentManifest::Desync,
-            Some((manifest, base)) => CurrentManifest::Initial(manifest, base),
+            None => CurrentManifest::FromScratch,
+            Some((manifest, base)) => {
+                CurrentManifest::Initial(Box::new((prev_manifest_state, manifest, base)))
+            }
         }
     }
 
@@ -363,6 +382,7 @@ impl Tracker {
     fn snapshot_chunks(
         &self,
         base: Option<Vec<Fingerprint>>,
+        prev_manifest_state: PreviousManifestState,
     ) -> Result<(u64, Vec<Fingerprint>, Vec<BundledChunk>, usize)> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -402,12 +422,18 @@ impl Tracker {
                 .is_some();
             let delta = (grown || wrote_past_end) as u64;
 
-            // We definitely don't know anything about what's at or
-            // after chunk index `fprints.len()`.  We also don't
-            // want to go out of bounds if the new file shrunk.
-            backfill_begin = (fprints.len() as u64)
-                .clamp(0, num_chunks)
-                .saturating_sub(delta);
+            if prev_manifest_state == PreviousManifestState::Arbitrary {
+                // Assume all the chunks in the manifests exist, but confirm
+                // that they match what we want.
+                backfill_begin = 0;
+            } else {
+                // We definitely don't know anything about what's at or
+                // after chunk index `fprints.len()`.  We also don't
+                // want to go out of bounds if the new file shrunk.
+                backfill_begin = (fprints.len() as u64)
+                    .clamp(0, num_chunks)
+                    .saturating_sub(delta);
+            }
             fprints
         } else {
             backfill_begin = 0;
@@ -550,7 +576,7 @@ impl Tracker {
         &mut self,
         header_fprint: Fingerprint,
         version_id: Vec<u8>,
-        current_manifest: Option<(Manifest, Option<Arc<Chunk>>)>,
+        current_manifest: Option<ValidManifestInfo>,
     ) -> Result<(usize, Vec<Fingerprint>, Option<Fingerprint>)> {
         use std::os::unix::fs::MetadataExt;
 
@@ -568,7 +594,7 @@ impl Tracker {
         // mark them as dirty: it doesn't matter that we didn't change
         // them, we can't refer to them without making sure they're
         // available for readers.
-        if let Some(v1) = current_manifest.as_ref().and_then(|x| x.0.v1.as_ref()) {
+        if let Some(v1) = current_manifest.as_ref().and_then(|x| x.1.v1.as_ref()) {
             for bundled in &v1.bundled_chunks {
                 self.dirty_chunks.insert(bundled.chunk_offset, None);
             }
@@ -583,9 +609,15 @@ impl Tracker {
         }
 
         // Try to get an initial list of chunks to work off.
-        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.0));
+        let base_fprints = Self::base_chunk_fprints(current_manifest.as_ref().map(|x| &x.1));
 
-        let (len, mut chunks, bundled_chunks, mut copied) = self.snapshot_chunks(base_fprints)?;
+        let prev_manifest_state = match current_manifest.as_ref() {
+            None => PreviousManifestState::Arbitrary,
+            Some(state) => state.0,
+        };
+
+        let (len, mut chunks, bundled_chunks, mut copied) =
+            self.snapshot_chunks(base_fprints, prev_manifest_state)?;
 
         let (ctime, ctime_ns) = match self.file.metadata() {
             Ok(meta) => (meta.ctime(), meta.ctime_nsec() as i32),
@@ -598,7 +630,7 @@ impl Tracker {
         let flattened = flatten_chunk_fprints(&chunks);
         let manifest_fprint = fingerprint_v1_chunk_list(&flattened);
         let (compressible, base_chunk) =
-            reencode_flattened_chunks(&self.buffer, current_manifest.and_then(|x| x.1), flattened)?;
+            reencode_flattened_chunks(&self.buffer, current_manifest.and_then(|x| x.2), flattened)?;
 
         let base_fprint = base_chunk.as_ref().map(|x| x.fprint());
 
@@ -724,12 +756,11 @@ impl Tracker {
                          e => chain_warn!(e, "failed to force populate version xattr", path=?self.path));
         }
 
-        let current_manifest: Option<(Manifest, Option<Arc<Chunk>>)> =
-            match self.judge_current_manifest(&version_id) {
-                CurrentManifest::UpToDate => return Ok(()),
-                CurrentManifest::Desync => None,
-                CurrentManifest::Initial(manifest, base) => Some((manifest, base)),
-            };
+        let current_manifest = match self.judge_current_manifest(&version_id) {
+            CurrentManifest::UpToDate => return Ok(()),
+            CurrentManifest::FromScratch => None,
+            CurrentManifest::Initial(manifest) => Some(manifest),
+        };
 
         // We don't *have* to overwrite the .metadata file, but we
         // should create it if it's missing: without that file, the
