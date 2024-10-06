@@ -46,10 +46,10 @@ impl std::fmt::Debug for LazyVecBucket {
 }
 
 impl LazyVecBucket {
-    pub fn new_from_buckets(buckets: Vec<Bucket>) -> Self {
+    pub fn new(builder: Box<VecBucketBuilder>) -> Self {
         LazyVecBucket {
-            builder: Default::default(),
-            buckets: Box::new(Ok(buckets)).into(),
+            builder: Mutex::new(Some(builder)),
+            buckets: Default::default(),
         }
     }
 
@@ -80,10 +80,62 @@ impl LazyVecBucket {
 
 #[test]
 fn test_buckets_no_credential() {
-    let bucket = Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap();
-    let lazy_vec = LazyVecBucket::new_from_buckets(vec![bucket]);
+    let called_flag = std::sync::Arc::new(Mutex::new(false));
 
-    println!("Buckets: {:?}", lazy_vec);
+    let builder_flag = called_flag.clone();
+    let builder = move || {
+        *builder_flag.lock().unwrap() = true;
+        Ok(vec![Bucket::new_public(
+            "test-bucket",
+            awsregion::Region::UsEast1,
+        )
+        .unwrap()])
+    };
+
+    let lazy_vec = LazyVecBucket::new(Box::new(builder));
+
+    {
+        println!("Delayed buckets: {:?}", lazy_vec);
+        let debug_output = format!("{:?}", lazy_vec);
+        assert!(!debug_output.to_lowercase().contains("credential"));
+        assert!(!debug_output.to_lowercase().contains("key"));
+        assert!(!debug_output.to_lowercase().contains("token"));
+    }
+
+    // Should still be delayed
+    assert!(!*called_flag.lock().unwrap());
+
+    // Force computation
+    let _ = lazy_vec.buckets();
+
+    // Should have called the builder
+    assert!(*called_flag.lock().unwrap());
+
+    {
+        println!("Resolved buckets: {:?}", lazy_vec);
+        let debug_output = format!("{:?}", lazy_vec);
+        assert!(!debug_output.to_lowercase().contains("credential"));
+        assert!(!debug_output.to_lowercase().contains("key"));
+        assert!(!debug_output.to_lowercase().contains("token"));
+    }
+}
+
+#[test]
+fn test_buckets_error() {
+    let called_flag = std::sync::Arc::new(Mutex::new(false));
+
+    let builder_flag = called_flag.clone();
+    let builder = move || {
+        *builder_flag.lock().unwrap() = true;
+        Err(crate::fresh_error!("fake error"))
+    };
+
+    let lazy_vec = LazyVecBucket::new(Box::new(builder));
+
+    // Force computation
+    let _ = lazy_vec.buckets();
+
+    println!("Erroneous buckets: {:?}", lazy_vec);
     let debug_output = format!("{:?}", lazy_vec);
     assert!(!debug_output.to_lowercase().contains("credential"));
     assert!(!debug_output.to_lowercase().contains("key"));

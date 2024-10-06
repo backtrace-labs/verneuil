@@ -307,19 +307,30 @@ impl Loader {
         mut cache_builder: kismet_cache::CacheBuilder,
         remote: &[ReplicationTarget],
     ) -> Result<Loader> {
-        let mut remote_sources = Vec::new();
+        // Precompute S3 target specs for `bucket_builder`.
+        let s3_specs = remote
+            .iter()
+            .filter(|x| matches!(x, ReplicationTarget::S3(_)))
+            .cloned()
+            .collect::<Vec<_>>();
 
-        // We only care about remote S3 sources.
-        if remote.iter().any(|x| matches!(x, ReplicationTarget::S3(_))) {
+        let bucket_builder = move || {
+            if s3_specs.is_empty() {
+                return Ok(Vec::new());
+            }
+
             let creds =
                 Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
-            for source in remote {
-                if let Some(bucket) = create_source(source, &creds, |s3| &s3.chunk_bucket)? {
+            let mut remote_sources = Vec::new();
+            for source in s3_specs {
+                if let Some(bucket) = create_source(&source, &creds, |s3| &s3.chunk_bucket)? {
                     remote_sources.push(bucket);
                 }
             }
-        }
+
+            Ok(remote_sources)
+        };
 
         cache_builder = apply_cache_replication_targets(cache_builder, remote);
 
@@ -335,7 +346,7 @@ impl Loader {
 
         Ok(Loader {
             cache: cache_builder.build(),
-            remote_sources: LazyVecBucket::new_from_buckets(remote_sources),
+            remote_sources: LazyVecBucket::new(Box::new(bucket_builder)),
             known_chunks: well_known_chunks()
                 .into_iter()
                 .map(|chunk| (chunk.fprint(), chunk))
@@ -666,14 +677,24 @@ mod tests {
 
     #[test]
     fn test_loader_no_credential() {
-        let bucket = Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap();
+        let builder = move || {
+            Ok(vec![Bucket::new_public(
+                "test-bucket",
+                awsregion::Region::UsEast1,
+            )
+            .unwrap()])
+        };
+
         let loader = Loader {
             cache: kismet_cache::CacheBuilder::new().build(),
-            remote_sources: LazyVecBucket::new_from_buckets(vec![bucket]),
+            remote_sources: LazyVecBucket::new(Box::new(builder)),
             known_chunks: HashMap::new(),
         };
 
-        println!("Loader: {:?}", loader);
+        // Force computation
+        let _ = loader.remote_sources.buckets();
+
+        println!("Resolved Loader: {:?}", loader);
         let debug_output = format!("{:?}", loader);
         assert!(!debug_output.to_lowercase().contains("credential"));
         assert!(!debug_output.to_lowercase().contains("key"));
