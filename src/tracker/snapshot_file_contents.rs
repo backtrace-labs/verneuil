@@ -251,6 +251,8 @@ enum PreviousManifestState {
     Arbitrary,
 }
 
+type ValidManifestInfo = Box<(PreviousManifestState, Manifest, Option<Arc<Chunk>>)>;
+
 /// How do we want to treat the current manifest (that we're about to
 /// replace)?
 enum CurrentManifest {
@@ -260,7 +262,7 @@ enum CurrentManifest {
     FromScratch,
     // Use the previous manifest as an initial snapshot, but be mindful
     // of how much we trust that manifest.
-    Initial(PreviousManifestState, Manifest, Option<Arc<Chunk>>),
+    Initial(ValidManifestInfo),
 }
 
 // This impl block has all the snapshot update logic.
@@ -366,7 +368,9 @@ impl Tracker {
 
         match current_manifest {
             None => CurrentManifest::FromScratch,
-            Some((manifest, base)) => CurrentManifest::Initial(prev_manifest_state, manifest, base),
+            Some((manifest, base)) => {
+                CurrentManifest::Initial(Box::new((prev_manifest_state, manifest, base)))
+            }
         }
     }
 
@@ -572,7 +576,7 @@ impl Tracker {
         &mut self,
         header_fprint: Fingerprint,
         version_id: Vec<u8>,
-        current_manifest: Option<(PreviousManifestState, Manifest, Option<Arc<Chunk>>)>,
+        current_manifest: Option<ValidManifestInfo>,
     ) -> Result<(usize, Vec<Fingerprint>, Option<Fingerprint>)> {
         use std::os::unix::fs::MetadataExt;
 
@@ -609,7 +613,7 @@ impl Tracker {
 
         let prev_manifest_state = match current_manifest.as_ref() {
             None => PreviousManifestState::Arbitrary,
-            Some((state, _, _)) => *state,
+            Some(state) => state.0,
         };
 
         let (len, mut chunks, bundled_chunks, mut copied) =
@@ -755,7 +759,7 @@ impl Tracker {
         let current_manifest = match self.judge_current_manifest(&version_id) {
             CurrentManifest::UpToDate => return Ok(()),
             CurrentManifest::FromScratch => None,
-            CurrentManifest::Initial(state, manifest, base) => Some((state, manifest, base)),
+            CurrentManifest::Initial(manifest) => Some(manifest),
         };
 
         // We don't *have* to overwrite the .metadata file, but we
