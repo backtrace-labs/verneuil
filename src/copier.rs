@@ -2,7 +2,6 @@
 //! asynchronously acquiring the current "ready" buffer in any number
 //! of replication directories, and sending the ready snapshot to
 //! object stores like S3.
-use core::num::NonZeroU32;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -10,6 +9,8 @@ use std::fs::File;
 use std::future;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -110,8 +111,11 @@ const COPY_REQUEST_JITTER: Duration = Duration::from_secs(600);
 /// we expect during `COPY_REQUEST_MIN_AGE` to avoid spuriously losing
 /// useful entries to LRU... but we still want a bound on the capacity,
 /// because unbounded data structures are a bad idea.
-const COPY_REQUEST_MEMORY: usize =
-    (1.5 * (COPY_RATE.get() as f64) * (COPY_REQUEST_MIN_AGE.as_secs() as f64)) as usize;
+const COPY_REQUEST_MEMORY: NonZeroUsize = unsafe {
+    NonZeroUsize::new_unchecked(
+        1 + (1.5 * (COPY_RATE.get() as f64) * (COPY_REQUEST_MIN_AGE.as_secs() as f64)) as usize,
+    )
+};
 
 /// Perform background work for one spooling directory approximately
 /// once per BACKGROUND_SCAN_PERIOD.

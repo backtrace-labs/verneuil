@@ -61,21 +61,21 @@ blake2b_simd = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 # Having dev dependencies as optional makes it possible to
 # build verneuil's examples out of tree.
-clap = { version = "3", optional = true }
+clap = { version = "4", optional = true }
 crossbeam-channel = "0.5"
-derivative = "2.2.0"
-governor = { version = "0.4", default-features = false, features = ["std", "jitter"] }  # 0.4 doesn't build without "jitter"
-itertools = "0.10"
+derivative = "2"
+governor = { version = "0.6", default-features = false, features = ["std"] }
+itertools = "0.13"
 kismet-cache = "0.2"
 lazy_static = "1"
 libc = "0.2"
-lru = { version = "0.7", default-features = false }  # Disable hashbrown
-memmap2 = "0.5"
+lru = { version = "0.12", default-features = false }  # Disable hashbrown
+memmap2 = "0.7"
 percent-encoding = "2"
-prost = "0.9"
+prost = "0.13"
 quinine = "0.2"
 rand = "0.8"
-rayon = "1.5"
+rayon = "1"
 regex = "1"
 rust-s3 = { version = "0.28", default-features = false, features = ["tokio-rustls-tls", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -85,15 +85,15 @@ tokio = { version = "1", features = ["rt", "time"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "3"
-umash = "0.4"
-uuid = { version = "0.8", features = ["v4"] }
-zstd = "0.11"
+umash = "0.6"
+uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"
 
 [dev-dependencies]
 rusqlite = { version = "0.26" }  # For the sample rusqlite_integration.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }  # Examples set up tracing.
 
-clap = { version = "3", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 test_dir = "0.2"
 
 [build-dependencies]

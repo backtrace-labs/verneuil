@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -53,7 +54,7 @@ const LOAD_RETRY_MULTIPLIER: f64 = 10.0;
 
 /// Keep up to this many cached `Chunk`s alive, regardless of whether
 /// there is any external strong reference to them.
-const LRU_CACHE_SIZE: usize = 128;
+const LRU_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
 
 /// Load chunks in a dedicated thread pool of this size.
 const LOADER_POOL_SIZE: usize = 10;
