@@ -66,6 +66,31 @@ pub struct S3ReplicationTarget {
     pub credentials_process: Option<String>,
 }
 
+/// Selects which of a target's two buckets (chunk vs manifest) callers
+/// want.  Replaces a per-target-shape closure that wouldn't generalise
+/// to non-`S3ReplicationTarget` variants.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum BucketKind {
+    Chunk,
+    Manifest,
+}
+
+impl BucketKind {
+    pub fn s3_bucket<'a>(self, s3: &'a S3ReplicationTarget) -> &'a str {
+        match self {
+            Self::Chunk => &s3.chunk_bucket,
+            Self::Manifest => &s3.manifest_bucket,
+        }
+    }
+
+    pub fn gcs_bucket<'a>(self, gcs: &'a GcsReplicationTarget) -> &'a str {
+        match self {
+            Self::Chunk => &gcs.chunk_bucket,
+            Self::Manifest => &gcs.manifest_bucket,
+        }
+    }
+}
+
 /// True if any target in `targets` needs the AWS default credential
 /// chain (i.e. is an S3 target without its own `credentials_process`
 /// command).  Call sites use this to decide whether the eager
@@ -76,7 +101,11 @@ pub struct S3ReplicationTarget {
 pub(crate) fn any_target_uses_default_credentials_chain(targets: &[ReplicationTarget]) -> bool {
     targets.iter().any(|t| match t {
         ReplicationTarget::S3(s3) => s3.credentials_process.is_none(),
-        ReplicationTarget::Local(_) | ReplicationTarget::ReadOnly(_) => false,
+        // GCS native uses ADC directly (which is its own discovery path,
+        // not the AWS default chain), and Local / ReadOnly need no creds.
+        ReplicationTarget::Gcs(_)
+        | ReplicationTarget::Local(_)
+        | ReplicationTarget::ReadOnly(_) => false,
     })
 }
 
@@ -120,12 +149,64 @@ pub struct LocalReplicationTarget {
     pub capacity: u64,
 }
 
+/// A native-GCS replication target.  Authenticates via Application
+/// Default Credentials (Workload Identity / attached service account)
+/// by default; `credentials_process` lets you override that with an
+/// external shell command that prints an OAuth bearer token.
+///
+/// On-demand bucket creation is opt-in and needs the GCS-specific
+/// `project_id` + `region` (location): GCS requires both at create time,
+/// unlike reads/writes which only need the bucket name.  With
+/// `create_buckets_on_demand` set but those missing, verneuil logs a
+/// warning and leaves it to ops to pre-create the bucket.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub struct GcsReplicationTarget {
+    /// Bucket name for content-addressed chunks.
+    pub chunk_bucket: String,
+
+    /// Bucket name for manifest blobs.
+    pub manifest_bucket: String,
+
+    /// GCS location (region) of these buckets, e.g. `us-west4`.  Optional:
+    /// native GCS addresses objects by bucket name and does not need a
+    /// region for reads/writes.  When set it is used (a) as the tracing
+    /// region label and (b) as the `location` when creating a bucket on
+    /// demand.  Named `region` to mirror [`S3ReplicationTarget::region`]
+    /// (GCS calls it the bucket's "location").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// GCP project id that owns the buckets (bare id or number).
+    /// Optional and only consulted for on-demand bucket creation, which GCS
+    /// scopes to a project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    /// If true, create a bucket with default settings when it does not
+    /// already exist.  Requires `project_id` + `region`; if either is missing
+    /// creation is skipped with a warning.  Mirrors
+    /// [`S3ReplicationTarget::create_buckets_on_demand`].
+    #[serde(default)]
+    pub create_buckets_on_demand: bool,
+
+    /// Optional shell command that, when set, is invoked to source GCP
+    /// OAuth credentials in place of the default ADC discovery.  The
+    /// command must print JSON to stdout per the schema described in
+    /// [`crate::gcs_credentials_process`].  Symmetric counterpart to
+    /// [`S3ReplicationTarget::credentials_process`] but for OAuth bearer
+    /// tokens instead of AWS access-key + secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_process: Option<String>,
+}
+
 /// A replication target tells us where to find or replicate data, but
 /// not with what credentials.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicationTarget {
     S3(S3ReplicationTarget),
+    /// Native GCS via keyless ADC (no HMAC).  See [`GcsReplicationTarget`].
+    Gcs(GcsReplicationTarget),
     ReadOnly(ReadOnlyCacheReplicationTarget),
     Local(LocalReplicationTarget),
 }
@@ -194,7 +275,8 @@ pub(crate) fn apply_cache_replication_targets(
 
                 has_local = true;
             }
-            S3(_) => {}
+            // Remote backends don't contribute to the cache reader chain.
+            S3(_) | Gcs(_) => {}
         }
     }
 
@@ -221,7 +303,8 @@ pub(crate) fn apply_local_cache_replication_target(
                 builder.writer(&target, num_shards, capacity);
                 return builder;
             }
-            ReadOnly(_) | S3(_) => {}
+            // Only `Local` targets feed the cache writer slot.
+            ReadOnly(_) | S3(_) | Gcs(_) => {}
         }
     }
 

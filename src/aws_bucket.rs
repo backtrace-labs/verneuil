@@ -1,14 +1,15 @@
-//! A thin wrapper around `aws-sdk-s3` exposing the operations verneuil
-//! actually uses (put / get / head-bucket / create-bucket / self-copy),
-//! preserving the `(Vec<u8>, u16)` response shape that rust-s3's API had.
+//! Verneuil's bucket facade, dispatching to either an `aws-sdk-s3` 1.x
+//! backend (real S3 and GCS via S3-interop) or a native [google-cloud-storage]
+//! backend (keyless GCS via Application Default Credentials).
 //!
-//! Why preserve that shape: `copier.rs`/`loader.rs` match on the HTTP status
-//! code to classify success / permanent-failure / retryable.  Keeping the
-//! shape lets us swap the SDK without rewriting the retry loops.
+//! Why preserve the rust-s3-shaped `(Vec<u8>, u16)` return: `copier.rs`/
+//! `loader.rs` match on the HTTP status code to classify success /
+//! permanent-failure / retryable.  Keeping the shape lets us swap the
+//! underlying SDK without rewriting the retry loops.
 //!
-//! Service errors (a request reached S3 and got a non-2xx response) become
-//! `Ok((body, status))` so the existing match arms work; transport-level
-//! errors (no response) propagate as `Err`.
+//! Service errors (we reached the server and got a non-2xx response)
+//! become `Ok((body, status))` so the existing match arms work;
+//! transport-level errors (no response) propagate as `Err`.
 
 use std::time::Duration;
 
@@ -21,22 +22,61 @@ use aws_sdk_s3::Client as SdkClient;
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_types::region::Region;
 
+use crate::gcs_bucket::GcsInner;
+
+/// Selects which backend the [`Bucket`] facade dispatches to.
+enum BackendInner {
+    /// AWS SDK: real S3, and GCS over the S3-interop endpoint (HMAC auth).
+    S3(SdkClient),
+    /// Google's official `google-cloud-storage` SDK: native GCS via
+    /// keyless ADC.  See [`crate::gcs_bucket`].
+    Gcs(GcsInner),
+}
+
+/// Which object-store backend a [`Bucket`] talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Aws,
+    Gcs,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Aws => "aws",
+            Backend::Gcs => "gcs",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A bucket-bound handle for object operations.
 pub(crate) struct Bucket {
-    client: SdkClient,
-    // Public(crate) so the existing verneuil call sites that use field
-    // access (e.g. `%target.name` in tracing macros) keep working without
-    // changes; the `name()` / `region()` accessors below are equivalent.
+    inner: BackendInner,
+    // pub(crate) so the existing verneuil call sites that use field access
+    // (e.g. `%target.name` in tracing macros) keep working without changes;
+    // the `name()` / `region()` accessors below are equivalent.
     pub(crate) name: String,
-    pub(crate) region: Region,
+    /// The store region, when it is meaningful/known: the AWS region for S3,
+    /// or the configured GCS location for a native-GCS target.  `None` for a
+    /// native-GCS target with no configured region (native GCS reads/writes
+    /// don't need one).
+    pub(crate) region: Option<Region>,
 }
 
 impl std::fmt::Debug for Bucket {
     /// Redact-safe: we never carry credentials in the struct (the SDK's
-    /// config holds them privately), so debug-print is just name + region.
+    /// config holds them privately), so debug-print is just name + backend +
+    /// region.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bucket")
             .field("name", &self.name)
+            .field("backend", &self.backend())
             .field("region", &self.region)
             .finish()
     }
@@ -62,7 +102,10 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// we don't hot-loop hammering the metadata service.  aws-sdk-s3's provider
 /// is *lazy* (constructed without I/O, resolves on first use), which would
 /// move credential failures to the first request and skip that sleep.  This
-/// helper restores the eager check.
+/// helper restores the eager check for the S3 default chain only.  Targets
+/// using their own `credentials_process` or the GCS native backend don't
+/// rely on the default chain and bypass this verification (see
+/// `crate::replication_target::any_target_uses_default_credentials_chain`).
 pub(crate) fn verify_default_credentials() -> Result<(), BoxError> {
     use aws_credential_types::provider::ProvideCredentials;
     crate::executor::block_on_with_executor(|| async {
@@ -83,7 +126,7 @@ pub(crate) fn verify_default_credentials() -> Result<(), BoxError> {
 }
 
 impl Bucket {
-    /// Build a client against the given region (and optional custom
+    /// Build an S3 client against the given region (and optional custom
     /// endpoint, e.g. minio or the GCS S3-interop URL).  Credentials come
     /// from aws-config's default provider chain (env, IMDS, ...), matching
     /// what `s3::creds::Credentials::default()` used to do.
@@ -151,10 +194,41 @@ impl Bucket {
             }
 
             Ok(Bucket {
-                client: SdkClient::from_conf(s3_cfg_b.build()),
+                inner: BackendInner::S3(SdkClient::from_conf(s3_cfg_b.build())),
                 name: name.to_string(),
-                region: parsed.region,
+                region: Some(parsed.region),
             })
+        })
+    }
+
+    /// Build a GCS-native bucket facade.  Uses ADC for auth (keyless)
+    /// when `credentials_process` is `None` -- a host with Workload
+    /// Identity / an attached SA gets credentials automatically.  When
+    /// `Some(cmd)`, the external command sources OAuth tokens instead
+    /// (see [`crate::gcs_credentials_process`]).
+    ///
+    /// `region` (the bucket's GCS location, e.g. `us-west4`) and `project_id`
+    /// are optional: native-GCS reads/writes address the bucket by name and
+    /// need neither.  `region`, when set, populates the honest
+    /// [`Bucket::region`] tracing field; together with `project_id` it also
+    /// lets [`Bucket::create_bucket`] create the bucket on demand.  Backend
+    /// identity is reported separately via [`Bucket::backend`].
+    ///
+    /// Synchronous (block-on internally) to match [`Bucket::new`]'s shape.
+    pub fn new_gcs(
+        name: &str,
+        region: Option<String>,
+        project_id: Option<String>,
+        credentials_process: Option<String>,
+    ) -> Result<Self, BoxError> {
+        Ok(Bucket {
+            inner: BackendInner::Gcs(GcsInner::new(
+                project_id,
+                region.clone(),
+                credentials_process,
+            )?),
+            name: name.to_string(),
+            region: region.map(Region::new),
         })
     }
 
@@ -162,106 +236,143 @@ impl Bucket {
         &self.name
     }
 
-    pub fn region(&self) -> &Region {
-        &self.region
+    /// The backend this bucket talks to (`aws` / `gcs`) -- the honest
+    /// tracing/metrics label (see [`Backend`]).
+    pub fn backend(&self) -> Backend {
+        match &self.inner {
+            BackendInner::S3(_) => Backend::Aws,
+            BackendInner::Gcs(_) => Backend::Gcs,
+        }
+    }
+
+    /// The store region, if known (see the [`Bucket::region`] field).
+    pub fn region(&self) -> Option<&Region> {
+        self.region.as_ref()
+    }
+
+    /// The region as a tracing label, falling back to `"unset"` when the
+    /// backend has no meaningful/configured region (a native-GCS target
+    /// without a configured location).
+    pub fn region_label(&self) -> &str {
+        self.region.as_ref().map(|r| r.as_ref()).unwrap_or("unset")
     }
 
     /// PUT an object with a content type.  Returns `(body, status)` (the
-    /// body is empty here -- verneuil only reads `status` from this method).
+    /// body is empty on success -- verneuil only reads `status`).
     pub async fn put_object_with_content_type(
         &self,
-        name: &str,
+        key: &str,
         bytes: &[u8],
         content_type: &str,
     ) -> Result<(Vec<u8>, u16), BoxError> {
-        match self
-            .client
-            .put_object()
-            .bucket(&self.name)
-            .key(name)
-            .content_type(content_type)
-            .body(ByteStream::from(bytes.to_vec()))
-            .send()
-            .await
-        {
-            Ok(_) => Ok((Vec::new(), 200)),
-            Err(e) => sdk_err_to_body_code(e),
+        match &self.inner {
+            BackendInner::S3(client) => {
+                match client
+                    .put_object()
+                    .bucket(&self.name)
+                    .key(key)
+                    .content_type(content_type)
+                    .body(ByteStream::from(bytes.to_vec()))
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok((Vec::new(), 200)),
+                    Err(e) => sdk_err_to_body_code(e),
+                }
+            }
+            BackendInner::Gcs(gcs) => {
+                gcs.put_object_with_content_type(&self.name, key, bytes, content_type)
+                    .await
+            }
         }
     }
 
     /// GET an object.  Returns `(body, status)`; on success, body is the
-    /// object's bytes (the SDK has already buffered them via `body.collect`).
-    pub async fn get_object(&self, name: &str) -> Result<(Vec<u8>, u16), BoxError> {
-        match self
-            .client
-            .get_object()
-            .bucket(&self.name)
-            .key(name)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let agg = resp
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| format!("read GET body: {e}"))?;
-                Ok((agg.into_bytes().to_vec(), 200))
+    /// object's bytes.
+    pub async fn get_object(&self, key: &str) -> Result<(Vec<u8>, u16), BoxError> {
+        match &self.inner {
+            BackendInner::S3(client) => {
+                match client.get_object().bucket(&self.name).key(key).send().await {
+                    Ok(resp) => {
+                        let agg = resp
+                            .body
+                            .collect()
+                            .await
+                            .map_err(|e| format!("read GET body: {e}"))?;
+                        Ok((agg.into_bytes().to_vec(), 200))
+                    }
+                    Err(e) => sdk_err_to_body_code(e),
+                }
             }
-            Err(e) => sdk_err_to_body_code(e),
+            BackendInner::Gcs(gcs) => gcs.get_object(&self.name, key).await,
         }
     }
 
     /// HEAD the bucket -- used to check whether it exists before deciding
-    /// whether to create it.  Replaces rust-s3's `bucket.location()`.
+    /// whether to create it.  On the GCS path this is `get_bucket`.
     pub async fn head_bucket(&self) -> Result<(Vec<u8>, u16), BoxError> {
-        match self.client.head_bucket().bucket(&self.name).send().await {
-            Ok(_) => Ok((Vec::new(), 200)),
-            Err(e) => sdk_err_to_body_code(e),
+        match &self.inner {
+            BackendInner::S3(client) => {
+                match client.head_bucket().bucket(&self.name).send().await {
+                    Ok(_) => Ok((Vec::new(), 200)),
+                    Err(e) => sdk_err_to_body_code(e),
+                }
+            }
+            BackendInner::Gcs(gcs) => gcs.head_bucket(&self.name).await,
         }
     }
 
     /// CreateBucket -- on-demand creation, the same intent as rust-s3's
-    /// `Bucket::create[_with_path_style]`.  `force_path_style` was selected
-    /// at construction; nothing extra to do here.
+    /// `Bucket::create[_with_path_style]`.  Not supported on the GCS
+    /// native path (see [`GcsInner::create_bucket`] for why).
     pub async fn create_bucket(&self) -> Result<(Vec<u8>, u16), BoxError> {
-        match self.client.create_bucket().bucket(&self.name).send().await {
-            Ok(_) => Ok((Vec::new(), 200)),
-            Err(e) => sdk_err_to_body_code(e),
+        match &self.inner {
+            BackendInner::S3(client) => {
+                match client.create_bucket().bucket(&self.name).send().await {
+                    Ok(_) => Ok((Vec::new(), 200)),
+                    Err(e) => sdk_err_to_body_code(e),
+                }
+            }
+            BackendInner::Gcs(gcs) => gcs.create_bucket(&self.name).await,
         }
     }
 
-    /// Copy an object onto itself with `MetadataDirective::Replace`.  This
-    /// is the verneuil "touch" idiom -- nudges the object's LastModified
-    /// without re-uploading bytes.  It replaces rust-s3's add_header dance
-    /// (`x-amz-copy-source` + `x-amz-metadata-directive` + empty-body PUT)
-    /// with a single CopyObject call.
+    /// "Touch" an object -- on the AWS path, CopyObject self-to-self with
+    /// `MetadataDirective::Replace`; on the GCS path, patch `custom_time`.
+    /// Either way the object's modification timestamp is bumped without
+    /// re-uploading bytes (verneuil uses this to nudge consumers that a
+    /// manifest is fresh).
     pub async fn copy_object_to_self(
         &self,
-        name: &str,
+        key: &str,
         content_type: &str,
     ) -> Result<(Vec<u8>, u16), BoxError> {
-        // copy_source = "{bucket}/{url-encoded-key}".  Match rust-s3's
-        // encoding choice: NON_ALPHANUMERIC encodes slashes too, since
-        // CopyObject's source header treats them as separators if left bare.
-        let encoded =
-            percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
-                .to_string();
-        let copy_source = format!("{}/{}", self.name, encoded);
+        match &self.inner {
+            BackendInner::S3(client) => {
+                // copy_source = "{bucket}/{url-encoded-key}".  Match rust-s3's
+                // encoding choice: NON_ALPHANUMERIC encodes slashes too, since
+                // CopyObject's source header treats them as separators if
+                // left bare.
+                let encoded =
+                    percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC)
+                        .to_string();
+                let copy_source = format!("{}/{}", self.name, encoded);
 
-        match self
-            .client
-            .copy_object()
-            .bucket(&self.name)
-            .key(name)
-            .copy_source(copy_source)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
-            .content_type(content_type)
-            .send()
-            .await
-        {
-            Ok(_) => Ok((Vec::new(), 200)),
-            Err(e) => sdk_err_to_body_code(e),
+                match client
+                    .copy_object()
+                    .bucket(&self.name)
+                    .key(key)
+                    .copy_source(copy_source)
+                    .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+                    .content_type(content_type)
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok((Vec::new(), 200)),
+                    Err(e) => sdk_err_to_body_code(e),
+                }
+            }
+            BackendInner::Gcs(gcs) => gcs.copy_object_to_self(&self.name, key, content_type).await,
         }
     }
 }
