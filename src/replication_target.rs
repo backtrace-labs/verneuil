@@ -48,6 +48,36 @@ pub struct S3ReplicationTarget {
     /// permissions if they don't already exist or disappear.
     #[serde(default)]
     pub create_buckets_on_demand: bool,
+
+    /// Optional shell command that, when set, is invoked instead of the
+    /// AWS default credential provider chain to obtain credentials for
+    /// this target.  Must output JSON per the AWS credential_process
+    /// spec (Version 1: `AccessKeyId`, `SecretAccessKey`, optional
+    /// `SessionToken`, optional `Expiration`).  See
+    /// [`crate::credentials_process`].
+    ///
+    /// Lets verneuil read its credentials at runtime from a script (e.g.
+    /// one that fetches a GCS HMAC pair from GCP Secret Manager via the
+    /// host's keyless ADC identity), removing the need for ambient
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars on the
+    /// daemon process -- and so retiring the Phase-1 `gcs-creds-exec.sh`
+    /// entrypoint shim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_process: Option<String>,
+}
+
+/// True if any target in `targets` needs the AWS default credential
+/// chain (i.e. is an S3 target without its own `credentials_process`
+/// command).  Call sites use this to decide whether the eager
+/// pre-flight credential check is needed -- if every target sources
+/// credentials via its own script, the default chain may not be
+/// configured at all and a verify call against it would be a spurious
+/// failure.
+pub(crate) fn any_target_uses_default_credentials_chain(targets: &[ReplicationTarget]) -> bool {
+    targets.iter().any(|t| match t {
+        ReplicationTarget::S3(s3) => s3.credentials_process.is_none(),
+        ReplicationTarget::Local(_) | ReplicationTarget::ReadOnly(_) => false,
+    })
 }
 
 fn return_true() -> bool {
@@ -292,6 +322,7 @@ fn test_serialization_smoke_test() {
             manifest_bucket: "manifests".into(),
             domain_addressing: true,
             create_buckets_on_demand: false,
+            credentials_process: None,
         })],
     };
 

@@ -733,8 +733,14 @@ fn create_target(
             // config, so we hand the choice to Bucket::new directly.
             // domain_addressing == true means subdomain-style (force=false).
             let force_path_style = !s3.domain_addressing;
-            let bucket = Bucket::new(bucket_name, region, force_path_style, COPY_REQUEST_TIMEOUT)
-                .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
+            let bucket = Bucket::new(
+                bucket_name,
+                region,
+                force_path_style,
+                COPY_REQUEST_TIMEOUT,
+                s3.credentials_process.clone(),
+            )
+            .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
 
             if s3.create_buckets_on_demand {
                 ensure_bucket_exists(&bucket)?;
@@ -1634,23 +1640,6 @@ impl CopierWorker {
     ) -> Result<bool> {
         let mut did_something = false;
 
-        // aws-sdk-s3 resolves credentials lazily on first request; we want
-        // the eager pre-flight check that rust-s3 gave us so the sleep
-        // below kicks in before we start building Buckets / firing PUTs.
-        // See aws_bucket::verify_default_credentials for the rationale.
-        crate::aws_bucket::verify_default_credentials().map_err(|e| {
-            use rand::Rng;
-
-            let backoff = FAILED_CREDENTIALS_SLEEP.mul_f64(rand::thread_rng().gen_range(1.0..2.0));
-            // Log before sleeping.
-            let err = chain_error!(e, "failed to get S3 credentials", ?backoff);
-            if sleep_on_credential_failure {
-                std::thread::sleep(backoff);
-            }
-
-            err
-        })?;
-
         // Try to read the metadata JSON, which tells us where to
         // replicate the chunks and meta files.  If we can't do
         // that, leave this precious data where it is...  We don't
@@ -1667,6 +1656,36 @@ impl CopierWorker {
                 chain_error!(e, "failed to parse .metadata file", ?metadata, ?contents)
             })?
         };
+
+        // aws-sdk-s3 resolves credentials lazily on first request; we want
+        // the eager pre-flight check that rust-s3 gave us so the sleep
+        // below kicks in before we start building Buckets / firing PUTs.
+        // Skip the check when every target sources creds via its own
+        // `credentials_process` script -- in that case the default chain
+        // may not be configured at all and verifying it would be a
+        // spurious failure.  Per-script verification happens lazily on
+        // first request (verneuil's own retry loops handle script
+        // failures).  This runs *after* targets is loaded so we can
+        // inspect them; previously verneuil did the eager check before
+        // loading targets, but with credentials_process the check has to
+        // be target-aware.
+        if crate::replication_target::any_target_uses_default_credentials_chain(
+            &targets.replication_targets,
+        ) {
+            crate::aws_bucket::verify_default_credentials().map_err(|e| {
+                use rand::Rng;
+
+                let backoff =
+                    FAILED_CREDENTIALS_SLEEP.mul_f64(rand::thread_rng().gen_range(1.0..2.0));
+                // Log before sleeping.
+                let err = chain_error!(e, "failed to get S3 credentials", ?backoff);
+                if sleep_on_credential_failure {
+                    std::thread::sleep(backoff);
+                }
+
+                err
+            })?;
+        }
 
         let cache = apply_local_cache_replication_target(
             kismet_cache::CacheBuilder::new(),
@@ -1862,9 +1881,15 @@ impl CopierWorker {
         }
 
         // Similarly, a failure here shouldn't trigger a full snapshot.
-        if let Err(e) = crate::aws_bucket::verify_default_credentials() {
-            let _ = chain_error!(e, "failed to get S3 credentials");
-            return Ok(());
+        // Skip when no target uses the default chain (see the analogous
+        // site earlier in this file for the rationale).
+        if crate::replication_target::any_target_uses_default_credentials_chain(
+            &targets.replication_targets,
+        ) {
+            if let Err(e) = crate::aws_bucket::verify_default_credentials() {
+                let _ = chain_error!(e, "failed to get S3 credentials");
+                return Ok(());
+            }
         }
 
         let mut chunks_buckets = targets

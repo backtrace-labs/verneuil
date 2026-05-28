@@ -95,7 +95,7 @@ regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "time", "io-util"], default-features = false }
+tokio = { version = "1", features = ["rt", "time", "io-util", "process"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "3"

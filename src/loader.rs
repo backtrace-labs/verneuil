@@ -306,9 +306,13 @@ pub(crate) fn fetch_manifest(
     if !remote.is_empty() {
         // aws-sdk-s3 is lazy about credentials -- do an eager pre-flight
         // check so we still surface "no credentials available" up front,
-        // matching what `Credentials::default()` did with rust-s3.
-        crate::aws_bucket::verify_default_credentials()
-            .map_err(|e| chain_error!(e, "failed to get credentials"))?;
+        // matching what `Credentials::default()` did with rust-s3.  Skip
+        // when no target uses the default chain (every target has its
+        // own `credentials_process`).
+        if crate::replication_target::any_target_uses_default_credentials_chain(remote) {
+            crate::aws_bucket::verify_default_credentials()
+                .map_err(|e| chain_error!(e, "failed to get credentials"))?;
+        }
 
         for source in remote {
             let bucket = create_source(source, |s3| &s3.manifest_bucket)?;
@@ -337,8 +341,14 @@ impl Loader {
 
         // We only care about remote S3 sources.
         if remote.iter().any(|x| matches!(x, ReplicationTarget::S3(_))) {
-            crate::aws_bucket::verify_default_credentials()
-                .map_err(|e| chain_error!(e, "failed to get credentials"))?;
+            // Only verify the default chain if some target actually uses
+            // it; targets that source creds via their own
+            // `credentials_process` script don't need (and can't be
+            // covered by) this check.
+            if crate::replication_target::any_target_uses_default_credentials_chain(remote) {
+                crate::aws_bucket::verify_default_credentials()
+                    .map_err(|e| chain_error!(e, "failed to get credentials"))?;
+            }
 
             for source in remote {
                 if let Some(bucket) = create_source(source, |s3| &s3.chunk_bucket)? {
@@ -596,10 +606,14 @@ fn create_source(
             // set_path_style after construction.  domain_addressing == true
             // means subdomain-style (so force_path_style = false).
             let force_path_style = !s3.domain_addressing;
-            let bucket = Bucket::new(bucket_name, region, force_path_style, LOAD_REQUEST_TIMEOUT)
-                .map_err(|e| {
-                chain_error!(e, "failed to create chunks S3 bucket object", ?s3)
-            })?;
+            let bucket = Bucket::new(
+                bucket_name,
+                region,
+                force_path_style,
+                LOAD_REQUEST_TIMEOUT,
+                s3.credentials_process.clone(),
+            )
+            .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
             Ok(Some(bucket))
         }
         ReadOnly(_) | Local(_) => Ok(None),
@@ -708,6 +722,7 @@ mod tests {
                 },
                 /*force_path_style=*/ false,
                 Duration::from_secs(1),
+                /*credentials_process=*/ None,
             )
             .unwrap(),
         );

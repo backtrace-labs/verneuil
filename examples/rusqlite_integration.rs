@@ -47,6 +47,7 @@ fn main() {
                         manifest_bucket: option_env!("DEFAULT_MANIFEST_BUCKET").unwrap().into(),
                         domain_addressing: true,
                         create_buckets_on_demand: false,
+                        credentials_process: None,
                     },
                 ),
                 // This local replication target is mostly for the
