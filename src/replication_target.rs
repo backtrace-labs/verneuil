@@ -212,30 +212,73 @@ pub(crate) fn apply_local_cache_replication_target(
 /// `region-name.domain.for.https.endpoint`; if there is no dot in the
 /// "region" name, we assume the endpoint matches the region name
 /// (e.g., when deployed to a local undotted domain entry).
-pub(crate) fn parse_s3_region_specification(region: &str, endpoint: Option<&str>) -> s3::Region {
+pub(crate) fn parse_s3_region_specification(
+    region: &str,
+    endpoint: Option<&str>,
+) -> crate::aws_bucket::ParsedRegion {
+    use crate::aws_bucket::ParsedRegion;
+
+    // Recognised AWS regions ride the standard SDK endpoint resolution; for
+    // anything else (custom regions, minio, GCS S3-interop, etc.) we synth a
+    // custom endpoint from the region string or take the caller's explicit
+    // one.
+    let known_aws_region = matches!(
+        region,
+        "us-east-1"
+            | "us-east-2"
+            | "us-west-1"
+            | "us-west-2"
+            | "ca-central-1"
+            | "af-south-1"
+            | "ap-east-1"
+            | "ap-south-1"
+            | "ap-northeast-1"
+            | "ap-northeast-2"
+            | "ap-northeast-3"
+            | "ap-southeast-1"
+            | "ap-southeast-2"
+            | "ap-southeast-3"
+            | "eu-central-1"
+            | "eu-west-1"
+            | "eu-west-2"
+            | "eu-west-3"
+            | "eu-north-1"
+            | "eu-south-1"
+            | "me-south-1"
+            | "sa-east-1"
+            | "us-gov-east-1"
+            | "us-gov-west-1"
+            | "cn-north-1"
+            | "cn-northwest-1"
+    );
+
     if let Some(endpoint) = endpoint {
-        return s3::Region::Custom {
-            region: region.to_owned(),
-            endpoint: endpoint.to_owned(),
+        return ParsedRegion {
+            region: aws_types::region::Region::new(region.to_owned()),
+            endpoint: Some(endpoint.to_owned()),
         };
     }
 
-    match region.parse() {
-        Ok(region) if !matches!(region, s3::Region::Custom { .. }) => region,
-        _ => {
-            let (region_name, endpoint) = match region.split_once('.') {
-                Some(pair) => pair,
-                None => (region, region),
-            };
+    if known_aws_region {
+        return ParsedRegion {
+            region: aws_types::region::Region::new(region.to_owned()),
+            endpoint: None,
+        };
+    }
 
-            let endpoint = format!("https://{}", endpoint);
-            tracing::debug!(string=%region, region=%region_name, %endpoint,
-                            "unknown S3 region; assuming it is a custom `region[.endpoint]`.");
-            s3::Region::Custom {
-                region: region_name.to_owned(),
-                endpoint,
-            }
-        }
+    // Custom region/endpoint, of the form `region-name.endpoint-host`; if
+    // there's no dot, we assume the endpoint host matches the region name
+    // (matching the previous rust-s3 behaviour for undotted local entries).
+    let (region_name, endpoint_host) = match region.split_once('.') {
+        Some(pair) => pair,
+        None => (region, region),
+    };
+    let endpoint = format!("https://{}", endpoint_host);
+    tracing::debug!(string=%region, region=%region_name, %endpoint,
+                    "unknown S3 region; assuming it is a custom `region[.endpoint]`.");
+    ParsedRegion {
+        region: aws_types::region::Region::new(region_name.to_owned()),
+        endpoint: Some(endpoint),
     }
 }
 
