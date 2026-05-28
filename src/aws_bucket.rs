@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
+use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::primitives::ByteStream;
@@ -98,6 +99,11 @@ impl Bucket {
     /// loader.rs) remain the only retry layer -- matching the behaviour
     /// rust-s3 had (it doesn't retry internally).
     ///
+    /// When `credentials_process` is `Some(cmd)`, that shell command is
+    /// invoked per the AWS credential_process spec to source credentials,
+    /// in place of the default provider chain.  See
+    /// [`crate::credentials_process::CredentialsProcessProvider`].
+    ///
     /// Synchronous (block-on internally) to match rust-s3's `Bucket::new`
     /// shape, so the verneuil call sites that already create Buckets
     /// synchronously don't have to be restructured.
@@ -106,6 +112,7 @@ impl Bucket {
         parsed: ParsedRegion,
         force_path_style: bool,
         request_timeout: Duration,
+        credentials_process: Option<String>,
     ) -> Result<Self, BoxError> {
         crate::executor::block_on_with_executor(|| async move {
             // Per-attempt timeout matches what rust-s3's per-request timeout
@@ -116,12 +123,23 @@ impl Bucket {
                 .operation_attempt_timeout(request_timeout)
                 .build();
 
-            let sdk_cfg = aws_config::defaults(BehaviorVersion::latest())
+            let mut loader = aws_config::defaults(BehaviorVersion::latest())
                 .region(parsed.region.clone())
                 .timeout_config(timeout)
-                .retry_config(RetryConfig::disabled())
-                .load()
-                .await;
+                .retry_config(RetryConfig::disabled());
+
+            // If the target specifies a credentials_process script, swap it
+            // in for the default provider chain.  The SDK's credentials
+            // cache wraps the provider automatically, so the script isn't
+            // invoked per-request -- it's called when creds are needed and
+            // re-called when the cached value expires (per the spec's
+            // `Expiration` field).
+            if let Some(command) = credentials_process {
+                let provider = crate::credentials_process::CredentialsProcessProvider::new(command);
+                loader = loader.credentials_provider(SharedCredentialsProvider::new(provider));
+            }
+
+            let sdk_cfg = loader.load().await;
 
             // 1.x exposes endpoint override and addressing style directly on
             // the S3-specific config builder (no more crafting an

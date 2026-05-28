@@ -1,6 +1,7 @@
 mod atomic_kv32;
 mod aws_bucket;
 mod copier;
+mod credentials_process;
 mod executor;
 mod instance_id;
 mod loader;
@@ -491,11 +492,14 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
         let region = replication_target::parse_s3_region_specification(region, None);
         // s3:// URIs default to subdomain (virtual-host) addressing -- this
         // mirrors the rust-s3 path which called set_subdomain_style here.
+        // No `credentials_process` for ad-hoc s3:// URIs -- those just use
+        // the default chain.
         let bucket = Bucket::new(
             bucket,
             region,
             /*force_path_style=*/ false,
             DOWNLOAD_TIMEOUT,
+            /*credentials_process=*/ None,
         )
         .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
 
