@@ -68,6 +68,26 @@ aws-smithy-async = "1"
 aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 aws-types = "1"
+# Google's official Rust SDK for Cloud Storage -- backs the keyless
+# (Application Default Credentials) native-GCS replication target.  1.x is
+# GA / API-stable.  Same family bt_s3_client uses for its GcsNative path.
+google-cloud-storage = "1"
+# Google's official Rust auth crate.  Pulled in explicitly so we can name
+# the `CredentialsProvider` trait that we implement for the GCS-native
+# `credentials_process` external-command auth path.
+google-cloud-auth = "1"
+# Google's gax (gRPC/HTTP transport) crate -- a transitive dep of
+# google-cloud-storage already; declared explicitly so we can name the
+# `CredentialsError` type (which lives here, not in google-cloud-auth).
+google-cloud-gax = "1"
+# Pulled in explicitly so we can name HeaderMap / HeaderValue / Extensions
+# (already transitive via google-cloud-storage 1.x).
+http = "1"
+# Well-known protobuf types, pulled in to name `FieldMask` for
+# Storage::update_object (used by the GCS put_tags equivalent).  Already a
+# transitive dep of google-cloud-storage; declaring it lets us reference
+# the type directly.
+google-cloud-wkt = "1"
 backtrace = "0.3"
 bytes = "1"
 # We use blake2b to compare the actual db file and our replicated snapshot,

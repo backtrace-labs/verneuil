@@ -50,7 +50,6 @@ use crate::replication_target::apply_local_cache_replication_target;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
-use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
 
 const CHUNK_CONTENT_TYPE: &str = "application/octet-stream";
@@ -691,43 +690,50 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
             e,
             "failed to head bucket",
             name=%bucket.name(),
-            region=?bucket.region()
+            backend=%bucket.backend(),
+            region=%bucket.region_label()
         )
     });
     if matches!(head, Ok((_, 200))) {
         return Ok(());
     }
 
-    // aws-sdk-s3's CreateBucket inherits the path-style choice from the
-    // client's config, which we set at `Bucket::new` time -- no need to
-    // re-dispatch by addressing style as rust-s3 required.
+    // CreateBucket inherits its settings from what was baked into the bucket
+    // at construction: addressing style for S3, project + location for GCS.
+    // A 409 (already exists) is success; anything else -- including the GCS
+    // "project_id/region not configured" refusal -- becomes a warning so a
+    // misconfigured on-demand target is visible rather than silently failing.
     match block_on_with_executor(|| bucket.create_bucket()) {
         Ok((_, code)) if (200..300).contains(&code) || code == 409 => {
             // 409 (Conflict) means the bucket already exists, which is fine.
             Ok(())
         }
-        Ok((body, code)) => Err(fresh_warn!("failed to create bucket in S3",
-                                            response=?(code, body),
-                                            name=?bucket.name(), region=?bucket.region())),
-        Err(e) => Err(chain_warn!(e, "failed to create bucket in S3",
-                                  name=?bucket.name(), region=?bucket.region())),
+        Ok((body, code)) => Err(fresh_warn!("failed to create bucket",
+                                            response=?(code, String::from_utf8_lossy(&body)),
+                                            name=?bucket.name(),
+                                            backend=%bucket.backend(),
+                                            region=%bucket.region_label())),
+        Err(e) => Err(chain_warn!(e, "failed to create bucket",
+                                  name=?bucket.name(),
+                                  backend=%bucket.backend(),
+                                  region=%bucket.region_label())),
     }
 }
 
 /// Attempts to configure a `Bucket` from a `ReplicationTarget`.  Once
 /// configured, the `Copier` will use the same bucket object to
 /// publish objects.
-#[instrument(level = "debug", skip(bucket_extractor), err)]
+#[instrument(level = "debug", err)]
 fn create_target(
     target: &ReplicationTarget,
-    bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
+    kind: crate::replication_target::BucketKind,
 ) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
 
     match target {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
-            let bucket_name = bucket_extractor(s3);
+            let bucket_name = kind.s3_bucket(s3);
             // rust-s3's set_subdomain_style/set_path_style was per-Bucket
             // mutation; aws-sdk-s3 selects addressing on the client's
             // config, so we hand the choice to Bucket::new directly.
@@ -743,6 +749,26 @@ fn create_target(
             .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
 
             if s3.create_buckets_on_demand {
+                ensure_bucket_exists(&bucket)?;
+            }
+
+            Ok(Some(bucket))
+        }
+        Gcs(gcs) => {
+            let bucket_name = kind.gcs_bucket(gcs);
+            // ADC by default; credentials_process overrides via an external
+            // OAuth-token-emitting command (symmetric with the S3 path).
+            // region/project_id are optional -- used for the tracing region
+            // label and for on-demand creation below.
+            let bucket = Bucket::new_gcs(
+                bucket_name,
+                gcs.region.clone(),
+                gcs.project_id.clone(),
+                gcs.credentials_process.clone(),
+            )
+            .map_err(|e| chain_error!(e, "failed to create GCS bucket object", ?gcs))?;
+
+            if gcs.create_buckets_on_demand {
                 ensure_bucket_exists(&bucket)?;
             }
 
@@ -1278,7 +1304,9 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
+                .flat_map(|target| {
+                    create_target(target, crate::replication_target::BucketKind::Chunk)
+                })
                 .flatten() // remove None
                 .collect::<Vec<_>>();
 
@@ -1330,7 +1358,9 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket))
+                .flat_map(|target| {
+                    create_target(target, crate::replication_target::BucketKind::Manifest)
+                })
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1446,7 +1476,9 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
+                .flat_map(|target| {
+                    create_target(target, crate::replication_target::BucketKind::Chunk)
+                })
                 .flatten() // Drop `None`.
                 .collect::<Vec<_>>();
 
@@ -1551,7 +1583,9 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket))
+                .flat_map(|target| {
+                    create_target(target, crate::replication_target::BucketKind::Manifest)
+                })
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1896,7 +1930,7 @@ impl CopierWorker {
             .replication_targets
             .iter()
             // TODO: how do we want to handle failures here?
-            .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
+            .flat_map(|target| create_target(target, crate::replication_target::BucketKind::Chunk))
             .flatten() // Drop `None`
             .collect::<Vec<_>>();
 

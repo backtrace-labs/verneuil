@@ -23,7 +23,6 @@ use crate::manifest_schema::hash_file_chunk;
 use crate::replication_target::apply_cache_replication_targets;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
-use crate::replication_target::S3ReplicationTarget;
 use crate::result::Result;
 use crate::unzstd::try_to_unzstd;
 
@@ -91,14 +90,16 @@ fn redacted_bucket_fmt(buckets: &Vec<Bucket>, fmt: &mut std::fmt::Formatter) -> 
     #[allow(dead_code)] // Because we disregard Debug in dead code analysis.
     struct RedactedBucket<'a> {
         name: &'a str,
-        region: &'a aws_types::region::Region,
+        backend: crate::aws_bucket::Backend,
+        region: Option<&'a aws_types::region::Region>,
     }
 
     let redacted = buckets
         .iter()
         .map(|x| RedactedBucket {
-            name: x.name.as_str(),
-            region: &x.region,
+            name: x.name(),
+            backend: x.backend(),
+            region: x.region(),
         })
         .collect::<Vec<_>>();
 
@@ -315,7 +316,7 @@ pub(crate) fn fetch_manifest(
         }
 
         for source in remote {
-            let bucket = create_source(source, |s3| &s3.manifest_bucket)?;
+            let bucket = create_source(source, crate::replication_target::BucketKind::Manifest)?;
             if let Some(bucket) = bucket {
                 if let Some(fetched) = load_from_source(&bucket, name)? {
                     return Ok(Some(fetched));
@@ -339,8 +340,14 @@ impl Loader {
     ) -> Result<Loader> {
         let mut remote_sources = Vec::new();
 
-        // We only care about remote S3 sources.
-        if remote.iter().any(|x| matches!(x, ReplicationTarget::S3(_))) {
+        // Set up remote chunk sources for any network backend (S3 *or*
+        // native GCS).  Gating on S3-only here would leave a pure-`gcs`
+        // target list with no remote chunk sources -- the manifest would
+        // load (that path handles Gcs) but every chunk fetch would miss.
+        if remote
+            .iter()
+            .any(|x| matches!(x, ReplicationTarget::S3(_) | ReplicationTarget::Gcs(_)))
+        {
             // Only verify the default chain if some target actually uses
             // it; targets that source creds via their own
             // `credentials_process` script don't need (and can't be
@@ -351,7 +358,9 @@ impl Loader {
             }
 
             for source in remote {
-                if let Some(bucket) = create_source(source, |s3| &s3.chunk_bucket)? {
+                if let Some(bucket) =
+                    create_source(source, crate::replication_target::BucketKind::Chunk)?
+                {
                     remote_sources.push(bucket);
                 }
             }
@@ -590,17 +599,17 @@ fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
     Some(upgraded)
 }
 
-#[instrument(level = "debug", skip(bucket_extractor), err)]
+#[instrument(level = "debug", err)]
 fn create_source(
     source: &ReplicationTarget,
-    bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
+    kind: crate::replication_target::BucketKind,
 ) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
 
     match source {
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
-            let bucket_name = bucket_extractor(s3);
+            let bucket_name = kind.s3_bucket(s3);
             // aws-sdk-s3 selects path/virtual-host addressing on the client
             // config; rust-s3 expressed it via set_subdomain_style/
             // set_path_style after construction.  domain_addressing == true
@@ -614,6 +623,21 @@ fn create_source(
                 s3.credentials_process.clone(),
             )
             .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
+            Ok(Some(bucket))
+        }
+        Gcs(gcs) => {
+            let bucket_name = kind.gcs_bucket(gcs);
+            // ADC by default; credentials_process overrides via an external
+            // OAuth-token-emitting command (see gcs_credentials_process).
+            // region is passed through only for the tracing label; the reader
+            // never creates buckets, so project_id/on-demand don't apply here.
+            let bucket = Bucket::new_gcs(
+                bucket_name,
+                gcs.region.clone(),
+                gcs.project_id.clone(),
+                gcs.credentials_process.clone(),
+            )
+            .map_err(|e| chain_error!(e, "failed to create chunks GCS bucket object", ?gcs))?;
             Ok(Some(bucket))
         }
         ReadOnly(_) | Local(_) => Ok(None),

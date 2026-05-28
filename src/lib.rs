@@ -3,6 +3,8 @@ mod aws_bucket;
 mod copier;
 mod credentials_process;
 mod executor;
+mod gcs_bucket;
+mod gcs_credentials_process;
 mod instance_id;
 mod loader;
 mod manifest_schema;
