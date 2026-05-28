@@ -1,4 +1,5 @@
 mod atomic_kv32;
+mod aws_bucket;
 mod copier;
 mod executor;
 mod instance_id;
@@ -462,8 +463,7 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
             )?))
         }
     } else if let Some(path) = path.strip_prefix("s3://") {
-        use s3::bucket::Bucket;
-        use s3::creds::Credentials;
+        use crate::aws_bucket::Bucket;
 
         let (bucket_region, blob) = match path.split_once('/') {
             Some(pair) => pair,
@@ -483,14 +483,21 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
             }
         };
 
-        let creds =
-            Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
+        // aws-sdk-s3 is lazy about credentials; verify up front so the
+        // s3:// URI fetch behaves like rust-s3's eager Credentials::default.
+        crate::aws_bucket::verify_default_credentials()
+            .map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
         let region = replication_target::parse_s3_region_specification(region, None);
-        let mut bucket = Bucket::new(bucket, region, creds)
-            .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
-        bucket.set_subdomain_style();
-        bucket.set_request_timeout(Some(DOWNLOAD_TIMEOUT));
+        // s3:// URIs default to subdomain (virtual-host) addressing -- this
+        // mirrors the rust-s3 path which called set_subdomain_style here.
+        let bucket = Bucket::new(
+            bucket,
+            region,
+            /*force_path_style=*/ false,
+            DOWNLOAD_TIMEOUT,
+        )
+        .map_err(|e| chain_error!(e, "failed to create S3 bucket", path))?;
 
         loader::load_from_source(&bucket, blob)
     } else if let Some(suffix) = path.strip_prefix("verneuil://") {

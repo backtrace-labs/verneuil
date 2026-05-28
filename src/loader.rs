@@ -8,11 +8,10 @@ use std::sync::Mutex;
 use std::sync::Weak;
 use std::time::Duration;
 
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
 use tracing::instrument;
 use umash::Fingerprint;
 
+use crate::aws_bucket::Bucket;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
@@ -83,15 +82,16 @@ impl Chunk {
     }
 }
 
-/// Workaround for the fact that rust-s3 doesn't redact credentials in debug
-/// impls.
+/// Workaround for the fact that rust-s3 didn't redact credentials in debug
+/// impls.  Kept after the aws-sdk-s3 swap (the new wrapper's Debug impl
+/// also intentionally omits the SDK client / its credentials).
 #[allow(clippy::ptr_arg)]
 fn redacted_bucket_fmt(buckets: &Vec<Bucket>, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
     #[derive(Debug)]
     #[allow(dead_code)] // Because we disregard Debug in dead code analysis.
     struct RedactedBucket<'a> {
         name: &'a str,
-        region: &'a awsregion::Region,
+        region: &'a aws_types::region::Region,
     }
 
     let redacted = buckets
@@ -304,11 +304,14 @@ pub(crate) fn fetch_manifest(
     }
 
     if !remote.is_empty() {
-        let creds =
-            Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
+        // aws-sdk-s3 is lazy about credentials -- do an eager pre-flight
+        // check so we still surface "no credentials available" up front,
+        // matching what `Credentials::default()` did with rust-s3.
+        crate::aws_bucket::verify_default_credentials()
+            .map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
         for source in remote {
-            let bucket = create_source(source, &creds, |s3| &s3.manifest_bucket)?;
+            let bucket = create_source(source, |s3| &s3.manifest_bucket)?;
             if let Some(bucket) = bucket {
                 if let Some(fetched) = load_from_source(&bucket, name)? {
                     return Ok(Some(fetched));
@@ -334,11 +337,11 @@ impl Loader {
 
         // We only care about remote S3 sources.
         if remote.iter().any(|x| matches!(x, ReplicationTarget::S3(_))) {
-            let creds =
-                Credentials::default().map_err(|e| chain_error!(e, "failed to get credentials"))?;
+            crate::aws_bucket::verify_default_credentials()
+                .map_err(|e| chain_error!(e, "failed to get credentials"))?;
 
             for source in remote {
-                if let Some(bucket) = create_source(source, &creds, |s3| &s3.chunk_bucket)? {
+                if let Some(bucket) = create_source(source, |s3| &s3.chunk_bucket)? {
                     remote_sources.push(bucket);
                 }
             }
@@ -577,10 +580,9 @@ fn fetch_from_cache(key: Fingerprint) -> Option<Arc<Chunk>> {
     Some(upgraded)
 }
 
-#[instrument(level = "debug", skip(creds, bucket_extractor), err)]
+#[instrument(level = "debug", skip(bucket_extractor), err)]
 fn create_source(
     source: &ReplicationTarget,
-    creds: &Credentials,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
 ) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
@@ -589,16 +591,15 @@ fn create_source(
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(s3);
-            let mut bucket = Bucket::new(bucket_name, region, creds.clone())
-                .map_err(|e| chain_error!(e, "failed to create chunks S3 bucket object", ?s3))?;
-
-            if s3.domain_addressing {
-                bucket.set_subdomain_style();
-            } else {
-                bucket.set_path_style();
-            }
-
-            bucket.set_request_timeout(Some(LOAD_REQUEST_TIMEOUT));
+            // aws-sdk-s3 selects path/virtual-host addressing on the client
+            // config; rust-s3 expressed it via set_subdomain_style/
+            // set_path_style after construction.  domain_addressing == true
+            // means subdomain-style (so force_path_style = false).
+            let force_path_style = !s3.domain_addressing;
+            let bucket = Bucket::new(bucket_name, region, force_path_style, LOAD_REQUEST_TIMEOUT)
+                .map_err(|e| {
+                chain_error!(e, "failed to create chunks S3 bucket object", ?s3)
+            })?;
             Ok(Some(bucket))
         }
         ReadOnly(_) | Local(_) => Ok(None),
@@ -695,9 +696,21 @@ mod tests {
             known_chunks: HashMap::new(),
         };
 
-        loader
-            .remote_sources
-            .push(Bucket::new_public("test-bucket", awsregion::Region::UsEast1).unwrap());
+        // The new aws-sdk-s3-backed `Bucket::new` only constructs the
+        // client config (doesn't fetch credentials), so it's safe to call
+        // here without any real credentials in scope.
+        loader.remote_sources.push(
+            Bucket::new(
+                "test-bucket",
+                crate::aws_bucket::ParsedRegion {
+                    region: aws_types::region::Region::new("us-east-1"),
+                    endpoint: None,
+                },
+                /*force_path_style=*/ false,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
 
         println!("Loader: {:?}", loader);
         let debug_output = format!("{:?}", loader);

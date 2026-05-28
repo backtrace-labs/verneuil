@@ -20,11 +20,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::aws_bucket::Bucket;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use kismet_cache::Cache;
-use s3::bucket::Bucket;
-use s3::creds::Credentials;
 use tracing::info_span;
 use tracing::instrument;
 use tracing::Level;
@@ -687,47 +686,29 @@ fn consume_directory<R: 'static + Future<Output = Result<()>>>(
 /// Creates `bucket` if it does not already exists.
 #[instrument(level = "debug", skip(bucket), err)]
 fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
-    let bucket_location = block_on_with_executor(|| bucket.location()).map_err(|e| {
+    let head = block_on_with_executor(|| bucket.head_bucket()).map_err(|e| {
         chain_debug!(
             e,
-            "failed to get buccket location",
+            "failed to head bucket",
             name=%bucket.name(),
             region=?bucket.region()
         )
     });
-    if matches!(bucket_location, Ok((_, 200))) {
+    if matches!(head, Ok((_, 200))) {
         return Ok(());
     }
 
-    let result = call_with_executor(|rt| {
-        if bucket.is_subdomain_style() {
-            rt.block_on(Bucket::create(
-                &bucket.name(),
-                bucket.region(),
-                bucket.credentials().clone(),
-                s3::bucket_ops::BucketConfiguration::private(),
-            ))
-        } else {
-            rt.block_on(Bucket::create_with_path_style(
-                &bucket.name(),
-                bucket.region(),
-                bucket.credentials().clone(),
-                s3::bucket_ops::BucketConfiguration::private(),
-            ))
-        }
-    });
-
-    match result {
-        Ok(response)
-            if (response.response_code >= 200 && response.response_code < 300) ||
-            // Conflicts on create is usually because the bucket already exists.
-            response.response_code == 409 =>
-        {
+    // aws-sdk-s3's CreateBucket inherits the path-style choice from the
+    // client's config, which we set at `Bucket::new` time -- no need to
+    // re-dispatch by addressing style as rust-s3 required.
+    match block_on_with_executor(|| bucket.create_bucket()) {
+        Ok((_, code)) if (200..300).contains(&code) || code == 409 => {
+            // 409 (Conflict) means the bucket already exists, which is fine.
             Ok(())
         }
-        Ok(response) => Err(fresh_warn!("failed to create bucket in S3",
-                                        response=?(response.response_code, response.response_text),
-                                        name=?bucket.name(), region=?bucket.region())),
+        Ok((body, code)) => Err(fresh_warn!("failed to create bucket in S3",
+                                            response=?(code, body),
+                                            name=?bucket.name(), region=?bucket.region())),
         Err(e) => Err(chain_warn!(e, "failed to create bucket in S3",
                                   name=?bucket.name(), region=?bucket.region())),
     }
@@ -736,11 +717,10 @@ fn ensure_bucket_exists(bucket: &Bucket) -> Result<()> {
 /// Attempts to configure a `Bucket` from a `ReplicationTarget`.  Once
 /// configured, the `Copier` will use the same bucket object to
 /// publish objects.
-#[instrument(level = "debug", skip(bucket_extractor, creds), err)]
+#[instrument(level = "debug", skip(bucket_extractor), err)]
 fn create_target(
     target: &ReplicationTarget,
     bucket_extractor: impl FnOnce(&S3ReplicationTarget) -> &str,
-    creds: Credentials,
 ) -> Result<Option<Bucket>> {
     use ReplicationTarget::*;
 
@@ -748,20 +728,18 @@ fn create_target(
         S3(s3) => {
             let region = parse_s3_region_specification(&s3.region, s3.endpoint.as_deref());
             let bucket_name = bucket_extractor(s3);
-            let mut bucket = Bucket::new(bucket_name, region, creds)
+            // rust-s3's set_subdomain_style/set_path_style was per-Bucket
+            // mutation; aws-sdk-s3 selects addressing on the client's
+            // config, so we hand the choice to Bucket::new directly.
+            // domain_addressing == true means subdomain-style (force=false).
+            let force_path_style = !s3.domain_addressing;
+            let bucket = Bucket::new(bucket_name, region, force_path_style, COPY_REQUEST_TIMEOUT)
                 .map_err(|e| chain_error!(e, "failed to create S3 bucket object", ?s3))?;
-
-            if s3.domain_addressing {
-                bucket.set_subdomain_style();
-            } else {
-                bucket.set_path_style();
-            }
 
             if s3.create_buckets_on_demand {
                 ensure_bucket_exists(&bucket)?;
             }
 
-            bucket.set_request_timeout(Some(COPY_REQUEST_TIMEOUT));
             Ok(Some(bucket))
         }
         ReadOnly(_) | Local(_) => Ok(None),
@@ -922,35 +900,23 @@ async fn copy_file(
 /// remote blob store and something is actively wrong with `blob_name`
 /// (e.g., it doesn't exist).
 #[instrument(level = "debug", skip(targets), err)]
-fn touch_blob(blob_name: &str, targets: &mut [Bucket]) -> Result<()> {
+fn touch_blob(blob_name: &str, targets: &[Bucket]) -> Result<()> {
     use rand::Rng;
-
-    const COPY_SOURCE: &str = "x-amz-copy-source";
-    const METADATA_DIRECTIVE: &str = "x-amz-metadata-directive";
-    const METADATA_DIRECTIVE_VALUE: &str = "REPLACE";
 
     let mut rng = rand::thread_rng();
 
     for target in targets {
-        let location_name = format!("{}/{}", target.name, blob_name);
-        // The value must be URL encoded (yes, that is double encoding
-        // given that blob names are themselves percent encoded).
-        let url_encoded_name = percent_encoding::utf8_percent_encode(
-            &location_name,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
-
-        target.add_header(COPY_SOURCE, &url_encoded_name.to_string());
-        // We're about to copy an object to itself.  S3 only allows this
-        // if we replace all metadata.
-        target.add_header(METADATA_DIRECTIVE, METADATA_DIRECTIVE_VALUE);
-
         for i in 0..=COPY_RETRY_LIMIT {
+            // aws-sdk-s3 has a dedicated CopyObject builder, so the
+            // rust-s3 add_header(x-amz-copy-source) + add_header(x-amz-
+            // metadata-directive) + empty-body PUT dance collapses into
+            // one call.  Same intent: copy the object onto itself with
+            // metadata replace to nudge LastModified.
             match call_with_slow_logging(
                 Duration::from_secs(10),
                 || {
                     block_on_with_executor(|| {
-                        target.put_object_with_content_type(&blob_name, &[], CHUNK_CONTENT_TYPE)
+                        target.copy_object_to_self(&blob_name, CHUNK_CONTENT_TYPE)
                     })
                 },
                 |duration| tracing::info!(?duration, ?blob_name, "slow S3 COPY"),
@@ -1288,13 +1254,12 @@ impl CopierWorker {
     /// "ready" snapshot over it.
     ///
     /// Returns whether we successfully updated the remote snapshot.
-    #[instrument(skip(self, creds), err)]
+    #[instrument(skip(self), err)]
     fn handle_ready_directory(
         &self,
         last_manifest_copy: &RacySystemTime,
         cache: &Cache,
         targets: &ReplicationTargetList,
-        creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
         let consuming = match replication_buffer::snapshot_ready_directory(parent.clone())? {
@@ -1307,7 +1272,7 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
                 .flatten() // remove None
                 .collect::<Vec<_>>();
 
@@ -1359,7 +1324,7 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
+                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket))
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1422,7 +1387,7 @@ impl CopierWorker {
     /// This function can only make progress if the caller first
     /// calls `handle_ready_directory`.
     #[allow(clippy::too_many_arguments)] // It's only called in one place.
-    #[instrument(skip(self, creds), err)]
+    #[instrument(skip(self), err)]
     fn handle_staging_directory(
         &self,
         last_manifest_copy: &RacySystemTime,
@@ -1430,7 +1395,6 @@ impl CopierWorker {
         stale: bool,
         cache: &Cache,
         targets: &ReplicationTargetList,
-        creds: Credentials,
         parent: PathBuf,
     ) -> Result<bool> {
         use rand::Rng;
@@ -1476,7 +1440,7 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+                .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
                 .flatten() // Drop `None`.
                 .collect::<Vec<_>>();
 
@@ -1581,7 +1545,7 @@ impl CopierWorker {
                 .replication_targets
                 .iter()
                 // TODO: how do we want to handle failures here?
-                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket, creds.clone()))
+                .flat_map(|target| create_target(target, |s3| &s3.manifest_bucket))
                 .flatten() // Drop `None`
                 .collect::<Vec<_>>();
 
@@ -1670,7 +1634,11 @@ impl CopierWorker {
     ) -> Result<bool> {
         let mut did_something = false;
 
-        let creds = Credentials::default().map_err(|e| {
+        // aws-sdk-s3 resolves credentials lazily on first request; we want
+        // the eager pre-flight check that rust-s3 gave us so the sleep
+        // below kicks in before we start building Buckets / firing PUTs.
+        // See aws_bucket::verify_default_credentials for the rationale.
+        crate::aws_bucket::verify_default_credentials().map_err(|e| {
             use rand::Rng;
 
             let backoff = FAILED_CREDENTIALS_SLEEP.mul_f64(rand::thread_rng().gen_range(1.0..2.0));
@@ -1736,7 +1704,6 @@ impl CopierWorker {
                     last_manifest_copy,
                     &cache,
                     &targets,
-                    creds.clone(),
                     spool.to_path_buf(),
                 )
                 .map_err(|e| chain_warn!(e, "failed to handle ready directory", ?spool))
@@ -1756,7 +1723,6 @@ impl CopierWorker {
                     stale,
                     &cache,
                     &targets,
-                    creds.clone(),
                     spool.to_path_buf(),
                 )
             },
@@ -1785,7 +1751,6 @@ impl CopierWorker {
                     last_manifest_copy,
                     &cache,
                     &targets,
-                    creds,
                     spool.to_path_buf(),
                 )
             },
@@ -1897,19 +1862,16 @@ impl CopierWorker {
         }
 
         // Similarly, a failure here shouldn't trigger a full snapshot.
-        let creds = match Credentials::default() {
-            Ok(creds) => creds,
-            Err(e) => {
-                let _ = chain_error!(e, "failed to get S3 credentials");
-                return Ok(());
-            }
-        };
+        if let Err(e) = crate::aws_bucket::verify_default_credentials() {
+            let _ = chain_error!(e, "failed to get S3 credentials");
+            return Ok(());
+        }
 
         let mut chunks_buckets = targets
             .replication_targets
             .iter()
             // TODO: how do we want to handle failures here?
-            .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket, creds.clone()))
+            .flat_map(|target| create_target(target, |s3| &s3.chunk_bucket))
             .flatten() // Drop `None`
             .collect::<Vec<_>>();
 

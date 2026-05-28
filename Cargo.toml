@@ -53,8 +53,23 @@ test_validate_all = ["test_validate_writes", "test_validate_reads"]
 
 [dependencies]
 attohttpc = { version = "0.18", default-features = false }
-aws-region = { version = "0.23" }  # we just want the same as rust-s3
+# AWS SDK v1.x -- Amazon's official Rust SDK, swapping verneuil off rust-s3.
+# Gains: dedicated CopyObject (no more add_header self-copy idiom),
+# credential-process auth, per-request builders, force_path_style as a
+# first-class config method.  We use the latest 1.x family; bt_s3_client is
+# still on 0.21 today, so two major versions of aws-sdk-s3 coexist in the
+# tree once verneuil is [patch]-linked into backtrace-backend.  That's a
+# build-time hit, not a correctness issue (separate semver-major crates).
+# Tracked: bring bt_s3_client up to 1.x as follow-up work.
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+aws-smithy-async = "1"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 backtrace = "0.3"
+bytes = "1"
 # We use blake2b to compare the actual db file and our replicated snapshot,
 # but only during tests.
 blake2b_simd = { version = "1", optional = true }
@@ -77,11 +92,10 @@ quinine = "0.2"
 rand = "0.8"
 rayon = "1.5"
 regex = "1"
-rust-s3 = { version = "0.28", default-features = false, features = ["tokio-rustls-tls", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "time"], default-features = false }
+tokio = { version = "1", features = ["rt", "time", "io-util"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["tracing-log"] }  # Also collect log! calls.
 uluru = "3"
