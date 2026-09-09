@@ -39,6 +39,17 @@ pub use snapshot::SnapshotLoadingPolicy;
 /// Read the verneuil configuration from this variable by default.
 pub const VERNEUIL_CONFIG_ENV_VAR: &str = "VERNEUIL_CONFIG";
 
+/// Eagerly resolve credentials from the default AWS provider chain
+/// (environment / profile / IMDS) — the same pre-flight the copier and loader
+/// run before S3 replication. Exposed so `verneuilctl check-credentials` can
+/// exercise exactly this path standalone (outside coronerd) when diagnosing
+/// IMDS / credential timeouts. Run with e.g. `--log aws_config=debug` to see
+/// the underlying SDK credential-chain detail.
+pub fn verify_credentials() -> Result<()> {
+    crate::aws_bucket::verify_default_credentials()
+        .map_err(|e| chain_error!(e, "credential verification failed"))
+}
+
 /// Initialization options for the Verneuil VFS.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]

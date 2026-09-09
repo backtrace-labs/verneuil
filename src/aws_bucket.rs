@@ -11,10 +11,14 @@
 //! become `Ok((body, status))` so the existing match arms work;
 //! transport-level errors (no response) propagate as `Err`.
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::imds;
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_credential_types::Credentials;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::primitives::ByteStream;
@@ -106,22 +110,65 @@ pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// using their own `credentials_process` or the GCS native backend don't
 /// rely on the default chain and bypass this verification (see
 /// `crate::replication_target::any_target_uses_default_credentials_chain`).
+/// IMDS connect/read timeout for credential resolution.
+///
+/// The SDK default is **1 second**, which is too tight when the host *process*
+/// is under load: IMDS itself answers in a few milliseconds (verified with a
+/// standalone probe), but a saturated coronerd can fail to poll the connect
+/// future within 1 s, so the fetch times out even though the metadata service
+/// is healthy. Five seconds is still trivially short next to the real ~5 ms
+/// round-trip, but survives scheduling jitter under load.
+const IMDS_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The standard default credential chain (env / profile / IMDS / …) but with an
+/// IMDS client that uses [`IMDS_CREDENTIAL_TIMEOUT`] instead of the SDK's 1 s
+/// default. Shared by the pre-flight check and by `Bucket::new`'s S3 client.
+async fn default_chain_with_imds_timeout() -> DefaultCredentialsChain {
+    let imds_client = imds::Client::builder()
+        .connect_timeout(IMDS_CREDENTIAL_TIMEOUT)
+        .read_timeout(IMDS_CREDENTIAL_TIMEOUT)
+        .build();
+    DefaultCredentialsChain::builder()
+        .imds_client(imds_client)
+        .build()
+        .await
+}
+
+/// Process-wide cache of the last successfully-resolved default-chain
+/// credentials. The pre-flight check runs on *every* replication cycle and
+/// manifest load; without this it rebuilt the chain and hit IMDS each time, and
+/// under load those repeated fetches are exactly what time out. Serving a
+/// still-valid cached value keeps IMDS traffic to roughly one refresh per
+/// credential lifetime (instance-role creds last hours).
+static CACHED_CREDENTIALS: Mutex<Option<Credentials>> = Mutex::new(None);
+
+/// Re-resolve this far ahead of expiry so a cached value is never handed out
+/// right as it lapses.
+const CREDENTIAL_REFRESH_SLACK: Duration = Duration::from_secs(300);
+
 pub(crate) fn verify_default_credentials() -> Result<(), BoxError> {
     use aws_credential_types::provider::ProvideCredentials;
+
+    // Fast path: a cached credential that isn't about to expire. Credentials
+    // with no expiry (e.g. static env creds) never need re-resolution.
+    if let Some(creds) = CACHED_CREDENTIALS.lock().unwrap().as_ref() {
+        let still_valid = creds
+            .expiry()
+            .is_none_or(|exp| exp > SystemTime::now() + CREDENTIAL_REFRESH_SLACK);
+        if still_valid {
+            return Ok(());
+        }
+    }
+
+    // Slow path: resolve via the default chain (with a generous IMDS timeout)
+    // and cache the result for subsequent pre-flights.
     crate::executor::block_on_with_executor(|| async {
-        let sdk_cfg = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        let provider = sdk_cfg.credentials_provider().ok_or_else(|| {
-            Box::new(VerneuilSdkError(
-                "no credentials provider in default chain".to_string(),
-            )) as BoxError
+        let chain = default_chain_with_imds_timeout().await;
+        let creds = chain.provide_credentials().await.map_err(|e| -> BoxError {
+            Box::new(VerneuilSdkError(format!("credentials discovery: {e}")))
         })?;
-        provider
-            .provide_credentials()
-            .await
-            .map(|_| ())
-            .map_err(|e| -> BoxError {
-                Box::new(VerneuilSdkError(format!("credentials discovery: {e}")))
-            })
+        *CACHED_CREDENTIALS.lock().unwrap() = Some(creds);
+        Ok(())
     })
 }
 
@@ -180,6 +227,13 @@ impl Bucket {
             if let Some(command) = credentials_process {
                 let provider = crate::credentials_process::CredentialsProcessProvider::new(command);
                 loader = loader.credentials_provider(SharedCredentialsProvider::new(provider));
+            } else {
+                // Otherwise use the same default chain, but with a longer IMDS
+                // connect timeout than the SDK's 1 s default (too tight under
+                // load — see `verify_default_credentials`). The client's own
+                // credentials cache still refreshes lazily near expiry.
+                let chain = default_chain_with_imds_timeout().await;
+                loader = loader.credentials_provider(SharedCredentialsProvider::new(chain));
             }
 
             let sdk_cfg = loader.load().await;

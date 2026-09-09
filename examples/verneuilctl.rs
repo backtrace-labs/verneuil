@@ -50,6 +50,54 @@ enum Command {
     Flush(Flush),
     Sync(Sync),
     Shell(Shell),
+    CheckCredentials(CheckCredentials),
+}
+
+/// Repeatedly run the S3 default-credential-chain pre-flight
+/// (`verneuil::verify_credentials`) — the exact check the copier/loader do
+/// before replicating — timing each attempt. Reproduces and vets
+/// IMDS/credential timeouts on a host without going through coronerd. Needs no
+/// `--config`. Pass `--log aws_config=debug` to see the SDK's credential detail.
+#[derive(Debug, Parser)]
+struct CheckCredentials {
+    /// How many times to probe the credential chain.
+    #[clap(short, long, default_value_t = 20)]
+    iterations: u32,
+
+    /// Milliseconds to sleep between probes.
+    #[clap(long, default_value_t = 200)]
+    interval_ms: u64,
+}
+
+fn check_credentials(cmd: CheckCredentials) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let (mut ok, mut fail) = (0u32, 0u32);
+    for i in 0..cmd.iterations {
+        let t0 = Instant::now();
+        match verneuil::verify_credentials() {
+            Ok(()) => {
+                ok += 1;
+                eprintln!("[{i:3}] OK   {:>8.1?}", t0.elapsed());
+            }
+            Err(e) => {
+                fail += 1;
+                eprintln!("[{i:3}] FAIL {:>8.1?}  {}", t0.elapsed(), e);
+            }
+        }
+        if i + 1 < cmd.iterations {
+            std::thread::sleep(Duration::from_millis(cmd.interval_ms));
+        }
+    }
+    eprintln!(
+        "check-credentials: {ok} ok / {fail} failed of {}",
+        cmd.iterations
+    );
+    if fail > 0 {
+        Err(fresh_error!("credential probe had failures"))
+    } else {
+        Ok(())
+    }
 }
 
 // Writes the contents of `reader` to `out`, or stdout if `None`.
@@ -523,5 +571,6 @@ pub fn main() -> Result<()> {
         Command::Flush(cmd) => flush(cmd),
         Command::Sync(cmd) => sync(cmd, replication_config(ApplyConfig::All)?),
         Command::Shell(cmd) => shell(cmd, replication_config(ApplyConfig::No)?),
+        Command::CheckCredentials(cmd) => check_credentials(cmd),
     }
 }
