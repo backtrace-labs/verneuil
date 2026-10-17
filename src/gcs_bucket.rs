@@ -12,6 +12,9 @@
 //! (the wrapper passes its own `name` field) so this struct itself isn't
 //! bucket-bound; that mirrors how the AWS-SDK client is also bucket-agnostic.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use bytes::Bytes;
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model::{Bucket as GcsBucketResource, Object};
@@ -40,14 +43,89 @@ pub(crate) struct GcsInner {
     location: Option<String>,
 }
 
+/// The data-plane and control-plane clients, which are `Arc`-backed and so
+/// cheap to clone out of the cache.
+#[derive(Clone)]
+struct Clients {
+    storage: Storage,
+    control: StorageControl,
+}
+
+/// Process-wide cache of constructed GCS clients, keyed by the only input
+/// that affects how they authenticate.
+///
+/// Each client owns its credential cache: ADC resolution and any
+/// `credentials_process` output are memoised *on the provider*, and the
+/// provider is built with the client. Constructing a fresh pair per request
+/// therefore re-resolves credentials on every manifest and chunk fetch --
+/// exactly the repeated-fetch pattern that
+/// [`crate::aws_bucket::verify_default_credentials`] avoids on the S3 side
+/// with its `CACHED_CREDENTIALS`. This is the native-GCS counterpart.
+///
+/// No invalidation: refreshing an expiring token is the provider's job, and
+/// it can only do it if we keep handing back the same provider.
+static CACHED_CLIENTS: Mutex<Option<HashMap<Option<String>, Clients>>> = Mutex::new(None);
+
+/// Clients for `credentials_process`, building them only on a cache miss.
+fn cached_clients(credentials_process: Option<String>) -> Result<Clients, BoxError> {
+    // Never hold the lock across construction: building blocks on the
+    // executor, and a sibling fetch must not be stuck behind it.
+    if let Some(hit) = CACHED_CLIENTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&credentials_process).cloned())
+    {
+        return Ok(hit);
+    }
+
+    let built = build_clients(credentials_process.clone())?;
+
+    // Another thread may have raced us here; either pair is equally good, so
+    // keep whichever landed first and let ours drop.
+    let mut guard = CACHED_CLIENTS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    Ok(map.entry(credentials_process).or_insert(built).clone())
+}
+
+fn build_clients(credentials_process: Option<String>) -> Result<Clients, BoxError> {
+    crate::executor::block_on_with_executor(|| async move {
+        // A provider per client: each of Storage / StorageControl keeps its
+        // own token cache, and they are not interchangeable.
+        let storage_builder = Storage::builder();
+        let control_builder = StorageControl::builder();
+
+        let (storage_builder, control_builder) = match credentials_process {
+            Some(cmd) => (
+                storage_builder.with_credentials(GcsCredentialsProcessProvider::new(cmd.clone())),
+                control_builder.with_credentials(GcsCredentialsProcessProvider::new(cmd)),
+            ),
+            None => (storage_builder, control_builder),
+        };
+
+        let storage = storage_builder.build().await.map_err(|e| -> BoxError {
+            Box::new(GcsError(format!("Storage::builder().build(): {e}")))
+        })?;
+        let control = control_builder.build().await.map_err(|e| -> BoxError {
+            Box::new(GcsError(format!("StorageControl::builder().build(): {e}")))
+        })?;
+        Ok(Clients { storage, control })
+    })
+}
+
 impl GcsInner {
-    /// Construct both clients (data plane and control plane).
+    /// Construct the backend for a GCS target.
     ///
-    /// When `credentials_process` is `None`, both clients use Application
+    /// When `credentials_process` is `None`, the clients use Application
     /// Default Credentials -- the keyless-GCS analogue of [`Bucket::new`]'s
     /// `aws_config::defaults(...).load()` path.  When `Some(cmd)`, the
     /// external command sources OAuth tokens for both clients per
     /// [`GcsCredentialsProcessProvider`].
+    ///
+    /// The clients themselves come from a process-wide cache (see
+    /// [`CACHED_CLIENTS`]), so repeated construction does not re-resolve
+    /// credentials; `project_id` and `location` are per-target and only
+    /// consulted by [`Self::create_bucket`].
     ///
     /// Sync (block-on internally) to match the S3 variant's construction
     /// shape -- both backends present a sync `new` so verneuil's existing
@@ -57,36 +135,12 @@ impl GcsInner {
         location: Option<String>,
         credentials_process: Option<String>,
     ) -> Result<Self, BoxError> {
-        crate::executor::block_on_with_executor(|| async move {
-            // Build a fresh provider per client so each Storage /
-            // StorageControl has its own internal token cache (the
-            // command-output cache lives on the provider).  Cheap to
-            // duplicate -- they don't talk to the network at construction
-            // time, only on first auth header request.
-            let storage_builder = Storage::builder();
-            let control_builder = StorageControl::builder();
-
-            let (storage_builder, control_builder) = match credentials_process {
-                Some(cmd) => (
-                    storage_builder
-                        .with_credentials(GcsCredentialsProcessProvider::new(cmd.clone())),
-                    control_builder.with_credentials(GcsCredentialsProcessProvider::new(cmd)),
-                ),
-                None => (storage_builder, control_builder),
-            };
-
-            let storage = storage_builder.build().await.map_err(|e| -> BoxError {
-                Box::new(GcsError(format!("Storage::builder().build(): {e}")))
-            })?;
-            let control = control_builder.build().await.map_err(|e| -> BoxError {
-                Box::new(GcsError(format!("StorageControl::builder().build(): {e}")))
-            })?;
-            Ok(GcsInner {
-                storage,
-                control,
-                project_id,
-                location,
-            })
+        let Clients { storage, control } = cached_clients(credentials_process)?;
+        Ok(GcsInner {
+            storage,
+            control,
+            project_id,
+            location,
         })
     }
 
