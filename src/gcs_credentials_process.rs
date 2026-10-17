@@ -182,18 +182,35 @@ impl CredentialsProvider for GcsCredentialsProcessProvider {
             }
         }
 
-        // Slow path: invoke the command without holding the cache lock so
-        // we don't block other readers if they happen to want the cached
-        // value while we're refreshing.  There's a small thundering-herd
-        // window where multiple concurrent calls all see "expired" and
-        // re-invoke; the script is cheap enough that we don't bother
-        // serialising further.
-        let fresh = self.fetch_fresh().await?;
+        // Slow path: hold the lock across the refresh so exactly one caller
+        // runs the command and the rest wait on it.
+        //
+        // This deliberately serialises refreshes. Releasing the lock first
+        // would let a concurrent caller keep using the still-valid token
+        // during the REFRESH_BUFFER window, but it also lets every caller
+        // that sees "expired" spawn its own process: the herd is bounded by
+        // caller concurrency, not by anything about the token. A consumer
+        // fetching one manifest per host across a fleet showed one
+        // invocation per worker thread on a cold cache. Trading a single
+        // sub-second stall once per token lifetime for that is clearly
+        // right.
+        let mut guard = self.cached.lock().await;
 
-        {
-            let mut guard = self.cached.lock().await;
-            *guard = Some(fresh.clone());
+        // Re-check: another caller may have refreshed while we waited.
+        if let Some(cached) = guard.as_ref() {
+            if cached.expires_at > SystemTime::now() + REFRESH_BUFFER {
+                let mut headers = HeaderMap::new();
+                headers.insert(http::header::AUTHORIZATION, cached.bearer.clone());
+                return Ok(CacheableResource::New {
+                    entity_tag: EntityTag::default(),
+                    data: headers,
+                });
+            }
         }
+
+        let fresh = self.fetch_fresh().await?;
+        *guard = Some(fresh.clone());
+        drop(guard);
 
         let mut headers = HeaderMap::new();
         headers.insert(http::header::AUTHORIZATION, fresh.bearer);
