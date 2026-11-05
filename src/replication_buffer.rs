@@ -1234,7 +1234,22 @@ impl ReplicationBuffer {
     }
 
     /// Attempts to overwrite the manifest file for the replicated file.
-    #[instrument(err)]
+    ///
+    /// `manifest` is skipped, and must stay skipped: `#[instrument]` records
+    /// each argument with its `Debug` impl, eagerly, whenever the span is
+    /// enabled.  `ManifestV1` holds one entry per replicated chunk in
+    /// `chunks`/`bundled_chunks`, so recording it walks the whole list on
+    /// every publish.  On a large database that dominates this function --
+    /// measured at 22.9s of 31.5s on a netflix restart, about a quarter of
+    /// all CPU in the window -- and it happens inside the SQLite commit, so
+    /// everything waiting on that database's write lock waits for it too.
+    /// `chunks` is skipped on prepare_ready_buffer and gc_chunks for the same
+    /// reason.  The count is cheap and is kept as a field.
+    #[instrument(
+        skip(manifest),
+        fields(chunks = manifest.v1.as_ref().map(|v| v.chunks.len())),
+        err
+    )]
     pub fn publish_manifest(&self, db_path: &Path, manifest: &Manifest) -> Result<()> {
         use prost::Message;
         use std::io::Write;
