@@ -11,6 +11,7 @@
 //! become `Ok((body, status))` so the existing match arms work;
 //! transport-level errors (no response) propagate as `Err`.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -140,6 +141,37 @@ async fn default_chain_with_imds_timeout() -> DefaultCredentialsChain {
 /// under load those repeated fetches are exactly what time out. Serving a
 /// still-valid cached value keeps IMDS traffic to roughly one refresh per
 /// credential lifetime (instance-role creds last hours).
+/// Everything about a [`Bucket`] that the SDK client itself depends on.
+///
+/// Deliberately not the bucket *name*: the name lives on the `Bucket`
+/// wrapper and is supplied per operation, so every bucket in a region shares
+/// one client.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct S3ClientKey {
+    region: String,
+    endpoint: Option<String>,
+    force_path_style: bool,
+    request_timeout: Duration,
+    credentials_process: Option<String>,
+}
+
+/// Built S3 clients, keyed by the configuration that produced them.
+///
+/// `Bucket::new` is called on paths that look one-shot but are not: every
+/// manifest decode builds a `Loader`, which creates a source per replication
+/// target, and each of those built a fresh client -- resolving the provider
+/// chain and standing up a connection pool each time.  On a large database
+/// that showed up as 2.6s per manifest read, inside the SQLite commit, with
+/// the database's write lock held.
+///
+/// This is the S3 counterpart to `gcs_bucket::CACHED_CLIENTS`; the native-GCS
+/// side already caches for the same reason.  `CACHED_CREDENTIALS` below only
+/// covers the credential *fetch*, not the client around it.
+///
+/// No invalidation: the SDK client owns a credentials cache and refreshes
+/// near expiry, which it can only do if we keep handing back the same client.
+static CACHED_S3_CLIENTS: Mutex<Option<HashMap<S3ClientKey, SdkClient>>> = Mutex::new(None);
+
 static CACHED_CREDENTIALS: Mutex<Option<Credentials>> = Mutex::new(None);
 
 /// Re-resolve this far ahead of expiry so a cached value is never handed out
@@ -204,6 +236,29 @@ impl Bucket {
         request_timeout: Duration,
         credentials_process: Option<String>,
     ) -> Result<Self, BoxError> {
+        let key = S3ClientKey {
+            region: parsed.region.to_string(),
+            endpoint: parsed.endpoint.clone(),
+            force_path_style,
+            request_timeout,
+            credentials_process: credentials_process.clone(),
+        };
+
+        // Never hold the lock across construction: building blocks on the
+        // executor, and a sibling fetch must not queue behind it.
+        if let Some(hit) = CACHED_S3_CLIENTS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&key).cloned())
+        {
+            return Ok(Bucket {
+                inner: BackendInner::S3(hit),
+                name: name.to_string(),
+                region: Some(parsed.region),
+            });
+        }
+
         crate::executor::block_on_with_executor(|| async move {
             // Per-attempt timeout matches what rust-s3's per-request timeout
             // bounded; disabled retries because verneuil's copier/loader
@@ -247,8 +302,18 @@ impl Bucket {
                 s3_cfg_b = s3_cfg_b.endpoint_url(endpoint);
             }
 
+            let client = SdkClient::from_conf(s3_cfg_b.build());
+
+            // Another thread may have raced us here; either client is equally
+            // good, so keep whichever landed first and let ours drop.
+            let client = {
+                let mut guard = CACHED_S3_CLIENTS.lock().unwrap();
+                let map = guard.get_or_insert_with(HashMap::new);
+                map.entry(key).or_insert(client).clone()
+            };
+
             Ok(Bucket {
-                inner: BackendInner::S3(SdkClient::from_conf(s3_cfg_b.build())),
+                inner: BackendInner::S3(client),
                 name: name.to_string(),
                 region: Some(parsed.region),
             })
