@@ -155,6 +155,7 @@ use tracing::instrument;
 use tracing::Level;
 use umash::Fingerprint;
 
+use crate::chain_debug;
 use crate::chain_error;
 use crate::chain_info;
 use crate::chain_warn;
@@ -170,6 +171,80 @@ use crate::process_id::process_id;
 use crate::replication_target::ReplicationTarget;
 use crate::replication_target::ReplicationTargetList;
 use crate::result::Result;
+
+/// An opaque identifier for a file's contents inode.
+///
+/// Two files with the same identifier are the same file, *provided*
+/// the caller holds one of them open: on a local filesystem an open
+/// descriptor pins the inode, so nothing else can be allocated the
+/// same `(dev, ino)` behind the caller's back.  Without such a handle
+/// this is only a heuristic, because inode numbers are reused.
+///
+/// `btime` is the first field to go: `Metadata::created()` fails on
+/// any filesystem that does not report `STATX_BTIME`, and then the
+/// identity is just `(len, dev, ino)` -- which is why the pin matters
+/// in practice rather than only in theory.  (A network filesystem
+/// would break the pin outright, since the server may reuse a fileid
+/// another client unlinked, but a spooling directory is machine-local
+/// by construction: it is keyed on the boot id and on the
+/// `$DEV.$INODE` of the local database file.)
+#[derive(Debug, Eq, PartialEq, Hash)]
+pub(crate) struct FileIdentifier {
+    btime: Option<std::time::SystemTime>,
+    len: u64,
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl FileIdentifier {
+    /// Returns a tuple that identifies a given file; if a given path has
+    /// the same identifier, it is the same (unless someone is maliciously
+    /// tampering with it).
+    ///
+    /// Deliberately not `#[instrument]`ed: this is now called inside
+    /// the sqlite commit on every publish, and recording a `&File`
+    /// argument makes `Debug` readlink /proc/self/fd.
+    pub(crate) fn new(file: &File) -> Result<Self> {
+        let meta = file
+            .metadata()
+            .map_err(|e| chain_error!(e, "failed to stat file"))?;
+        Ok(FileIdentifier::from_metadata(&meta))
+    }
+
+    /// Returns the identifier for the file described by `meta`.
+    pub(crate) fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        FileIdentifier {
+            btime: meta
+                .created()
+                .map_err(|e| chain_debug!(e, "failed to compute file creation time", ?meta))
+                .ok(),
+            len: meta.len(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+
+    /// Returns whether `self == other`, except for `ctime`/`ctime_nsec`.
+    ///
+    /// Manifest files in "staging/meta" are hardlinked into "ready"
+    /// (`prepare_ready_buffer`), and that hardlink is removed again
+    /// later -- by the copier once it has uploaded the data, or by a
+    /// `Tracker` dropping the temporary directory when the ready
+    /// buffer was never published, or by `cleanup_scratch_directory`
+    /// sweeping what a crashed process left behind.  All of those bump
+    /// the inode's ctime without touching its contents, so a
+    /// comparison that took ctime into account would reject files that
+    /// are still, byte for byte, the ones we published.
+    pub(crate) fn equal_except_ctime(&self, other: &FileIdentifier) -> bool {
+        (self.btime, self.len, self.dev, self.ino) == (other.btime, other.len, other.dev, other.ino)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ReplicationBuffer {
@@ -389,7 +464,12 @@ pub(crate) fn construct_tapped_manifest_path(
     tapped_manifest_path_in_spool_prefix(Some(base.to_path_buf()), source_db)
 }
 
-/// Relinks `file` on top of `name` in the `.tap` directory for `spool_dir`.
+/// Copies `file`'s contents over `name` in the `.tap` directory for
+/// `spool_dir`.
+///
+/// This writes a fresh file and renames it into place; it does *not*
+/// hardlink `file`, so the staged manifest's link count and ctime are
+/// left alone.
 #[instrument(level = "debug", err)]
 pub(crate) fn tap_manifest_file(
     spool_dir: &Path,
@@ -1664,6 +1744,102 @@ impl ReplicationBuffer {
 
         Ok(())
     }
+}
+
+/// `FileIdentifier`'s *constructor* has to read each field off the
+/// `Metadata`, not just its comparison.  Testing the comparison with
+/// hand-built literals leaves `from_metadata` free to hardcode `ino`
+/// to 0, at which point the identity the staged-manifest cache rests
+/// on quietly becomes `(btime, len, dev)` and every test still passes.
+#[test]
+fn file_identifier_reads_every_field() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().expect("must create temp dir");
+    let path = dir.path().join("file");
+    std::fs::write(&path, b"some bytes").expect("must write");
+
+    let meta = std::fs::metadata(&path).expect("must stat");
+    let id = FileIdentifier::from_metadata(&meta);
+
+    assert_eq!(id.len, meta.len());
+    assert_eq!(id.dev, meta.dev());
+    assert_eq!(id.ino, meta.ino());
+    assert_eq!(id.ctime, meta.ctime());
+    assert_eq!(id.ctime_nsec, meta.ctime_nsec());
+    assert_eq!(id.btime, meta.created().ok());
+
+    // And two distinct files in the same directory must differ in the
+    // field the design actually leans on.
+    let other = dir.path().join("other");
+    std::fs::write(&other, b"some bytes").expect("must write");
+    let other = FileIdentifier::from_metadata(&std::fs::metadata(&other).expect("must stat"));
+
+    assert_eq!(
+        id.len, other.len,
+        "same contents, so len cannot discriminate"
+    );
+    assert_eq!(id.dev, other.dev, "same filesystem");
+    assert_ne!(
+        id.ino, other.ino,
+        "distinct files must have distinct inodes"
+    );
+}
+
+/// Every `FileIdentifier` field has to matter.  A test that varies two
+/// at once cannot tell: two files written back to back differ in
+/// `btime` *and* `ino`, so a comparison that had quietly stopped
+/// looking at `ino` would still pass it.  The staged-manifest cache's
+/// soundness is stated in terms of `(dev, ino)`, so pin them one at a
+/// time.
+#[test]
+fn file_identifier_fields_are_all_load_bearing() {
+    let base = || FileIdentifier {
+        btime: Some(std::time::SystemTime::UNIX_EPOCH),
+        len: 10,
+        dev: 1,
+        ino: 2,
+        ctime: 3,
+        ctime_nsec: 4,
+    };
+
+    // ctime is the one field that must *not* count: a hardlink into
+    // "ready", and its later removal, move it without moving a byte.
+    assert!(base().equal_except_ctime(&base()));
+    assert!(base().equal_except_ctime(&FileIdentifier {
+        ctime: 99,
+        ctime_nsec: 98,
+        ..base()
+    }));
+
+    // Everything else must.
+    assert!(!base().equal_except_ctime(&FileIdentifier {
+        btime: None,
+        ..base()
+    }));
+    assert!(!base().equal_except_ctime(&FileIdentifier { len: 11, ..base() }));
+    assert!(!base().equal_except_ctime(&FileIdentifier { dev: 9, ..base() }));
+    assert!(!base().equal_except_ctime(&FileIdentifier { ino: 9, ..base() }));
+
+    // The derived `PartialEq` is consulted by the copier's "is this a
+    // new manifest file" check (the `initial_meta` comparison in
+    // `handle_staging_directory`), which compares whole values --
+    // ctime included -- so it has to see those fields too.  (Its LRU
+    // uses `equal_except_ctime`, not this.)
+    assert_ne!(
+        base(),
+        FileIdentifier {
+            ctime: 99,
+            ..base()
+        }
+    );
+    assert_ne!(
+        base(),
+        FileIdentifier {
+            ctime_nsec: 99,
+            ..base()
+        }
+    );
 }
 
 #[test]

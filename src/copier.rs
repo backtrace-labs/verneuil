@@ -46,6 +46,7 @@ use crate::racy_time::RacySystemTime;
 use crate::recent_work_set::RecentWorkSet;
 use crate::recent_work_set::WorkUnit;
 use crate::replication_buffer;
+use crate::replication_buffer::FileIdentifier;
 use crate::replication_target::apply_local_cache_replication_target;
 use crate::replication_target::parse_s3_region_specification;
 use crate::replication_target::ReplicationTarget;
@@ -240,17 +241,6 @@ type Governor = governor::RateLimiter<
     governor::state::InMemoryState,
     governor::clock::MonotonicClock,
 >;
-
-/// An opaque identifier for a file's contents inode.
-#[derive(Debug, Eq, PartialEq, Hash)]
-struct FileIdentifier {
-    btime: Option<std::time::SystemTime>,
-    len: u64,
-    dev: u64,
-    ino: u64,
-    ctime: i64,
-    ctime_nsec: i64,
-}
 
 /// This state belongs to the copier worker that is currently
 /// uploading the contents of a spool directory for that database
@@ -1076,36 +1066,6 @@ fn directory_is_empty_or_absent(path: &Path) -> Result<bool> {
     }
 }
 
-impl FileIdentifier {
-    /// Returns a tuple that identifies a given file; if a given path has
-    /// the same identifier, it is the same (unless someone is maliciously
-    /// tampering with it).
-    #[instrument(level = "debug")]
-    fn new(file: &File) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-
-        let meta = file
-            .metadata()
-            .map_err(|e| chain_error!(e, "failed to stat file"))?;
-        Ok(FileIdentifier {
-            btime: meta
-                .created()
-                .map_err(|e| chain_debug!(e, "failed to compute file creation time", ?meta))
-                .ok(),
-            len: meta.len(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-            ctime: meta.ctime(),
-            ctime_nsec: meta.ctime_nsec(),
-        })
-    }
-
-    /// Returns whether `self == other`, except for `ctime`/`ctime_nsec`.
-    fn equal_except_ctime(&self, other: &FileIdentifier) -> bool {
-        (self.btime, self.len, self.dev, self.ino) == (other.btime, other.len, other.dev, other.ino)
-    }
-}
-
 /// `CopierWorker`s handle the actual upload of chunks and manifests
 /// to remote blob stores, and deletion of files once their contents
 /// hit remote storage.
@@ -1609,9 +1569,8 @@ impl CopierWorker {
 
                     // If we're not forcing uploads and we think we
                     // have already uploaded this file, nothing to do.
-                    // We must ignore ctime because tapping a file
-                    // changes its hardlink count, and thus updates
-                    // its ctime.
+                    // See `FileIdentifier::equal_except_ctime` for why
+                    // ctime has to be left out of that comparison.
                     if !force_meta.load(Ordering::Relaxed)
                         && state
                             .recent_staged_directories
