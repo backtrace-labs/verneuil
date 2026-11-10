@@ -59,7 +59,6 @@ enum MutationState {
     Dirty,   // Some mutation since the last snapshot.
 }
 
-#[derive(Debug)]
 pub(crate) struct Tracker {
     // The C-side actually owns the file descriptor, but we can share
     // it with Rust: our C code doesn't use the FD's internal cursor.
@@ -132,6 +131,39 @@ pub(crate) fn set_staged_manifest_caching(enabled: bool) {
 
 pub(crate) fn staged_manifest_caching() -> bool {
     CACHE_STAGED_MANIFEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Hand-written rather than derived, to keep `dirty_chunks` out of the
+/// output: it holds one entry per 64KB of dirty data, so formatting it
+/// is linear in the size of the write transaction.  Measured, for a
+/// fully dirty database: 7MB of output at 100k chunks, 65MB at 900k.
+///
+/// `Tracker::snapshot` logs `tracker=?self` whenever a snapshot
+/// fails, which is exactly when the dirty set is largest and the
+/// machine is already in trouble.  Same mistake
+/// "replication_buffer: stop Debug-formatting the manifest into a
+/// span" had to fix for `publish_manifest`.
+///
+/// Fields are chosen for a failure log: what was being replicated,
+/// how much of it was dirty, and what the tracker believed about the
+/// file.  The counts stay counts.
+impl std::fmt::Debug for Tracker {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("Tracker")
+            .field("path", &self.path)
+            .field("buffer", &self.buffer)
+            .field("backing_file_state", &self.backing_file_state)
+            .field("num_dirty_chunks", &self.dirty_chunks.len())
+            .field("chunk_counter", &self.chunk_counter)
+            .field("previous_version_id", &self.previous_version_id)
+            .field(
+                "recent_base_chunk",
+                &self.recent_base_chunk.as_ref().map(|chunk| chunk.fprint()),
+            )
+            .field("staged_manifest_cache", &self.staged_manifest_cache)
+            .field("cache_staged_manifest", &self.cache_staged_manifest)
+            .finish()
+    }
 }
 
 impl Tracker {
@@ -374,6 +406,20 @@ impl Tracker {
             self.snapshot_file_contents()
         })();
 
+        // Log the failure here, before the reset below.  Afterwards
+        // the dirty set is empty, the state is `Clean` and the version
+        // id is gone, so a tracker formatted by the caller describes
+        // something that no longer resembles whatever failed.
+        let ret = match ret {
+            Ok(()) => Ok(()),
+            // Same line the caller used to emit, just emitted here,
+            // where the fields still describe the failure.  Going
+            // through `chain_warn!` keeps `%root_id` -- the join key
+            // back to the event that first reported this -- attached
+            // as a field rather than buried in a `Debug` string.
+            Err(err) => Err(chain_warn!(err, "failed to snapshot db file", tracker = ?self)),
+        };
+
         // Always reset our state after a snapshot attempt.
         self.cached_uuid.get_or_insert_with(Uuid::new_v4);
         self.backing_file_state = MutationState::Clean;
@@ -418,6 +464,233 @@ impl Tracker {
                 .map_err(|e| chain_error!(e, "copy_spool_path thread failed"))?
         } else {
             crate::copier::copy_spool_path(to_flush)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One captured WARN event: the `tracker` field's rendering, and
+    /// the `root_id` field if the line carried one.
+    #[derive(Debug)]
+    struct CapturedWarning {
+        tracker: String,
+        root_id: Option<String>,
+    }
+
+    /// Captures the `tracker` field of any WARN event, so a test can
+    /// see what a failed snapshot actually logged.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<CapturedWarning>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+
+            #[derive(Default)]
+            struct Visitor {
+                tracker: Option<String>,
+                // `chain!` records `%root_id`, the join key back to
+                // the event that first reported the failure.  A
+                // visitor that only looks at `tracker` cannot tell
+                // `chain_warn!` from a bare `tracing::warn!`.
+                root_id: Option<String>,
+            }
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // `%root_id` is a `Display` value, and `tracing`
+                    // routes those through `record_debug` too.
+                    match field.name() {
+                        "tracker" => self.tracker = Some(format!("{:?}", value)),
+                        "root_id" => self.root_id = Some(format!("{:?}", value)),
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            if let Some(tracker) = visitor.tracker {
+                self.0
+                    .lock()
+                    .expect("lock must be valid")
+                    .push(CapturedWarning {
+                        tracker,
+                        root_id: visitor.root_id,
+                    });
+            }
+        }
+    }
+
+    /// A failed snapshot has to be logged *before* `snapshot` resets
+    /// the state that explains it.  Moving the log after the reset --
+    /// or leaving it at the caller, which is where it used to be --
+    /// produces a line that always reads `num_dirty_chunks: 0`,
+    /// `Clean`, no version id, whatever went wrong.
+    #[test]
+    fn a_failed_snapshot_is_logged_with_its_dirty_set_intact() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let db_path = dir.path().join("db");
+        std::fs::write(&db_path, vec![0x5au8; 4096]).expect("must write db");
+
+        // A hot rollback journal makes `snapshot` fail without any
+        // cooperation from the replication machinery.
+        const SQLITE_JOURNAL_HEADER: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        std::fs::write(dir.path().join("db-journal"), SQLITE_JOURNAL_HEADER)
+            .expect("must write journal");
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("must open db");
+
+        let mut tracker = Tracker {
+            file: ManuallyDrop::new(file),
+            path: db_path,
+            buffer: ReplicationBuffer::new_for_test(dir.path().to_owned()),
+            copier: crate::copier::Copier::get_global_copier(),
+            replication_targets: ReplicationTargetList {
+                replication_targets: Vec::new(),
+            },
+            chunk_counter: AtomicU64::new(0),
+            cached_uuid: None,
+            dirty_chunks: (0..1_234u64)
+                .map(|i| (i * SNAPSHOT_GRANULARITY, None))
+                .collect(),
+            backing_file_state: MutationState::Dirty,
+            previous_version_id: Vec::new(),
+            recent_base_chunk: None,
+            staged_manifest_cache: None,
+            cache_staged_manifest: false,
+        };
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracker.snapshot().is_err(), "a hot journal must fail");
+        });
+
+        let lines = std::mem::take(&mut *captured.0.lock().expect("lock must be valid"));
+        assert_eq!(lines.len(), 1, "exactly one failure line: {:?}", lines);
+        assert!(
+            lines[0].tracker.contains("num_dirty_chunks: 1234"),
+            "the log must describe the tracker that failed, not the one \
+             left behind by the reset: {}",
+            lines[0].tracker
+        );
+        // `chain_warn!` is what keeps `%root_id` on the line, as a
+        // field rather than buried in a `Debug` string; a plain
+        // `tracing::warn!` would carry the tracker and lose the join
+        // key back to the event that first reported the failure.
+        assert!(
+            lines[0].root_id.is_some(),
+            "the failure line must carry the root_id field: {}",
+            lines[0].tracker
+        );
+
+        // And a snapshot that *succeeds* must not log at all.  Remove
+        // the journal and dirty the tracker again, so this is a real
+        // snapshot doing real work -- not the `Clean` early return,
+        // which could not have logged no matter where the line sits.
+        std::fs::remove_file(dir.path().join("db-journal")).expect("must remove journal");
+        tracker.flag_write(std::ptr::null(), 0, 4096);
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracker.snapshot().is_ok(), "the snapshot must succeed");
+        });
+        assert!(
+            captured.0.lock().expect("lock must be valid").is_empty(),
+            "a successful snapshot must not log a failure"
+        );
+    }
+
+    /// `Tracker::snapshot` logs `tracker=?self` on every failed
+    /// snapshot, and `dirty_chunks` holds one entry per 64KB of dirty
+    /// data, so a derived `Debug` makes that line linear in the size of
+    /// the write transaction.  Pin the real impl, not a stand-in: this
+    /// builds an actual `Tracker` so that re-deriving `Debug` fails
+    /// here rather than in production.
+    #[test]
+    fn debug_does_not_enumerate_dirty_chunks() {
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let file = std::fs::File::create(dir.path().join("db")).expect("must create file");
+
+        let mut dirty: BTreeMap<u64, Option<Fingerprint>> = BTreeMap::new();
+        for i in 0..100_000u64 {
+            dirty.insert(i * SNAPSHOT_GRANULARITY, Some(Fingerprint::new(i, !i)));
+        }
+        // Sanity check that enumerating really would be ruinous, so
+        // this test can't pass by the map being small.
+        assert!(format!("{:?}", dirty).len() > 1_000_000);
+
+        let tracker = Tracker {
+            file: ManuallyDrop::new(file),
+            path: dir.path().join("db"),
+            buffer: ReplicationBuffer::new_for_test(dir.path().to_owned()),
+            copier: Copier::get_global_copier(),
+            replication_targets: ReplicationTargetList {
+                replication_targets: Vec::new(),
+            },
+            chunk_counter: AtomicU64::new(0),
+            cached_uuid: None,
+            dirty_chunks: dirty,
+            backing_file_state: MutationState::Dirty,
+            previous_version_id: Vec::new(),
+            recent_base_chunk: None,
+            staged_manifest_cache: None,
+            cache_staged_manifest: false,
+        };
+
+        let rendered = format!("{:?}", tracker);
+        assert!(
+            rendered.len() < 512,
+            "Debug output must not grow with the dirty set, got {} bytes: {:.200}...",
+            rendered.len(),
+            rendered
+        );
+        // The count is what makes the line useful; keep it.
+        assert!(
+            rendered.contains("num_dirty_chunks: 100000"),
+            "{}",
+            rendered
+        );
+        // So are the other fields the failure log is written for:
+        // what was being replicated, and what the tracker believed
+        // about the file.  Dropping any of them shrinks the output,
+        // so the length bound above cannot notice.
+        for field in [
+            "path",
+            "buffer",
+            "backing_file_state",
+            "chunk_counter",
+            "previous_version_id",
+            "recent_base_chunk",
+            "staged_manifest_cache",
+            "cache_staged_manifest",
+        ] {
+            assert!(
+                rendered.contains(&format!("{}: ", field)),
+                "Debug must keep the {} field: {}",
+                field,
+                rendered
+            );
         }
     }
 }

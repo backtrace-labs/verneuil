@@ -254,9 +254,12 @@ extern "C" fn verneuil__file_unlock(file: &mut LinuxFile, level: LockLevel) -> i
 
     if file.lock_level == LockLevel::Shared {
         if let Some(tracker) = file.tracker() {
-            // TODO: consider logging snapshot failures here.
-            drop_result!(tracker.snapshot(),
-                         e => chain_warn!(e, "failed to snapshot db file", ?tracker));
+            // `Tracker::snapshot` logs its own failures.  It has to:
+            // it resets the state that makes them worth reading --
+            // the dirty set, the mutation state, the version id --
+            // before it returns, so anything logged out here would
+            // describe the tracker after the fact.
+            let _ = tracker.snapshot();
         }
     }
 
