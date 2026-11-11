@@ -100,6 +100,38 @@ pub(crate) struct Tracker {
     // this db's manifest.  Keeping this chunk alive guarantees we can
     // find it in the global cache, and thus avoids useless GETs.
     recent_base_chunk: Option<Arc<crate::loader::Chunk>>,
+
+    // What we last published to "staging/meta", in the form the next
+    // snapshot wants to read it back in, with the identity of the
+    // file we published it to.  Lets a snapshot skip reading and
+    // decoding its own manifest, which is linear in the size of the
+    // database and happens with the db's write lock held.
+    //
+    // Only ever consulted after confirming that the file on disk is
+    // still the one we wrote; see `cached_base_if_current`.
+    staged_manifest_cache: Option<snapshot_file_contents::StagedManifest>,
+
+    // Gates `staged_manifest_cache`: when false -- the default -- the
+    // cache is never populated, and every snapshot reads the staged
+    // manifest back from the spool directory, exactly as if the cache
+    // did not exist.  Captured from the configured default
+    // (`Options::cache_staged_manifest`) when the tracker is created.
+    cache_staged_manifest: bool,
+}
+
+/// Whether `Tracker`s created from now on cache the staged manifests
+/// they publish; see `Options::cache_staged_manifest`.
+static CACHE_STAGED_MANIFEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the global default for `Tracker::cache_staged_manifest`.
+/// Takes effect for trackers created afterwards.
+pub(crate) fn set_staged_manifest_caching(enabled: bool) {
+    CACHE_STAGED_MANIFEST.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn staged_manifest_caching() -> bool {
+    CACHE_STAGED_MANIFEST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Tracker {
@@ -160,6 +192,8 @@ impl Tracker {
             backing_file_state: MutationState::Unknown,
             previous_version_id: Vec::new(),
             recent_base_chunk: None,
+            staged_manifest_cache: None,
+            cache_staged_manifest: staged_manifest_caching(),
         }))
     }
 

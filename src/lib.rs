@@ -76,6 +76,19 @@ pub struct Options {
 
     /// Global policy when loading snapshot data.
     pub snapshot_loading_policy: SnapshotLoadingPolicy,
+
+    /// If true, each sqlite connection remembers, in memory, the
+    /// snapshot metadata it last spooled for replication, and seeds
+    /// the next snapshot from that instead of reading the staged
+    /// manifest back from the spool directory.  Purely a write-path
+    /// optimisation -- the read-back it skips is linear in the size
+    /// of the database and happens while holding the sqlite write
+    /// lock -- at the cost of one cached chunk list and one open
+    /// file descriptor per writing connection.
+    ///
+    /// Off by default.  Takes effect for connections opened after
+    /// configuration.
+    pub cache_staged_manifest: bool,
 }
 
 #[repr(C)]
@@ -170,6 +183,7 @@ pub fn configure_replication(options: Options) -> Result<()> {
 
     replication_target::set_default_replication_targets(options.replication_targets);
     snapshot::set_default_snapshot_loading_policy(options.snapshot_loading_policy);
+    tracker::set_staged_manifest_caching(options.cache_staged_manifest);
 
     Ok(())
 }

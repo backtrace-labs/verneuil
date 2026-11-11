@@ -246,6 +246,29 @@ impl FileIdentifier {
     }
 }
 
+/// The manifest file `ReplicationBuffer::publish_manifest` just wrote,
+/// and the identity it had when we wrote it.
+#[derive(Debug)]
+pub(crate) struct PublishedManifest {
+    /// The published manifest file.  Keep this open for as long as
+    /// `id` is trusted: `id` only identifies *this* inode while a
+    /// descriptor for it remains open.
+    pub file: File,
+    /// `file`'s identity, read from `file`'s own descriptor rather
+    /// than from the path we renamed it to.  Another process could
+    /// have replaced that path the instant after our `rename(2)`;
+    /// stat-ing the path again would then pair our manifest's
+    /// contents with their file's identity, and the next snapshot
+    /// would happily use our value as the base for their file.
+    ///
+    /// `None` if that `fstat` failed.  The manifest is published
+    /// either way -- it is already on disk by then -- and the caller
+    /// simply does not get to cache it; failing the publish here
+    /// would clear the database's version id and force a full
+    /// resnapshot over a stat.
+    pub id: Option<FileIdentifier>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplicationBuffer {
     spooling_directory: PathBuf,
@@ -1239,6 +1262,16 @@ impl ReplicationBuffer {
         }))
     }
 
+    /// Returns a `ReplicationBuffer` for an arbitrary spooling
+    /// directory.
+    ///
+    /// Only for tests: the real constructor derives the directory
+    /// from the replicated file's identity, and that needs a db file.
+    #[cfg(test)]
+    pub fn new_for_test(spooling_directory: PathBuf) -> Self {
+        ReplicationBuffer { spooling_directory }
+    }
+
     /// Attempts to create a staging directory for the replication
     /// buffer.  For the staging directory to be useful, the metadata
     /// file must exist.  Create it.
@@ -1330,7 +1363,11 @@ impl ReplicationBuffer {
         fields(chunks = manifest.v1.as_ref().map(|v| v.chunks.len())),
         err
     )]
-    pub fn publish_manifest(&self, db_path: &Path, manifest: &Manifest) -> Result<()> {
+    pub fn publish_manifest(
+        &self,
+        db_path: &Path,
+        manifest: &Manifest,
+    ) -> Result<PublishedManifest> {
         use prost::Message;
         use std::io::Write;
 
@@ -1355,9 +1392,14 @@ impl ReplicationBuffer {
             &percent_encode_local_path_uri(db_path)
                 .map_err(|e| chain_error!(e, "invalid manifest name", ?db_path))?,
         );
-        temp.persist(&target)
+        let file = temp
+            .persist(&target)
             .map_err(|e| chain_error!(e, "failed to publish manifest", ?target))?;
-        Ok(())
+        let id = FileIdentifier::new(&file)
+            .map_err(|e| chain_info!(e, "failed to identify published manifest", ?target))
+            .ok();
+
+        Ok(PublishedManifest { file, id })
     }
 
     /// Returns true if there is definitely a ready manifest file for
@@ -1427,11 +1469,19 @@ impl ReplicationBuffer {
         cache_builder: kismet_cache::CacheBuilder,
         targets: &[ReplicationTarget],
     ) -> Result<Option<(Manifest, Option<Arc<Chunk>>)>> {
+        let src = self.staged_manifest_path(db_path)?;
+        read_manifest_at_path(&src, cache_builder, targets)
+    }
+
+    /// Returns the path at which `publish_manifest` publishes
+    /// `db_path`'s manifest, and from which `read_staged_manifest`
+    /// reads it back.
+    pub fn staged_manifest_path(&self, db_path: &Path) -> Result<PathBuf> {
         let mut src = self.spooling_directory.clone();
         src.push(STAGING);
         src.push(META);
         src.push(&percent_encode_local_path_uri(db_path)?);
-        read_manifest_at_path(&src, cache_builder, targets)
+        Ok(src)
     }
 
     /// Returns the path prefix for staged chunks.

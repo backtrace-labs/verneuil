@@ -114,6 +114,7 @@ sleep 5;
 OFFLINE_CONFIG=$(cat <<'EOF'
 {
     "make_default": true,
+    "cache_staged_manifest": true,
     "replication_spooling_dir": "/tmp",
     "replication_targets": []
 }
