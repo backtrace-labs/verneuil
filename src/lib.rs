@@ -2,6 +2,7 @@ mod atomic_kv32;
 mod aws_bucket;
 mod copier;
 mod credentials_process;
+mod dns_cache;
 mod executor;
 mod gcs_bucket;
 mod gcs_credentials_process;

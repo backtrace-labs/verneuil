@@ -362,7 +362,13 @@ impl Bucket {
             let mut loader = aws_config::defaults(BehaviorVersion::latest())
                 .region(parsed.region.clone())
                 .timeout_config(timeout)
-                .retry_config(RetryConfig::disabled());
+                .retry_config(RetryConfig::disabled())
+                // The stock connector, but with cached, single-flight
+                // DNS: S3 drops idle connections after ~20s, so a busy
+                // flush otherwise re-resolves the same few hostnames
+                // from every worker -- see dns_cache.rs for why that is
+                // especially costly on EC2.
+                .http_client(crate::dns_cache::shared_http_client());
 
             // If the target specifies a credentials_process script, swap it
             // in for the default provider chain.  The SDK's credentials
