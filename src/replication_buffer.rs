@@ -438,6 +438,73 @@ fn append_subdirectory(mut base: PathBuf) -> PathBuf {
     base
 }
 
+/// Returns the *live* spool directory holding replication data for
+/// the database at `db_path`: the most-recently-modified
+/// `$dev.$inode` subdirectory of
+/// `$spooling_prefix/$instance_id/$mangled_db_path/`.
+///
+/// There is normally exactly one such subdirectory.  Multiple entries
+/// mean the database file was replaced (new inode) at some point and a
+/// stale directory has not been cleaned up yet.  Stale directories are
+/// deliberately *not* returned, matching `copy_all_spool_paths`'s
+/// pick-newest choice, because for an uploader they are worse than
+/// useless: every directory's staged manifest targets the **same**
+/// remote blob (the manifest name is derived from hostname and path,
+/// never inode), the copier re-uploads staged manifests without
+/// consuming them, and so flushing a stale directory overwrites the
+/// live remote manifest with an obsolete one -- durably, if the live
+/// directory's upload then fails.  Their chunks hold nothing the live
+/// replica needs either: chunks are content-addressed, and a tracker
+/// stages every chunk its own manifest references.  (Ties on
+/// modification time fall back to the `$dev.$inode` name, like
+/// `copy_all_spool_paths`; on a filesystem with coarse timestamps that
+/// tie-break is uncorrelated with liveness, and the next replication
+/// pass self-corrects.)
+///
+/// Returns `None` when nothing was ever spooled for the path.
+pub(crate) fn newest_db_spool_directory(
+    spooling_prefix: PathBuf,
+    db_path: &Path,
+) -> Result<Option<PathBuf>> {
+    let mut dir = current_spooling_dir(spooling_prefix);
+    dir.push(mangle_path(db_path)?);
+
+    let mut spools = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                match entry.metadata().and_then(|meta| meta.modified()) {
+                    Ok(modified) => spools.push((modified, path)),
+                    // A concurrent cleaner (`delete_stale_directories`,
+                    // from any process opening the db) may legitimately
+                    // remove a directory between the listing and the
+                    // stat.
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => return Err(chain_error!(e, "failed to stat spool directory", ?path)),
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(chain_error!(e, "failed to list db spool directory", ?dir)),
+    }
+
+    spools.sort_unstable();
+    if spools.len() > 1 {
+        tracing::warn!(
+            ?spools,
+            ?dir,
+            "found multiple inodes for the same source db"
+        );
+    }
+
+    Ok(spools.pop().map(|(_, path)| path))
+}
+
 /// Returns the .tap path given the path prefix for spooling
 /// directories (or None to use the global default), if we can find
 /// it.
@@ -1921,6 +1988,141 @@ fn replace_slashes_invertible() {
             .expect("must decode")
             .expect("must be reversible")
     );
+}
+
+/// `newest_db_spool_directory` must pick exactly the directory a
+/// tracker would be writing to -- composed from the same
+/// `current_spooling_dir` and `mangle_path` pieces
+/// `ReplicationBuffer::new` uses -- and it must pick by *modification
+/// time*, not by name or readdir order.
+#[test]
+fn newest_db_spool_directory_picks_the_live_subtree() {
+    let prefix = tempfile::tempdir().expect("must create temp dir");
+    // `mangle_path` canonicalizes, so the db paths must really exist.
+    let db_dir = tempfile::tempdir().expect("must create temp dir");
+    let db_path = db_dir.path().join("db.sqlite");
+    std::fs::write(&db_path, b"").expect("must create db file");
+    let db_path = db_path.as_path();
+
+    // Nothing spooled yet: None, not an error.
+    assert_eq!(
+        newest_db_spool_directory(prefix.path().to_owned(), db_path).expect("must list"),
+        None
+    );
+
+    let mut dir = current_spooling_dir(prefix.path().to_owned());
+    dir.push(mangle_path(db_path).expect("must mangle"));
+    // The *stale* directory sorts lexically after the live one, so this
+    // only passes if the choice really is by modification time.
+    let stale_inode = dir.join("789.1011");
+    let live_inode = dir.join("123.456");
+    std::fs::create_dir_all(&stale_inode).expect("must create");
+    std::fs::create_dir_all(&live_inode).expect("must create");
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&stale_inode)
+        .expect("must open dir")
+        .set_modified(hour_ago)
+        .expect("must backdate dir");
+    // A stray file must not be considered.
+    std::fs::write(dir.join("not-a-dir"), b"x").expect("must write");
+
+    assert_eq!(
+        newest_db_spool_directory(prefix.path().to_owned(), db_path).expect("must list"),
+        Some(live_inode)
+    );
+
+    // A different db path maps to a different subtree.
+    let other = db_dir.path().join("else.sqlite");
+    std::fs::write(&other, b"").expect("must create db file");
+    assert_eq!(
+        newest_db_spool_directory(prefix.path().to_owned(), &other).expect("must list"),
+        None
+    );
+}
+
+/// `copy_db_spool_path` must honor `best_effort` on an unspooled db,
+/// error on an unspooled db when strict, and flush the *newest* spool
+/// directory only -- never a stale one, whose obsolete staged manifest
+/// would overwrite the live remote manifest.
+///
+/// The "flush failed" seam is `copy_spool_path`'s very first step --
+/// reading the spool's `.metadata` file -- so a spool directory without
+/// one makes the flush fail before any network or credential work.
+#[test]
+fn copy_db_spool_path_flushes_only_the_newest_dir() {
+    let prefix = tempfile::tempdir().expect("must create temp dir");
+    let db_dir = tempfile::tempdir().expect("must create temp dir");
+    let db_path = db_dir.path().join("db.sqlite");
+    std::fs::write(&db_path, b"").expect("must create db file");
+
+    // Nothing spooled: best-effort succeeds, strict errors.
+    crate::copy_db_spool_path(
+        prefix.path().to_owned(),
+        &db_path,
+        /*best_effort=*/ true,
+    )
+    .expect("best-effort flush of an unspooled db must succeed");
+    crate::copy_db_spool_path(
+        prefix.path().to_owned(),
+        &db_path,
+        /*best_effort=*/ false,
+    )
+    .expect_err("strict flush of an unspooled db must fail");
+
+    let mut dir = current_spooling_dir(prefix.path().to_owned());
+    dir.push(mangle_path(&db_path).expect("must mangle"));
+
+    let backdate = |spool: &Path| {
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(spool)
+            .expect("must open dir")
+            .set_modified(hour_ago)
+            .expect("must backdate dir");
+    };
+
+    // A flushable (metadata-bearing) newest dir next to a stale dir
+    // that would fail if visited: the flush must succeed, proving the
+    // stale dir is never touched.
+    let stale = dir.join("999.999");
+    let live = dir.join("111.111");
+    std::fs::create_dir_all(&stale).expect("must create");
+    std::fs::create_dir_all(&live).expect("must create");
+    std::fs::write(
+        buffer_metadata_file(live.clone()),
+        b"{\"replication_targets\":[]}",
+    )
+    .expect("must write metadata");
+    backdate(&stale);
+
+    crate::copy_db_spool_path(
+        prefix.path().to_owned(),
+        &db_path,
+        /*best_effort=*/ false,
+    )
+    .expect("only the newest dir is flushed; the stale one must not be visited");
+
+    // Invert the ages: now the metadata-less dir is newest, so the
+    // flush must visit it -- and fail -- even best-effort (which only
+    // forgives a *missing* spool, not a failed flush).
+    backdate(&live);
+    let now = std::time::SystemTime::now();
+    std::fs::File::open(&stale)
+        .expect("must open dir")
+        .set_modified(now)
+        .expect("must front-date dir");
+
+    crate::copy_db_spool_path(
+        prefix.path().to_owned(),
+        &db_path,
+        /*best_effort=*/ false,
+    )
+    .expect_err("the newest dir must be the one flushed");
+    crate::copy_db_spool_path(
+        prefix.path().to_owned(),
+        &db_path,
+        /*best_effort=*/ true,
+    )
+    .expect_err("best_effort only forgives a missing spool, not a failed flush");
 }
 
 /// A short path should be invertible.

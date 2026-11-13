@@ -300,6 +300,14 @@ fn flush(cmd: Flush) -> Result<()> {
 /// The verneuilctl sync utility accepts the path to a sqlite db, and
 /// uploads a fresh snapshot to the configured replication targets.
 ///
+/// Only that database's spooled replication data is touched: syncing
+/// one db out of a large spool does not walk, upload, or contend with
+/// the others.  (The spool subtree is keyed on the *canonical* path,
+/// so data spooled under a different spelling of the same file -- a
+/// since-retargeted symlink, say -- is not this invocation's to flush;
+/// `flush` drains everything.)  To flush every database's pending
+/// data, use `flush`.
+///
 /// On success, prints the manifest name to stdout.
 struct Sync {
     /// The source sqlite database file.
@@ -338,8 +346,19 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
     )
     .map_err(|e| chain_error!(e, "--source could not be converted to a C string", ?cmd))?;
 
-    tracing::info!(?dir, "flushing all spooled replication data");
-    verneuil::copy_all_spool_paths(dir.clone(), /*best_effort*/ true)?;
+    // The spool subtree is keyed on the canonical db path (that is what
+    // the tracker mangles into the directory name), so resolve it once
+    // up front and use it for both flushes and the manifest name.
+    let path = std::fs::canonicalize(&cmd.source)
+        .map_err(|e| chain_error!(e, "failed to canonicalize database path", ?cmd))?;
+
+    // Drain this db's spool first so the fresh snapshot below can claim
+    // the single-occupancy "ready" slot: a tracker only publishes a new
+    // ready buffer once the previous one has been fully uploaded.
+    // Best-effort because a db that has never replicated has no spool
+    // directory yet.
+    tracing::info!(?dir, ?path, "flushing spooled replication data for db");
+    verneuil::copy_db_spool_path(dir.clone(), &path, /*best_effort*/ true)?;
 
     tracing::info!(?cmd.source, %cmd.optimize, "cycling a transaction on source db");
     let code = unsafe { verneuil__cycle_db(cstr.as_ptr(), cmd.optimize) };
@@ -347,14 +366,9 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
         return Err(fresh_error!("Failed to force a transaction on database", ?cmd.source, code));
     }
 
-    tracing::info!(
-        ?dir,
-        "flushing all spooled replication data, with new snapshot"
-    );
-    verneuil::copy_all_spool_paths(dir, /*best_effort*/ false)?;
+    tracing::info!(?dir, ?path, "flushing new snapshot for db");
+    verneuil::copy_db_spool_path(dir, &path, /*best_effort*/ false)?;
 
-    let path = std::fs::canonicalize(&cmd.source)
-        .map_err(|e| chain_error!(e, "failed to canonicalize database path", ?cmd))?;
     let manifest_name = verneuil::manifest_name_for_hostname_path(None, &path)
         .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?;
 

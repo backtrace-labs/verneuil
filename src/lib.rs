@@ -562,6 +562,38 @@ pub fn manifest_bytes_for_path(config: Option<&Options>, path: &str) -> Result<O
     }
 }
 
+/// Synchronously copies any pending replication data for the single
+/// database at `db_path` (under `replication_spooling_dir`) to its
+/// replication targets.
+///
+/// This is the per-database counterpart of [`copy_all_spool_paths`]:
+/// the spooling directory holds one subtree per replicated database,
+/// keyed on the (mangled, canonical) database path, so flushing one
+/// database does not walk -- or contend with -- every other database's
+/// spool.  Like `copy_all_spool_paths`, only the database's *newest*
+/// spool directory is uploaded; see
+/// `replication_buffer::newest_db_spool_directory` for why a stale one
+/// must never be.
+///
+/// With `best_effort`, a database that has no spooled data yet is not
+/// an error.  Upload failures are reported either way.
+pub fn copy_db_spool_path(
+    replication_spooling_dir: std::path::PathBuf,
+    db_path: &Path,
+    best_effort: bool,
+) -> Result<()> {
+    let dir = replication_buffer::newest_db_spool_directory(replication_spooling_dir, db_path)?;
+
+    match dir {
+        Some(dir) => copy_spool_path(&dir),
+        None if best_effort => Ok(()),
+        None => Err(fresh_error!(
+            "no spooled replication data found for db",
+            ?db_path
+        )),
+    }
+}
+
 /// Synchronously uploads all the data contained in the spooling
 /// directory prefix.
 ///
