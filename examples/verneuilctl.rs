@@ -300,24 +300,30 @@ fn flush(cmd: Flush) -> Result<()> {
 }
 
 #[derive(Debug, Parser)]
-/// The verneuilctl sync utility accepts the path to a sqlite db, and
-/// uploads a fresh snapshot to the configured replication targets.
+/// The verneuilctl sync utility accepts the paths of one or more
+/// sqlite dbs, and uploads a fresh snapshot of each to the configured
+/// replication targets.
 ///
-/// Only that database's spooled replication data is touched: syncing
-/// one db out of a large spool does not walk, upload, or contend with
-/// the others.  (The spool subtree is keyed on the *canonical* path,
-/// so data spooled under a different spelling of the same file -- a
-/// since-retargeted symlink, say -- is not this invocation's to flush;
-/// `flush` drains everything.)  To flush every database's pending
-/// data, use `flush`.
+/// Only the listed databases' spooled replication data is touched:
+/// syncing a few dbs out of a large spool does not walk, upload, or
+/// contend with the others.  (The spool subtree is keyed on the
+/// *canonical* path, so data spooled under a different spelling of the
+/// same file -- a since-retargeted symlink, say -- is not this
+/// invocation's to flush; `flush` drains everything.)  To flush every
+/// database's pending data, use `flush`.
 ///
-/// On success, prints the manifest name to stdout.
+/// The databases are synced independently: a failure on one is
+/// reported on stderr and does not stop the others, and the exit
+/// status is non-zero if any failed.  On success, prints each
+/// database's manifest name to stdout, one per line, in argument
+/// order -- skipping failures and duplicate spellings of the same
+/// file.
 struct Sync {
-    /// The source sqlite database file.
-    #[clap(parse(from_os_str))]
-    source: PathBuf,
+    /// The source sqlite database files.
+    #[clap(parse(from_os_str), required = true)]
+    sources: Vec<PathBuf>,
 
-    /// Whether to optimize the database before uploading it.
+    /// Whether to optimize the databases before uploading them.
     ///
     /// Databases are currently optimized by fixing the sqlite page
     /// size to 64 KB (ideal for Verneuil), and vacuuming the
@@ -325,12 +331,71 @@ struct Sync {
     /// effect, and garbage collects the database's contents.
     #[clap(short, long)]
     optimize: bool,
+
+    /// How many databases to sync concurrently.
+    ///
+    /// Defaults to 1: one at a time spreads the upload load out while
+    /// still paying the per-process setup -- credential resolution,
+    /// client construction, DNS -- only once for the whole batch.
+    /// Higher values trade burstier uploads and burstier source I/O
+    /// for wall-clock time.
+    #[clap(short, long, default_value = "1")]
+    jobs: usize,
 }
 
-fn sync(cmd: Sync, config: Options) -> Result<()> {
+/// Syncs one database: drains its spool, forces a fresh snapshot,
+/// and drains that too.  Returns the database's manifest name.
+///
+/// `path` is `source` canonicalized; the spool subtree is keyed on
+/// the canonical path (that is what the tracker mangles into the
+/// directory name), so the flushes and the manifest name use `path`,
+/// while sqlite opens the file by the spelling it was given.
+fn sync_one(
+    dir: &std::path::Path,
+    source: &std::path::Path,
+    path: &std::path::Path,
+    optimize: bool,
+) -> Result<String> {
     extern "C" {
         fn verneuil__cycle_db(path: *const std::os::raw::c_char, vacuum: bool) -> i32;
     }
+
+    let cstr = std::ffi::CString::new(
+        source
+            .to_str()
+            .ok_or_else(|| fresh_error!("source is not a valid utf-8 string", ?source))?,
+    )
+    .map_err(|e| chain_error!(e, "source could not be converted to a C string", ?source))?;
+
+    // Drain this db's spool first so the fresh snapshot below can claim
+    // the single-occupancy "ready" slot: a tracker only publishes a new
+    // ready buffer once the previous one has been fully uploaded.
+    // Best-effort because a db that has never replicated has no spool
+    // directory yet.
+    tracing::info!(?dir, ?path, "flushing spooled replication data for db");
+    verneuil::copy_db_spool_path(dir.to_owned(), path, /*best_effort*/ true)?;
+
+    tracing::info!(?source, %optimize, "cycling a transaction on source db");
+    let code = unsafe { verneuil__cycle_db(cstr.as_ptr(), optimize) };
+    if code != 0 {
+        return Err(fresh_error!(
+            "Failed to force a transaction on database",
+            ?source,
+            code
+        ));
+    }
+
+    tracing::info!(?dir, ?path, "flushing new snapshot for db");
+    verneuil::copy_db_spool_path(dir.to_owned(), path, /*best_effort*/ false)?;
+
+    verneuil::manifest_name_for_hostname_path(None, path)
+        .map_err(|e| chain_error!(e, "failed to construct manifest name", ?source))
+}
+
+fn sync(cmd: Sync, config: Options) -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
 
     let dir: PathBuf = match &config.replication_spooling_dir {
         Some(dir) => dir.into(),
@@ -342,41 +407,75 @@ fn sync(cmd: Sync, config: Options) -> Result<()> {
         }
     };
 
-    let cstr = std::ffi::CString::new(
-        cmd.source
-            .to_str()
-            .ok_or_else(|| fresh_error!("--source is not a valid utf-8 string", ?cmd))?,
-    )
-    .map_err(|e| chain_error!(e, "--source could not be converted to a C string", ?cmd))?;
-
-    // The spool subtree is keyed on the canonical db path (that is what
-    // the tracker mangles into the directory name), so resolve it once
-    // up front and use it for both flushes and the manifest name.
-    let path = std::fs::canonicalize(&cmd.source)
-        .map_err(|e| chain_error!(e, "failed to canonicalize database path", ?cmd))?;
-
-    // Drain this db's spool first so the fresh snapshot below can claim
-    // the single-occupancy "ready" slot: a tracker only publishes a new
-    // ready buffer once the previous one has been fully uploaded.
-    // Best-effort because a db that has never replicated has no spool
-    // directory yet.
-    tracing::info!(?dir, ?path, "flushing spooled replication data for db");
-    verneuil::copy_db_spool_path(dir.clone(), &path, /*best_effort*/ true)?;
-
-    tracing::info!(?cmd.source, %cmd.optimize, "cycling a transaction on source db");
-    let code = unsafe { verneuil__cycle_db(cstr.as_ptr(), cmd.optimize) };
-    if code != 0 {
-        return Err(fresh_error!("Failed to force a transaction on database", ?cmd.source, code));
+    // Resolve every source to its canonical path up front, and keep
+    // the first spelling of each file: syncing a db twice would only
+    // cycle and upload it twice for nothing.  A path that cannot be
+    // canonicalized counts as a failed sync, not a fatal error --
+    // one bad entry in a batch must not strand the rest.
+    let mut work: Vec<(&PathBuf, PathBuf)> = Vec::with_capacity(cmd.sources.len());
+    let mut failures: Vec<&PathBuf> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for source in &cmd.sources {
+            match std::fs::canonicalize(source)
+                .map_err(|e| chain_error!(e, "failed to canonicalize database path", ?source))
+            {
+                Ok(path) => {
+                    if seen.insert(path.clone()) {
+                        work.push((source, path));
+                    } else {
+                        tracing::warn!(?source, ?path, "skipping duplicate database");
+                    }
+                }
+                Err(_) => failures.push(source),
+            }
+        }
     }
 
-    tracing::info!(?dir, ?path, "flushing new snapshot for db");
-    verneuil::copy_db_spool_path(dir, &path, /*best_effort*/ false)?;
+    // `--jobs` workers pull databases off a shared cursor; each
+    // result lands in its database's own slot, so stdout below stays
+    // in argument order whatever the completion order was.
+    let results: Mutex<Vec<Option<Result<String>>>> =
+        Mutex::new((0..work.len()).map(|_| None).collect());
+    let next = AtomicUsize::new(0);
+    let workers = cmd.jobs.max(1).min(work.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                match work.get(i) {
+                    Some((source, path)) => {
+                        let result = sync_one(&dir, source, path, cmd.optimize);
+                        results.lock().unwrap()[i] = Some(result);
+                    }
+                    None => break,
+                }
+            });
+        }
+    });
 
-    let manifest_name = verneuil::manifest_name_for_hostname_path(None, &path)
-        .map_err(|e| chain_error!(e, "failed to construct manifest name", ?cmd))?;
+    // Successes on stdout, in argument order.  `scope` joined every
+    // worker, so a slot left empty means its worker died; count it
+    // with the failures rather than pretending it synced.
+    for ((source, _), result) in work.iter().zip(results.into_inner().unwrap()) {
+        match result {
+            Some(Ok(manifest_name)) => println!("{}", manifest_name),
+            _ => failures.push(source),
+        }
+    }
 
-    println!("{}", manifest_name);
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let num_failed = failures.len();
+        let num_sources = cmd.sources.len();
+        Err(fresh_error!(
+            "failed to sync some databases",
+            ?failures,
+            num_failed,
+            num_sources
+        ))
+    }
 }
 
 #[derive(Debug, Parser)]
