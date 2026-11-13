@@ -124,23 +124,24 @@ const IMDS_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The standard default credential chain (env / profile / IMDS / …) but with an
 /// IMDS client that uses [`IMDS_CREDENTIAL_TIMEOUT`] instead of the SDK's 1 s
 /// default. Shared by the pre-flight check and by `Bucket::new`'s S3 client.
-async fn default_chain_with_imds_timeout() -> DefaultCredentialsChain {
+async fn default_chain_with_imds_timeout(
+    region: Option<aws_types::region::Region>,
+) -> DefaultCredentialsChain {
     let imds_client = imds::Client::builder()
         .connect_timeout(IMDS_CREDENTIAL_TIMEOUT)
         .read_timeout(IMDS_CREDENTIAL_TIMEOUT)
         .build();
-    DefaultCredentialsChain::builder()
-        .imds_client(imds_client)
-        .build()
-        .await
+    let mut builder = DefaultCredentialsChain::builder().imds_client(imds_client);
+    // Building a chain runs region discovery -- an IMDS probe of its
+    // own -- unless a region is supplied.  Callers that know theirs
+    // (Bucket::new does) should pass it and spare the probe; the
+    // pre-flight has none to offer.
+    if let Some(region) = region {
+        builder = builder.region(region);
+    }
+    builder.build().await
 }
 
-/// Process-wide cache of the last successfully-resolved default-chain
-/// credentials. The pre-flight check runs on *every* replication cycle and
-/// manifest load; without this it rebuilt the chain and hit IMDS each time, and
-/// under load those repeated fetches are exactly what time out. Serving a
-/// still-valid cached value keeps IMDS traffic to roughly one refresh per
-/// credential lifetime (instance-role creds last hours).
 /// Everything about a [`Bucket`] that the SDK client itself depends on.
 ///
 /// Deliberately not the bucket *name*: the name lives on the `Bucket`
@@ -165,25 +166,78 @@ struct S3ClientKey {
 /// the database's write lock held.
 ///
 /// This is the S3 counterpart to `gcs_bucket::CACHED_CLIENTS`; the native-GCS
-/// side already caches for the same reason.  `CACHED_CREDENTIALS` below only
-/// covers the credential *fetch*, not the client around it.
+/// side already caches for the same reason.  `CREDENTIAL_PREFLIGHT` below
+/// only covers the credential *fetch*, not the client around it.
 ///
 /// No invalidation: the SDK client owns a credentials cache and refreshes
 /// near expiry, which it can only do if we keep handing back the same client.
 static CACHED_S3_CLIENTS: Mutex<Option<HashMap<S3ClientKey, SdkClient>>> = Mutex::new(None);
 
-static CACHED_CREDENTIALS: Mutex<Option<Credentials>> = Mutex::new(None);
+/// Process-wide state for the default-chain credential pre-flight.  The
+/// pre-flight runs on *every* replication cycle and manifest load, and
+/// everything in here exists to keep that from turning into IMDS
+/// traffic:
+///
+/// - `creds` caches the last successful resolution; a still-valid value
+///   is served without touching the network, so IMDS sees roughly one
+///   refresh per credential lifetime (instance-role creds last hours).
+/// - `chain` is built once per *successful* resolution run and reused.
+///   Building a default chain is not free: it runs its own region
+///   discovery, an IMDS probe with the SDK's default one-second
+///   client, and under load each of those probes times out and logs
+///   "failed to load region from IMDS" -- one chain build per
+///   pre-flight was a log-spam firehose.  A failed resolution drops
+///   the chain again, so one built region-less during a brownout is
+///   not pinned for the life of the process (the default chain *can*
+///   need the region: profile/STS flows use it on hosts configured
+///   that way); rebuilds stay bounded to one per backoff window.
+/// - `last_failure` is a short negative cache.  IMDS and the VPC
+///   resolver share the instance's link-local packet allowance, so the
+///   moment replies start being dropped is exactly the moment *every*
+///   caller's pre-flight fails and retries -- a feedback loop that
+///   keeps the allowance exhausted and takes DNS down with it.  One
+///   probe per backoff window per process is plenty.
+///
+/// The mutex is deliberately held across resolution, so concurrent
+/// pre-flights single-flight behind the first one instead of each
+/// opening its own IMDS conversation.
+struct CredentialPreflight {
+    chain: Option<SharedCredentialsProvider>,
+    creds: Option<Credentials>,
+    last_failure: Option<(std::time::Instant, String)>,
+}
+
+static CREDENTIAL_PREFLIGHT: Mutex<CredentialPreflight> = Mutex::new(CredentialPreflight {
+    chain: None,
+    creds: None,
+    last_failure: None,
+});
 
 /// Re-resolve this far ahead of expiry so a cached value is never handed out
 /// right as it lapses.
 const CREDENTIAL_REFRESH_SLACK: Duration = Duration::from_secs(300);
 
+/// After a failed resolution, serve the failure from cache for this long
+/// before letting another probe at the network.
+const CREDENTIAL_FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+
 pub(crate) fn verify_default_credentials() -> Result<(), BoxError> {
     use aws_credential_types::provider::ProvideCredentials;
 
+    // Held across the whole resolution on purpose: see
+    // `CredentialPreflight`.  Recover from poisoning rather than
+    // unwrapping: holding the lock across resolution means a panicking
+    // resolver would otherwise poison every future pre-flight -- and
+    // the state is consistent at any point a panic can land (`chain`
+    // is written before resolution starts; `creds`/`last_failure` only
+    // after it finishes).
+    let mut state = CREDENTIAL_PREFLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // Fast path: a cached credential that isn't about to expire. Credentials
     // with no expiry (e.g. static env creds) never need re-resolution.
-    if let Some(creds) = CACHED_CREDENTIALS.lock().unwrap().as_ref() {
+    if let Some(creds) = &state.creds {
         let still_valid = creds
             .expiry()
             .is_none_or(|exp| exp > SystemTime::now() + CREDENTIAL_REFRESH_SLACK);
@@ -192,16 +246,53 @@ pub(crate) fn verify_default_credentials() -> Result<(), BoxError> {
         }
     }
 
-    // Slow path: resolve via the default chain (with a generous IMDS timeout)
-    // and cache the result for subsequent pre-flights.
-    crate::executor::block_on_with_executor(|| async {
-        let chain = default_chain_with_imds_timeout().await;
-        let creds = chain.provide_credentials().await.map_err(|e| -> BoxError {
-            Box::new(VerneuilSdkError(format!("credentials discovery: {e}")))
-        })?;
-        *CACHED_CREDENTIALS.lock().unwrap() = Some(creds);
-        Ok(())
-    })
+    // Almost-as-fast path: a recent failure.  Serving it from cache is
+    // what breaks the drop -> fail -> retry -> drop feedback loop.
+    if let Some((at, msg)) = &state.last_failure {
+        if at.elapsed() < CREDENTIAL_FAILURE_BACKOFF {
+            return Err(Box::new(VerneuilSdkError(format!(
+                "credentials discovery (cached failure): {msg}"
+            ))));
+        }
+    }
+
+    // Slow path: resolve via the chain (built once -- with a generous
+    // IMDS timeout -- and reused) and cache the outcome, good or bad.
+    let provider = match &state.chain {
+        Some(provider) => provider.clone(),
+        None => {
+            let chain =
+                crate::executor::block_on_with_executor(|| default_chain_with_imds_timeout(None));
+            let provider = SharedCredentialsProvider::new(chain);
+            state.chain = Some(provider.clone());
+            provider
+        }
+    };
+
+    let resolved =
+        crate::executor::block_on_with_executor(
+            || async move { provider.provide_credentials().await },
+        );
+
+    match resolved {
+        Ok(creds) => {
+            state.creds = Some(creds);
+            state.last_failure = None;
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            state.last_failure = Some((std::time::Instant::now(), msg.clone()));
+            // Don't pin a chain that just failed: it may have been
+            // built during an IMDS brownout (region-less), and the
+            // default chain can need the region.  The next probe --
+            // after the backoff -- rebuilds it.
+            state.chain = None;
+            Err(Box::new(VerneuilSdkError(format!(
+                "credentials discovery: {msg}"
+            ))))
+        }
+    }
 }
 
 impl Bucket {
@@ -287,7 +378,7 @@ impl Bucket {
                 // connect timeout than the SDK's 1 s default (too tight under
                 // load — see `verify_default_credentials`). The client's own
                 // credentials cache still refreshes lazily near expiry.
-                let chain = default_chain_with_imds_timeout().await;
+                let chain = default_chain_with_imds_timeout(Some(parsed.region.clone())).await;
                 loader = loader.credentials_provider(SharedCredentialsProvider::new(chain));
             }
 
@@ -531,3 +622,219 @@ impl std::fmt::Display for VerneuilSdkError {
 }
 
 impl std::error::Error for VerneuilSdkError {}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    /// Both tests poke the same process-global `CREDENTIAL_PREFLIGHT`;
+    /// serialize them or they interfere under the parallel harness.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// The pre-flight must serve recent outcomes from cache -- success
+    /// and failure alike -- without touching the network.  The failure
+    /// half is the load-bearing one: IMDS and the VPC resolver share
+    /// the instance's link-local packet allowance, so re-probing from
+    /// every caller the moment replies get dropped is a feedback loop.
+    ///
+    /// Exercised by injecting state directly; resolving for real would
+    /// make the test depend on the machine's credential environment.
+    #[test]
+    fn credential_preflight_serves_cached_outcomes() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // A cached failure within the backoff window is returned as-is.
+        {
+            let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            state.creds = None;
+            state.chain = None;
+            state.last_failure = Some((std::time::Instant::now(), "injected".to_string()));
+        }
+        let err = verify_default_credentials().expect_err("must serve the cached failure");
+        let msg = format!("{err}");
+        assert!(msg.contains("cached failure"), "{}", msg);
+        assert!(msg.contains("injected"), "{}", msg);
+
+        // A cached, unexpiring credential wins over the failure.
+        {
+            let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            state.creds = Some(Credentials::new("AK", "SK", None, None, "test"));
+        }
+        verify_default_credentials().expect("must serve the cached credential");
+
+        // Leave no residue for other tests (none touch this today).
+        let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+        state.creds = None;
+        state.last_failure = None;
+    }
+
+    /// Drives the *slow path* deterministically by injecting a stub chain, so resolution
+    /// outcomes -- not just pre-cached ones -- are observable without
+    /// touching the network, IMDS, or ~/.aws.
+    #[derive(Debug)]
+    struct StubProvider {
+        creds: Option<Credentials>,
+        delay: Duration,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl aws_credential_types::provider::ProvideCredentials for StubProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            aws_credential_types::provider::future::ProvideCredentials::new(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                self.creds.clone().ok_or_else(|| {
+                    aws_credential_types::provider::error::CredentialsError::provider_error(
+                        VerneuilSdkError("stub resolution failure".to_string()),
+                    )
+                })
+            })
+        }
+    }
+
+    fn inject(state: &mut CredentialPreflight, stub: StubProvider) {
+        state.chain = Some(SharedCredentialsProvider::new(stub));
+    }
+
+    #[test]
+    fn credential_preflight_caches_resolution_outcomes() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // 1. A successful resolution must be cached, and must clear a
+        //    stale failure.
+        {
+            let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            state.creds = None;
+            state.last_failure = Some((
+                std::time::Instant::now() - CREDENTIAL_FAILURE_BACKOFF,
+                "stale".to_string(),
+            ));
+            inject(
+                &mut state,
+                StubProvider {
+                    creds: Some(Credentials::new("STUBAK", "SK", None, None, "stub")),
+                    delay: Duration::ZERO,
+                    calls: calls.clone(),
+                },
+            );
+        }
+        verify_default_credentials().expect("stub chain must resolve");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "must consult the injected chain"
+        );
+        {
+            let state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            let creds = state.creds.as_ref().expect("success must be cached");
+            assert_eq!(creds.access_key_id(), "STUBAK");
+            assert!(
+                state.last_failure.is_none(),
+                "success must clear the failure"
+            );
+        }
+
+        // ... and the cached success is served without re-resolving.
+        verify_default_credentials().expect("cached credential");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cache hit must not resolve"
+        );
+
+        // 2. A credential expiring within the refresh slack must be
+        //    re-resolved (here: into a failure), and the failure cached.
+        {
+            let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            state.creds = Some(Credentials::new(
+                "AK",
+                "SK",
+                None,
+                Some(SystemTime::now() + CREDENTIAL_REFRESH_SLACK / 2),
+                "expiring",
+            ));
+            inject(
+                &mut state,
+                StubProvider {
+                    creds: None,
+                    delay: Duration::ZERO,
+                    calls: calls.clone(),
+                },
+            );
+        }
+        let _err = verify_default_credentials().expect_err("stub chain must fail");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expiring cred must re-resolve"
+        );
+        assert!(
+            CREDENTIAL_PREFLIGHT.lock().unwrap().chain.is_none(),
+            "a failed resolution must drop the chain so a brownout-built one is not pinned"
+        );
+        {
+            let state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            let (at, _msg) = state.last_failure.as_ref().expect("failure must be cached");
+            assert!(at.elapsed() < CREDENTIAL_FAILURE_BACKOFF);
+        }
+
+        // ... and within the backoff window the failure is served from
+        // cache, without touching the chain.
+        {
+            // The failed resolution left `creds` as the expiring value;
+            // drop it so the failure path is what serves.
+            CREDENTIAL_PREFLIGHT.lock().unwrap().creds = None;
+        }
+        verify_default_credentials().expect_err("cached failure");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "backoff must suppress re-probing"
+        );
+
+        // 3. Concurrent pre-flights single-flight: with a slow stub,
+        //    the second caller must wait for -- then reuse -- the first
+        //    caller's resolution instead of starting its own.
+        {
+            let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+            state.creds = None;
+            state.last_failure = None;
+            inject(
+                &mut state,
+                StubProvider {
+                    creds: Some(Credentials::new("STUBAK2", "SK", None, None, "stub")),
+                    delay: Duration::from_millis(250),
+                    calls: calls.clone(),
+                },
+            );
+        }
+        let threads: Vec<_> = (0..2)
+            .map(|_| std::thread::spawn(|| verify_default_credentials().map_err(|e| e.to_string())))
+            .collect();
+        for t in threads {
+            t.join()
+                .expect("no panic")
+                .expect("both pre-flights succeed");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "concurrent pre-flights must coalesce into one resolution"
+        );
+
+        // Leave no residue.
+        let mut state = CREDENTIAL_PREFLIGHT.lock().unwrap();
+        state.creds = None;
+        state.last_failure = None;
+        state.chain = None;
+    }
+}

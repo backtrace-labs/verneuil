@@ -55,10 +55,13 @@ enum Command {
 
 /// Repeatedly run the S3 default-credential-chain pre-flight
 /// (`verneuil::verify_credentials`) — the exact check the copier/loader do
-/// before replicating — timing each attempt. Reproduces and vets
-/// IMDS/credential timeouts on a host without going through the embedding
-/// application. Needs no
-/// `--config`. Pass `--log aws_config=debug` to see the SDK's credential detail.
+/// before replicating — timing each attempt.  The pre-flight caches:
+/// a resolved credential is served until near expiry, and a failure is
+/// served for its backoff window, so expect one real resolution up
+/// front and near-instant probes after it (cached failures are
+/// labelled as such).  That is the behaviour the copier experiences;
+/// this tool measures it, it does not bypass it.  Needs no `--config`.
+/// Pass `--log aws_config=debug` to see the SDK's credential detail.
 #[derive(Debug, Parser)]
 struct CheckCredentials {
     /// How many times to probe the credential chain.
