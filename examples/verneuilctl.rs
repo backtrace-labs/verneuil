@@ -144,11 +144,21 @@ fn output_reader(mut reader: impl std::io::Read, out: &Option<PathBuf>) -> Resul
 }
 
 #[derive(Debug, Parser)]
-/// The verneuilctl restore utility accepts the path to a verneuil
-/// manifest file, and reconstructs its contents to the `--out`
-/// argument (or stdout by default).
+/// The verneuilctl restore utility accepts the paths of one or more
+/// verneuil manifest files (and/or replicated source files), and
+/// reconstructs their contents.
+///
+/// A single database is written to `--out` (or stdout by default).
+/// Several databases require `--out-dir` or `--in-place`, so that
+/// each one has its own destination; they are then restored
+/// independently -- a failure on one is reported on stderr and does
+/// not stop the others, and the exit status is non-zero if any
+/// failed.  Each successfully restored file's path is printed to
+/// stdout, one per line, in input order (manifests first, then
+/// source paths).
 struct Restore {
-    /// The manifest file that describes the snapshot to restore.
+    /// A manifest file that describes a snapshot to restore.  May be
+    /// repeated to restore several snapshots.
     ///
     /// These are typically stored as objects in versioned buckets;
     /// it is up to the invoker to fish out the relevant version.
@@ -165,58 +175,267 @@ struct Restore {
     /// hostname if empty) and source path, and a `file://` prefix
     /// will always be read as a local path.
     #[clap(short, long)]
-    manifest: Option<String>,
+    manifest: Vec<String>,
 
-    /// The hostname of the machine that generated the snapshot.
+    /// The hostname of the machine that generated the snapshots.
     ///
-    /// Defaults to the current machine's hostname.
+    /// Defaults to the current machine's hostname.  Applies to every
+    /// `--source_path`; to mix hostnames in one invocation, pass
+    /// `verneuil://hostname/path` manifest URIs instead.
     #[clap(long)]
     hostname: Option<String>,
 
-    /// The path to the source file that was replicated by Verneuil,
-    /// when it ran on `--hostname`.
+    /// The path to a source file that was replicated by Verneuil,
+    /// when it ran on `--hostname`.  May be repeated to restore
+    /// several databases.
     #[clap(short, long, parse(from_os_str))]
-    source_path: Option<PathBuf>,
+    source_path: Vec<PathBuf>,
 
     /// The path to the reconstructed output file.
     ///
-    /// Defaults to stdout.
+    /// Defaults to stdout.  Only valid when restoring a single
+    /// database; see `--out-dir` and `--in-place` for several.
     #[clap(short, long, parse(from_os_str))]
     out: Option<PathBuf>,
+
+    /// Root directory under which each restored database is written
+    /// to its own source path: with `--out-dir /tmp/stage`, a
+    /// database replicated from /var/lib/app/db.sqlite is restored
+    /// to /tmp/stage/var/lib/app/db.sqlite.  Parent directories are
+    /// created as needed.
+    ///
+    /// Every input must carry a source path: `--source_path` inputs
+    /// do, as do `verneuil://` manifest URIs; other `--manifest`
+    /// forms do not, and are rejected up front.
+    #[clap(long, parse(from_os_str))]
+    out_dir: Option<PathBuf>,
+
+    /// Restore each database over its own source path, i.e.
+    /// `--out-dir /`.
+    ///
+    /// Each file is written to a temporary sibling and atomically
+    /// renamed into place -- but that only protects processes that
+    /// open the database *afterwards*.  Restoring over a database
+    /// that a live process already has open yanks the data out from
+    /// under it; only use this when nothing on this machine has the
+    /// databases open.
+    #[clap(long)]
+    in_place: bool,
+
+    /// How many databases to restore concurrently.
+    ///
+    /// Defaults to 1.  Chunk downloads share one small process-global
+    /// thread pool no matter what this is set to, so higher values
+    /// mostly overlap one database's decompression and output writing
+    /// with another's downloads.  Note that every in-flight restore
+    /// also stages its full database in the local chunk cache, so the
+    /// transient disk footprint is roughly twice the combined size of
+    /// the databases in flight.
+    #[clap(short, long, default_value = "1")]
+    jobs: usize,
 }
 
 fn restore(cmd: Restore, config: Options) -> Result<()> {
-    let read_manifest = || {
-        if let Some(path) = &cmd.manifest {
-            match verneuil::manifest_bytes_for_path(None, path)? {
-                Some(bytes) => Ok(bytes),
-                None => Err(fresh_error!("manifest not found", ?path)),
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    let inputs: Vec<RestoreInput> = cmd
+        .manifest
+        .iter()
+        .cloned()
+        .map(RestoreInput::Manifest)
+        .chain(
+            cmd.source_path
+                .iter()
+                .cloned()
+                .map(RestoreInput::SourcePath),
+        )
+        .collect();
+
+    if inputs.is_empty() {
+        return Err(fresh_error!(
+            "One of `--manifest` or `--source_path` must be provided to `verneuilctl restore`",
+            ?cmd
+        ));
+    }
+
+    if cmd.in_place && cmd.out_dir.is_some() {
+        return Err(fresh_error!(
+            "`--in-place` and `--out-dir` are mutually exclusive",
+            ?cmd
+        ));
+    }
+
+    if cmd.out.is_some() && (cmd.in_place || cmd.out_dir.is_some()) {
+        return Err(fresh_error!(
+            "`--out` conflicts with `--out-dir` and `--in-place`",
+            ?cmd
+        ));
+    }
+
+    if inputs.len() > 1 && cmd.out_dir.is_none() && !cmd.in_place {
+        return Err(fresh_error!(
+            "restoring more than one database requires `--out-dir` or `--in-place` \
+             (`--out` and stdout can only carry one)",
+            ?cmd
+        ));
+    }
+
+    // Resolve every destination up front: an input whose output path
+    // cannot be derived is a usage error, and should reject the batch
+    // before any network work, not after half of it restored.
+    //
+    // `mirrored` doubles as "print the destination on success": the
+    // single-database `--out`/stdout modes stay silent, as they
+    // always were.
+    let mirrored = cmd.in_place || cmd.out_dir.is_some();
+    let mut work: Vec<(&RestoreInput, Option<PathBuf>)> = Vec::with_capacity(inputs.len());
+    {
+        let mut seen = std::collections::HashSet::new();
+        for input in &inputs {
+            let out = if mirrored {
+                let source = input.source_path()?;
+                let out = match &cmd.out_dir {
+                    // `--in-place`: the database's own path.
+                    None => source,
+                    Some(dir) => {
+                        let relative = source.strip_prefix("/").unwrap_or(&source).to_owned();
+                        dir.join(relative)
+                    }
+                };
+                if !seen.insert(out.clone()) {
+                    tracing::warn!(?input, ?out, "skipping duplicate database");
+                    continue;
+                }
+                Some(out)
+            } else {
+                cmd.out.clone()
+            };
+            work.push((input, out));
+        }
+    }
+
+    // `--jobs` workers pull databases off a shared cursor; each
+    // result lands in its database's own slot, so stdout below stays
+    // in input order whatever the completion order was.
+    let results: Mutex<Vec<Option<Result<()>>>> =
+        Mutex::new((0..work.len()).map(|_| None).collect());
+    let next = AtomicUsize::new(0);
+    let workers = cmd.jobs.max(1).min(work.len());
+    let hostname = cmd.hostname.as_deref();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                match work.get(i) {
+                    Some((input, out)) => {
+                        let result = restore_one(input, out, hostname, &config);
+                        results.lock().unwrap()[i] = Some(result);
+                    }
+                    None => break,
+                }
+            });
+        }
+    });
+
+    // Restored paths on stdout, in input order.  `scope` joined every
+    // worker, so a slot left empty means its worker died; count it
+    // with the failures rather than pretending it restored.
+    let mut failures: Vec<&RestoreInput> = Vec::new();
+    for ((input, out), result) in work.iter().zip(results.into_inner().unwrap()) {
+        match result {
+            Some(Ok(())) => {
+                if mirrored {
+                    if let Some(out) = out {
+                        println!("{}", out.display());
+                    }
+                }
             }
-        } else if let Some(path) = &cmd.source_path {
-            match verneuil::manifest_bytes_for_hostname_path(
-                Some(&config),
-                cmd.hostname.as_deref(),
-                path,
-            )? {
-                Some(bytes) => Ok(bytes),
-                None => Err(fresh_error!("unable to fetch manifest", ?cmd, ?config)),
+            _ => failures.push(input),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let num_failed = failures.len();
+        let num_inputs = inputs.len();
+        Err(fresh_error!(
+            "failed to restore some databases",
+            ?failures,
+            num_failed,
+            num_inputs
+        ))
+    }
+}
+
+/// One database to restore: a manifest path/URI, or a replicated
+/// source file's path (resolved against `--hostname`).
+#[derive(Debug)]
+enum RestoreInput {
+    Manifest(String),
+    SourcePath(PathBuf),
+}
+
+impl RestoreInput {
+    /// Returns the replicated file's path, when the input names one:
+    /// `--out-dir` and `--in-place` need it for the destination.
+    ///
+    /// The `verneuil://` parse mirrors `manifest_bytes_for_path`:
+    /// everything up to the first '/' is the hostname, the rest --
+    /// with the leading '/' restored -- is the source path.
+    fn source_path(&self) -> Result<PathBuf> {
+        match self {
+            RestoreInput::SourcePath(path) => Ok(path.clone()),
+            RestoreInput::Manifest(uri) => {
+                let suffix = uri.strip_prefix("verneuil://").ok_or_else(|| {
+                    fresh_error!(
+                        "cannot derive an output path for this manifest: only `verneuil://` \
+                         manifest URIs carry a source path.  Use `--source_path`, or restore \
+                         it by itself with `--out`.",
+                        %uri
+                    )
+                })?;
+                match suffix.split_once('/') {
+                    Some((_machine, path)) => Ok(PathBuf::from(format!("/{}", path))),
+                    None => Err(fresh_error!(
+                        "failed to parse verneuil URI; should be verneuil://machine-hostname/path/to/sqlite.db",
+                        %uri
+                    )),
+                }
             }
-        } else {
-            Err(fresh_error!(
-                "One of `--manifest` or `--source_path` must be provided to `verneuilctl restore`",
-                ?cmd
-            ))
+        }
+    }
+}
+
+/// Restores one database to `out` (`None` means stdout).
+fn restore_one(
+    input: &RestoreInput,
+    out: &Option<PathBuf>,
+    hostname: Option<&str>,
+    config: &Options,
+) -> Result<()> {
+    let (manifest_contents, manifest_or) = match input {
+        RestoreInput::Manifest(path) => match verneuil::manifest_bytes_for_path(None, path)? {
+            Some(bytes) => (bytes, Some(path.clone())),
+            None => return Err(fresh_error!("manifest not found", ?path)),
+        },
+        RestoreInput::SourcePath(path) => {
+            match verneuil::manifest_bytes_for_hostname_path(Some(config), hostname, path)? {
+                Some(bytes) => (bytes, None),
+                None => return Err(fresh_error!("unable to fetch manifest", ?path, ?config)),
+            }
         }
     };
 
-    let manifest_contents = read_manifest()?;
     // Use the global default target lists for the manifest and when
     // fetching its chunks.
     let (manifest, base) = verneuil::Manifest::decode_and_validate(
         &*manifest_contents,
         Default::default(),
         None,
-        &cmd.manifest,
+        &manifest_or,
     )?;
     let snapshot = verneuil::Snapshot::new_with_default_targets(
         verneuil::SnapshotLoadingPolicy::Eager,
@@ -224,7 +443,13 @@ fn restore(cmd: Restore, config: Options) -> Result<()> {
         base,
     )?;
     let reader = snapshot.as_read(0, u64::MAX)?; // Read the whole thing.
-    output_reader(reader, &cmd.out)
+
+    if let Some(parent) = out.as_ref().and_then(|dst| dst.parent()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| chain_error!(e, "failed to create output directory", ?parent))?;
+    }
+
+    output_reader(reader, out)
 }
 
 #[derive(Debug, Parser)]
